@@ -777,6 +777,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "smallvec",
  "tokio",
  "toml",
  "tower-http 0.5.2",

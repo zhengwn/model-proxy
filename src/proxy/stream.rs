@@ -6,7 +6,9 @@ use axum::{
 use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::{json, Value};
+use smallvec::SmallVec;
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
@@ -40,6 +42,8 @@ fn sse_event_literal(event: &str, json_literal: &str) -> String {
     s.push_str("\n\n");
     s
 }
+
+type StreamEvents = SmallVec<[String; 4]>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StreamBlockKind {
@@ -75,20 +79,20 @@ pub(crate) fn compact_sse_buffer(buffer: &mut String, read_offset: &mut usize) {
     }
 }
 
-fn push_content_block_stop(events: &mut Vec<String>, index: usize) {
+fn push_content_block_stop(events: &mut StreamEvents, index: usize) {
     events.push(sse_event(
         "content_block_stop",
         &json!({"type": "content_block_stop", "index": index}),
     ));
 }
 
-fn stop_current_stream_block(events: &mut Vec<String>, current_block: &mut Option<CurrentBlock>) {
+fn stop_current_stream_block(events: &mut StreamEvents, current_block: &mut Option<CurrentBlock>) {
     if let Some(block) = current_block.take() {
         push_content_block_stop(events, block.index);
     }
 }
 
-fn close_open_tool_blocks(events: &mut Vec<String>, open_tool_blocks: &mut BTreeSet<usize>) {
+fn close_open_tool_blocks(events: &mut StreamEvents, open_tool_blocks: &mut BTreeSet<usize>) {
     for index in std::mem::take(open_tool_blocks) {
         push_content_block_stop(events, index);
     }
@@ -230,8 +234,8 @@ pub(crate) fn convert_stream_chunk(
     tool_block_indices: &mut HashMap<usize, usize>,
     open_tool_blocks: &mut BTreeSet<usize>,
     stop_reason_value: &mut Option<String>,
-) -> Vec<String> {
-    let mut events = Vec::new();
+) -> StreamEvents {
+    let mut events = StreamEvents::new();
 
     let id = chunk
         .get("id")
@@ -440,7 +444,7 @@ pub(crate) async fn handle_stream(
     upstream_resp: reqwest::Response,
     model: &str,
     _estimated_input_tokens: u64,
-    tool_name_reverse_map: &HashMap<String, String>,
+    tool_name_reverse_map: Arc<HashMap<String, String>>,
     request_id: String,
     request_start: std::time::Instant,
     upstream_start: std::time::Instant,
@@ -454,7 +458,6 @@ pub(crate) async fn handle_stream(
     let (tx, rx) = mpsc::channel::<std::result::Result<Bytes, AppError>>(128);
 
     let model = model.to_string();
-    let reverse_map = tool_name_reverse_map.clone();
 
     tokio::spawn(async move {
         let stream_start = std::time::Instant::now();
@@ -625,7 +628,7 @@ pub(crate) async fn handle_stream(
                                         &mut ended,
                                         &mut pending_message_delta,
                                         &mut output_tokens,
-                                        &reverse_map,
+                                        &tool_name_reverse_map,
                                         &mut tool_block_indices,
                                         &mut open_tool_blocks,
                                         &mut stop_reason_value,

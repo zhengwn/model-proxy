@@ -7,6 +7,7 @@ use axum::{
     Json,
 };
 use serde_json::{json, Value};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
@@ -172,7 +173,7 @@ pub async fn proxy_messages(
                     upstream_resp,
                     &model,
                     input_tokens,
-                    &tool_name_map,
+                    Arc::new(tool_name_map),
                     request_id,
                     request_start,
                     upstream_start,
