@@ -10,10 +10,6 @@ use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
-use crate::{
-    config::Config,
-    error::{AppError, Result},
-};
 use super::convert::{build_provider_request, prepare_body};
 use super::passthrough::{handle_non_stream_passthrough, handle_stream_passthrough};
 use super::response::handle_non_stream;
@@ -23,6 +19,10 @@ use super::state::{
 };
 use super::stream::handle_stream;
 use super::utils::{estimate_input_tokens, message_count, tool_count, truncate_for_log};
+use crate::{
+    config::Config,
+    error::{AppError, Result},
+};
 
 fn check_auth(headers: &HeaderMap, config: &Config) -> Result<()> {
     if let Some(expected_key) = &config.server.api_key {

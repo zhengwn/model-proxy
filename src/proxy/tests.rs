@@ -155,7 +155,10 @@ fn max_tokens_uses_provider_model_capabilities() {
 #[test]
 fn sse_block_end_supports_lf_and_crlf() {
     assert_eq!(utils::find_sse_block_end("data: {}\n\nrest"), Some((8, 2)));
-    assert_eq!(utils::find_sse_block_end("data: {}\r\n\r\nrest"), Some((8, 4)));
+    assert_eq!(
+        utils::find_sse_block_end("data: {}\r\n\r\nrest"),
+        Some((8, 4))
+    );
 }
 
 #[test]
@@ -312,6 +315,27 @@ fn stream_tool_use_stop_uses_allocated_block_index() {
     assert!(text.contains(r#""index":1"#));
 }
 
+#[test]
+fn sse_offset_parser_compacts_and_continues() {
+    let mut buffer = String::new();
+    let mut read_offset = 0;
+    let first_payload = "x".repeat(9000);
+    let first_event = format!("data: {}\n\n", first_payload);
+    buffer.push_str(&first_event);
+    buffer.push_str("data: second\n\n");
+
+    let first = stream::next_sse_block(&buffer, &mut read_offset).unwrap();
+    assert_eq!(first, format!("data: {}", first_payload));
+    assert_eq!(read_offset, first_event.len());
+
+    stream::compact_sse_buffer(&mut buffer, &mut read_offset);
+    assert_eq!(read_offset, 0);
+    assert_eq!(buffer, "data: second\n\n");
+
+    let second = stream::next_sse_block(&buffer, &mut read_offset).unwrap();
+    assert_eq!(second, "data: second");
+}
+
 #[tokio::test]
 async fn non_stream_response_restores_original_tool_name() {
     let body = json!({
@@ -338,7 +362,8 @@ async fn non_stream_response_restores_original_tool_name() {
     });
     let tool_name_map = HashMap::from([("tool_search".to_string(), "tool.search".to_string())]);
 
-    let anthropic = response::convert_non_stream_response(body, "deepseek-v4-pro", &tool_name_map).await;
+    let anthropic =
+        response::convert_non_stream_response(body, "deepseek-v4-pro", &tool_name_map).await;
 
     assert_eq!(anthropic["stop_reason"].as_str(), Some("tool_use"));
     assert_eq!(

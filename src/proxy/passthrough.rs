@@ -6,8 +6,8 @@ use axum::{
 use futures::StreamExt;
 use tracing::{error, info};
 
-use crate::error::AppError;
 use super::state::elapsed_ms;
+use crate::error::AppError;
 
 pub(crate) async fn handle_non_stream_passthrough(
     upstream_resp: reqwest::Response,

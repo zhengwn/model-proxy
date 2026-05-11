@@ -1,4 +1,3 @@
-use std::collections::{BTreeSet, HashMap};
 use axum::{
     body::Body,
     http::{header, StatusCode},
@@ -7,13 +6,40 @@ use axum::{
 use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::{json, Value};
+use std::collections::{BTreeSet, HashMap};
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
-use crate::error::{AppError, Result};
 use super::convert::openai_id_to_anthropic;
 use super::state::elapsed_ms;
 use super::utils::{append_utf8_safe, find_sse_block_end};
+use crate::error::{AppError, Result};
+
+// ---- SSE formatting helpers (hot path) ----
+// These helpers centralize SSE framing, pre-allocate the output string, and serialize
+// payloads compactly. Static payloads can use `sse_event_literal` to skip serde_json.
+
+fn sse_event(event: &str, data: &Value) -> String {
+    let json_str = serde_json::to_string(data).unwrap_or_default();
+    let mut s = String::with_capacity(8 + event.len() + 8 + json_str.len() + 2);
+    s.push_str("event: ");
+    s.push_str(event);
+    s.push_str("\ndata: ");
+    s.push_str(&json_str);
+    s.push_str("\n\n");
+    s
+}
+
+/// For tiny, static-structure payloads we skip `serde_json` entirely.
+fn sse_event_literal(event: &str, json_literal: &str) -> String {
+    let mut s = String::with_capacity(8 + event.len() + 8 + json_literal.len() + 2);
+    s.push_str("event: ");
+    s.push_str(event);
+    s.push_str("\ndata: ");
+    s.push_str(json_literal);
+    s.push_str("\n\n");
+    s
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StreamBlockKind {
@@ -33,10 +59,26 @@ fn next_stream_block_index(next_content_block_index: &mut usize) -> usize {
     index
 }
 
+pub(crate) fn next_sse_block<'a>(buffer: &'a str, read_offset: &mut usize) -> Option<&'a str> {
+    let search = &buffer[*read_offset..];
+    let (pos, delimiter_len) = find_sse_block_end(search)?;
+    let block_start = *read_offset;
+    let block_end = block_start + pos;
+    *read_offset = block_end + delimiter_len;
+    Some(&buffer[block_start..block_end])
+}
+
+pub(crate) fn compact_sse_buffer(buffer: &mut String, read_offset: &mut usize) {
+    if *read_offset > 8192 && *read_offset > buffer.len() / 2 {
+        buffer.drain(..*read_offset);
+        *read_offset = 0;
+    }
+}
+
 fn push_content_block_stop(events: &mut Vec<String>, index: usize) {
-    events.push(format!(
-        "event: content_block_stop\ndata: {}\n\n",
-        json!({"type": "content_block_stop", "index": index})
+    events.push(sse_event(
+        "content_block_stop",
+        &json!({"type": "content_block_stop", "index": index}),
     ));
 }
 
@@ -142,9 +184,9 @@ async fn send_final_events(
     let mut sent = 0;
     if let Some(block) = *current_block {
         if tx
-            .send(Ok(Bytes::from(format!(
-                "event: content_block_stop\ndata: {}\n\n",
-                json!({"type": "content_block_stop", "index": block.index})
+            .send(Ok(Bytes::from(sse_event(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": block.index}),
             ))))
             .await
             .is_ok()
@@ -155,9 +197,9 @@ async fn send_final_events(
 
     for index in open_tool_blocks {
         if tx
-            .send(Ok(Bytes::from(format!(
-                "event: content_block_stop\ndata: {}\n\n",
-                json!({"type": "content_block_stop", "index": index})
+            .send(Ok(Bytes::from(sse_event(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": index}),
             ))))
             .await
             .is_ok()
@@ -169,13 +211,8 @@ async fn send_final_events(
     sent
 }
 
-async fn send_message_stop(
-    tx: &mpsc::Sender<std::result::Result<Bytes, AppError>>,
-) -> bool {
-    let msg_stop = format!(
-        "event: message_stop\ndata: {}\n\n",
-        json!({"type": "message_stop"})
-    );
+async fn send_message_stop(tx: &mpsc::Sender<std::result::Result<Bytes, AppError>>) -> bool {
+    let msg_stop = sse_event_literal("message_stop", r#"{"type":"message_stop"}"#);
     tx.send(Ok(Bytes::from(msg_stop))).await.is_ok()
 }
 
@@ -220,9 +257,9 @@ pub(crate) fn convert_stream_chunk(
 
     if !*started && delta.get("role").is_some() {
         *started = true;
-        events.push(format!(
-            "event: message_start\ndata: {}\n\n",
-            json!({
+        events.push(sse_event(
+            "message_start",
+            &json!({
                 "type": "message_start",
                 "message": {
                     "id": stream_id,
@@ -234,7 +271,7 @@ pub(crate) fn convert_stream_chunk(
                         "output_tokens": 0
                     }
                 }
-            })
+            }),
         ));
     }
 
@@ -244,16 +281,16 @@ pub(crate) fn convert_stream_chunk(
             if current_block.map(|block| block.kind) != Some(StreamBlockKind::Thinking) {
                 stop_current_stream_block(&mut events, current_block);
                 let index = next_stream_block_index(next_content_block_index);
-                events.push(format!(
-                    "event: content_block_start\ndata: {}\n\n",
-                    json!({
+                events.push(sse_event(
+                    "content_block_start",
+                    &json!({
                         "type": "content_block_start",
                         "index": index,
                         "content_block": {
                             "type": "thinking",
                             "thinking": ""
                         }
-                    })
+                    }),
                 ));
                 *current_block = Some(CurrentBlock {
                     kind: StreamBlockKind::Thinking,
@@ -261,16 +298,16 @@ pub(crate) fn convert_stream_chunk(
                 });
             }
             let index = current_block.map(|block| block.index).unwrap_or(0);
-            events.push(format!(
-                "event: content_block_delta\ndata: {}\n\n",
-                json!({
+            events.push(sse_event(
+                "content_block_delta",
+                &json!({
                     "type": "content_block_delta",
                     "index": index,
                     "delta": {
                         "type": "thinking_delta",
                         "thinking": text
                     }
-                })
+                }),
             ));
             *output_tokens += text.len() / 4 + 1;
         }
@@ -282,16 +319,16 @@ pub(crate) fn convert_stream_chunk(
             if current_block.map(|block| block.kind) != Some(StreamBlockKind::Text) {
                 stop_current_stream_block(&mut events, current_block);
                 let index = next_stream_block_index(next_content_block_index);
-                events.push(format!(
-                    "event: content_block_start\ndata: {}\n\n",
-                    json!({
+                events.push(sse_event(
+                    "content_block_start",
+                    &json!({
                         "type": "content_block_start",
                         "index": index,
                         "content_block": {
                             "type": "text",
                             "text": ""
                         }
-                    })
+                    }),
                 ));
                 *current_block = Some(CurrentBlock {
                     kind: StreamBlockKind::Text,
@@ -299,16 +336,16 @@ pub(crate) fn convert_stream_chunk(
                 });
             }
             let index = current_block.map(|block| block.index).unwrap_or(0);
-            events.push(format!(
-                "event: content_block_delta\ndata: {}\n\n",
-                json!({
+            events.push(sse_event(
+                "content_block_delta",
+                &json!({
                     "type": "content_block_delta",
                     "index": index,
                     "delta": {
                         "type": "text_delta",
                         "text": text
                     }
-                })
+                }),
             ));
             *output_tokens += text.len() / 4 + 1;
         }
@@ -334,9 +371,9 @@ pub(crate) fn convert_stream_chunk(
                         .map(|s| s.as_str())
                         .unwrap_or(name);
                     let anthropic_id = openai_id_to_anthropic(call_id);
-                    events.push(format!(
-                        "event: content_block_start\ndata: {}\n\n",
-                        json!({
+                    events.push(sse_event(
+                        "content_block_start",
+                        &json!({
                             "type": "content_block_start",
                             "index": block_index,
                             "content_block": {
@@ -345,7 +382,7 @@ pub(crate) fn convert_stream_chunk(
                                 "name": original_name,
                                 "input": {}
                             }
-                        })
+                        }),
                     ));
                     tool_block_indices.insert(index, block_index);
                     open_tool_blocks.insert(block_index);
@@ -353,16 +390,16 @@ pub(crate) fn convert_stream_chunk(
 
                 if !arguments.is_empty() {
                     let block_index = tool_block_indices.get(&index).copied().unwrap_or(index);
-                    events.push(format!(
-                        "event: content_block_delta\ndata: {}\n\n",
-                        json!({
+                    events.push(sse_event(
+                        "content_block_delta",
+                        &json!({
                             "type": "content_block_delta",
                             "index": block_index,
                             "delta": {
                                 "type": "input_json_delta",
                                 "partial_json": arguments
                             }
-                        })
+                        }),
                     ));
                 }
             }
@@ -381,9 +418,9 @@ pub(crate) fn convert_stream_chunk(
             _ => "end_turn",
         };
         *stop_reason_value = Some(stop_reason.to_string());
-        *pending_message_delta = Some(format!(
-            "event: message_delta\ndata: {}\n\n",
-            json!({
+        *pending_message_delta = Some(sse_event(
+            "message_delta",
+            &json!({
                 "type": "message_delta",
                 "delta": {
                     "stop_reason": stop_reason,
@@ -392,7 +429,7 @@ pub(crate) fn convert_stream_chunk(
                 "usage": {
                     "output_tokens": *output_tokens
                 }
-            })
+            }),
         ));
     }
 
@@ -421,7 +458,7 @@ pub(crate) async fn handle_stream(
 
     tokio::spawn(async move {
         let stream_start = std::time::Instant::now();
-        let mut buffer = String::new();
+        let mut buffer = String::with_capacity(16384);
         let mut utf8_remainder: Vec<u8> = Vec::new();
         let mut stream_id = String::new();
         let mut started = false;
@@ -468,6 +505,8 @@ pub(crate) async fn handle_stream(
         };
 
         let mut stream = byte_stream;
+        // Offset-based buffer to avoid O(n) drain and block-to_string per chunk.
+        let mut read_offset: usize = 0;
 
         while let Some(result) = stream.next().await {
             match result {
@@ -475,10 +514,7 @@ pub(crate) async fn handle_stream(
                     append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
 
                     loop {
-                        if let Some((pos, delimiter_len)) = find_sse_block_end(&buffer) {
-                            let block = buffer[..pos].to_string();
-                            buffer.drain(..pos + delimiter_len);
-
+                        if let Some(block) = next_sse_block(&buffer, &mut read_offset) {
                             for line in block.lines() {
                                 if !line.starts_with("data: ") {
                                     continue;
@@ -493,16 +529,16 @@ pub(crate) async fn handle_stream(
                                             actual_usage,
                                             output_tokens as u64,
                                         );
-                                        let delta = format!(
-                                            "event: message_delta\ndata: {}\n\n",
-                                            json!({
+                                        let delta = sse_event(
+                                            "message_delta",
+                                            &json!({
                                                 "type": "message_delta",
                                                 "delta": {
                                                     "stop_reason": sr,
                                                     "stop_sequence": null
                                                 },
                                                 "usage": usage
-                                            })
+                                            }),
                                         );
                                         match tx.send(Ok(Bytes::from(delta))).await {
                                             Ok(_) => emitted_events += 1,
@@ -619,6 +655,8 @@ pub(crate) async fn handle_stream(
                                     }
                                 }
                             }
+
+                            compact_sse_buffer(&mut buffer, &mut read_offset);
                         } else {
                             break;
                         }

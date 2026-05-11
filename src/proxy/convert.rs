@@ -1,10 +1,10 @@
-use std::collections::HashMap;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use tracing::{debug, warn};
 
+use super::state::strip_leading_anthropic_billing_header;
 use crate::config::{Config, ProviderFormat};
 use crate::error::Result;
-use super::state::strip_leading_anthropic_billing_header;
 
 pub(crate) fn is_openai_o_series(model: &str) -> bool {
     model.len() > 1
@@ -139,21 +139,20 @@ pub(crate) fn sanitize_tool_name(
     (sanitized, modified)
 }
 
-pub fn clean_schema(mut schema: Value) -> Value {
+pub fn clean_schema(schema: &mut Value) {
     if let Some(obj) = schema.as_object_mut() {
         if obj.get("format").and_then(|v| v.as_str()) == Some("uri") {
             obj.remove("format");
         }
         if let Some(properties) = obj.get_mut("properties").and_then(|v| v.as_object_mut()) {
-            for (_, value) in properties.iter_mut() {
-                *value = clean_schema(value.clone());
+            for value in properties.values_mut() {
+                clean_schema(value);
             }
         }
         if let Some(items) = obj.get_mut("items") {
-            *items = clean_schema(items.clone());
+            clean_schema(items);
         }
     }
-    schema
 }
 
 pub(crate) fn convert_tools(tools: &Value, forward_map: &mut HashMap<String, String>) -> Value {
@@ -175,13 +174,14 @@ pub(crate) fn convert_tools(tools: &Value, forward_map: &mut HashMap<String, Str
                         .get("description")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    let input_schema = tool.get("input_schema").cloned().unwrap_or(json!({}));
+                    let mut input_schema = tool.get("input_schema").cloned().unwrap_or(json!({}));
+                    clean_schema(&mut input_schema);
                     let mut t = json!({
                         "type": "function",
                         "function": {
                             "name": name,
                             "description": description,
-                            "parameters": clean_schema(input_schema)
+                            "parameters": input_schema
                         }
                     });
                     if let Some(cc) = tool.get("cache_control") {

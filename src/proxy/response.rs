@@ -1,18 +1,18 @@
+use axum::body::Body;
 use axum::http::header;
 use axum::http::StatusCode;
 use axum::response::Response;
-use axum::body::Body;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::Instant;
 use tracing::{error, info};
 
-use crate::error::{AppError, Result};
 use super::convert::openai_id_to_anthropic;
 use super::state::elapsed_ms;
 use super::state::MAX_LOG_BODY_BYTES;
-use super::stream::{extract_openai_usage_parts, build_anthropic_usage};
+use super::stream::{build_anthropic_usage, extract_openai_usage_parts};
 use super::utils::truncate_for_log;
+use crate::error::{AppError, Result};
 
 pub(crate) async fn handle_non_stream(
     upstream_resp: reqwest::Response,

@@ -1,14 +1,14 @@
-mod state;
-mod utils;
 mod convert;
-mod response;
-mod stream;
-mod passthrough;
 mod handlers;
+mod passthrough;
+mod response;
+mod state;
+mod stream;
 #[cfg(test)]
 mod tests;
+mod utils;
 
-pub use handlers::{event_logging_batch, proxy_messages};
-pub use state::AppState;
 #[allow(unused_imports)]
 pub use convert::clean_schema;
+pub use handlers::{event_logging_batch, proxy_messages};
+pub use state::AppState;

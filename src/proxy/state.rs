@@ -1,9 +1,9 @@
+use reqwest::Client;
 use std::{
     sync::atomic::{AtomicU64, Ordering},
     sync::Arc,
     time::{Duration, Instant},
 };
-use reqwest::Client;
 use tracing::info;
 
 use crate::config::Config;
@@ -95,6 +95,8 @@ impl AppState {
     pub fn new(config: Config) -> Self {
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(UPSTREAM_CONNECT_TIMEOUT_SECS))
+            .tcp_nodelay(true)
+            .tcp_keepalive(Duration::from_secs(60))
             .build()
             .expect("构建 HTTP 客户端失败");
 
