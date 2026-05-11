@@ -1312,22 +1312,7 @@ async fn convert_non_stream_response(
     };
 
     let usage = body.get("usage").cloned().unwrap_or(json!({}));
-    let input_tokens = usage
-        .get("prompt_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let output_tokens = usage
-        .get("completion_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let cache_read = usage
-        .get("prompt_cache_hit_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let cache_creation = usage
-        .get("prompt_cache_miss_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let usage_parts = extract_openai_usage_parts(&usage);
 
     json!({
         "type": "message",
@@ -1337,12 +1322,7 @@ async fn convert_non_stream_response(
         "model": model,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "cache_read_input_tokens": cache_read,
-            "cache_creation_input_tokens": cache_creation
-        }
+        "usage": build_anthropic_usage(usage_parts, 0)
     })
 }
 
@@ -1385,10 +1365,92 @@ fn close_open_tool_blocks(events: &mut Vec<String>, open_tool_blocks: &mut BTree
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct UsageParts {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+}
+
+impl UsageParts {
+    fn has_any(self) -> bool {
+        self.input_tokens.is_some()
+            || self.output_tokens.is_some()
+            || self.cache_read_input_tokens.is_some()
+            || self.cache_creation_input_tokens.is_some()
+    }
+
+    fn merge(&mut self, other: UsageParts) {
+        if other.input_tokens.is_some() {
+            self.input_tokens = other.input_tokens;
+        }
+        if other.output_tokens.is_some() {
+            self.output_tokens = other.output_tokens;
+        }
+        if other.cache_read_input_tokens.is_some() {
+            self.cache_read_input_tokens = other.cache_read_input_tokens;
+        }
+        if other.cache_creation_input_tokens.is_some() {
+            self.cache_creation_input_tokens = other.cache_creation_input_tokens;
+        }
+    }
+}
+
+fn usage_u64(usage: &Value, key: &str) -> Option<u64> {
+    usage.get(key).and_then(|v| v.as_u64())
+}
+
+fn usage_nested_u64(usage: &Value, object_key: &str, key: &str) -> Option<u64> {
+    usage
+        .get(object_key)
+        .and_then(|v| v.get(key))
+        .and_then(|v| v.as_u64())
+}
+
+fn extract_openai_usage_parts(usage: &Value) -> UsageParts {
+    UsageParts {
+        input_tokens: usage_u64(usage, "prompt_tokens")
+            .or_else(|| usage_u64(usage, "input_tokens")),
+        output_tokens: usage_u64(usage, "completion_tokens")
+            .or_else(|| usage_u64(usage, "output_tokens")),
+        cache_read_input_tokens: usage_u64(usage, "prompt_cache_hit_tokens")
+            .or_else(|| usage_u64(usage, "cache_read_input_tokens"))
+            .or_else(|| usage_nested_u64(usage, "prompt_tokens_details", "cached_tokens")),
+        cache_creation_input_tokens: usage_u64(usage, "prompt_cache_miss_tokens")
+            .or_else(|| usage_u64(usage, "cache_creation_input_tokens"))
+            .or_else(|| {
+                usage_nested_u64(
+                    usage,
+                    "prompt_tokens_details",
+                    "cache_creation_input_tokens",
+                )
+            }),
+    }
+}
+
+fn build_anthropic_usage(parts: UsageParts, fallback_output_tokens: u64) -> Value {
+    let mut usage = json!({
+        "output_tokens": parts.output_tokens.unwrap_or(fallback_output_tokens)
+    });
+
+    if let Some(input_tokens) = parts.input_tokens {
+        usage["input_tokens"] = json!(input_tokens);
+    }
+    if let Some(cache_read) = parts.cache_read_input_tokens {
+        usage["cache_read_input_tokens"] = json!(cache_read);
+    }
+    if let Some(cache_creation) = parts.cache_creation_input_tokens {
+        usage["cache_creation_input_tokens"] = json!(cache_creation);
+    }
+
+    usage
+}
+
 async fn handle_stream(
     upstream_resp: reqwest::Response,
     model: &str,
-    input_tokens: u64,
+    _estimated_input_tokens: u64,
     tool_name_reverse_map: &HashMap<String, String>,
     request_id: String,
     request_start: Instant,
@@ -1419,8 +1481,7 @@ async fn handle_stream(
         let mut has_emitted_message_delta = false;
         let mut tool_block_indices: HashMap<usize, usize> = HashMap::new();
         let mut open_tool_blocks: BTreeSet<usize> = BTreeSet::new();
-        let mut actual_output_tokens: Option<u64> = None;
-        let mut actual_input_tokens: Option<u64> = None;
+        let mut actual_usage = UsageParts::default();
         let mut stop_reason_value: Option<String> = None;
         let mut upstream_chunks: u64 = 0;
         let mut emitted_events: u64 = 0;
@@ -1431,8 +1492,7 @@ async fn handle_stream(
                               ended: bool,
                               upstream_chunks: u64,
                               emitted_events: u64,
-                              actual_input_tokens: Option<u64>,
-                              actual_output_tokens: Option<u64>,
+                              actual_usage: UsageParts,
                               stop_reason_value: Option<&str>| {
             info!(
                 request_id = request_id.as_str(),
@@ -1442,8 +1502,10 @@ async fn handle_stream(
                 ended,
                 upstream_chunks,
                 emitted_events,
-                actual_input_tokens,
-                actual_output_tokens,
+                actual_input_tokens = actual_usage.input_tokens,
+                actual_output_tokens = actual_usage.output_tokens,
+                actual_cache_read_input_tokens = actual_usage.cache_read_input_tokens,
+                actual_cache_creation_input_tokens = actual_usage.cache_creation_input_tokens,
                 stop_reason = stop_reason_value.unwrap_or(""),
                 upstream_headers_ms,
                 upstream_total_ms = elapsed_ms(upstream_start),
@@ -1474,13 +1536,12 @@ async fn handle_stream(
                                 if data == "[DONE]" {
                                     upstream_chunks += 1;
                                     // 如果上游返回了实际 usage，用实际值重新生成 message_delta
-                                    if let Some(actual) = actual_output_tokens {
+                                    if actual_usage.has_any() {
                                         let sr = stop_reason_value.as_deref().unwrap_or("end_turn");
-                                        let mut usage = json!({"output_tokens": actual});
-                                        // 上游若返回了 prompt_tokens，一并透传
-                                        if let Some(prompt) = actual_input_tokens {
-                                            usage["input_tokens"] = json!(prompt);
-                                        }
+                                        let usage = build_anthropic_usage(
+                                            actual_usage,
+                                            output_tokens as u64,
+                                        );
                                         let delta = format!(
                                             "event: message_delta\ndata: {}\n\n",
                                             json!({
@@ -1502,8 +1563,7 @@ async fn handle_stream(
                                                     ended,
                                                     upstream_chunks,
                                                     emitted_events,
-                                                    actual_input_tokens,
-                                                    actual_output_tokens,
+                                                    actual_usage,
                                                     stop_reason_value.as_deref(),
                                                 );
                                                 return;
@@ -1520,8 +1580,7 @@ async fn handle_stream(
                                                     ended,
                                                     upstream_chunks,
                                                     emitted_events,
-                                                    actual_input_tokens,
-                                                    actual_output_tokens,
+                                                    actual_usage,
                                                     stop_reason_value.as_deref(),
                                                 );
                                                 return;
@@ -1537,8 +1596,7 @@ async fn handle_stream(
                                             ended,
                                             upstream_chunks,
                                             emitted_events,
-                                            actual_input_tokens,
-                                            actual_output_tokens,
+                                            actual_usage,
                                             stop_reason_value.as_deref(),
                                         );
                                     } else {
@@ -1549,8 +1607,7 @@ async fn handle_stream(
                                             ended,
                                             upstream_chunks,
                                             emitted_events,
-                                            actual_input_tokens,
-                                            actual_output_tokens,
+                                            actual_usage,
                                             stop_reason_value.as_deref(),
                                         );
                                     }
@@ -1561,16 +1618,7 @@ async fn handle_stream(
                                     upstream_chunks += 1;
                                     // 检查上游是否在最后一个 chunk 返回了 usage
                                     if let Some(usage) = chunk.get("usage") {
-                                        if let Some(completion) =
-                                            usage.get("completion_tokens").and_then(|v| v.as_u64())
-                                        {
-                                            actual_output_tokens = Some(completion);
-                                        }
-                                        if let Some(prompt) =
-                                            usage.get("prompt_tokens").and_then(|v| v.as_u64())
-                                        {
-                                            actual_input_tokens = Some(prompt);
-                                        }
+                                        actual_usage.merge(extract_openai_usage_parts(usage));
                                         // 如果 choices 为空，这是纯 usage chunk，跳过
                                         if chunk
                                             .get("choices")
@@ -1591,7 +1639,6 @@ async fn handle_stream(
                                         &mut next_content_block_index,
                                         &mut ended,
                                         &mut pending_message_delta,
-                                        input_tokens,
                                         &mut output_tokens,
                                         &reverse_map,
                                         &mut tool_block_indices,
@@ -1610,8 +1657,7 @@ async fn handle_stream(
                                                     ended,
                                                     upstream_chunks,
                                                     emitted_events,
-                                                    actual_input_tokens,
-                                                    actual_output_tokens,
+                                                    actual_usage,
                                                     stop_reason_value.as_deref(),
                                                 );
                                                 return;
@@ -1647,8 +1693,7 @@ async fn handle_stream(
                         ended,
                         upstream_chunks,
                         emitted_events,
-                        actual_input_tokens,
-                        actual_output_tokens,
+                        actual_usage,
                         stop_reason_value.as_deref(),
                     );
                     return;
@@ -1669,8 +1714,7 @@ async fn handle_stream(
                 ended,
                 upstream_chunks,
                 emitted_events,
-                actual_input_tokens,
-                actual_output_tokens,
+                actual_usage,
                 stop_reason_value.as_deref(),
             );
         } else if started && ended {
@@ -1692,8 +1736,7 @@ async fn handle_stream(
                 ended,
                 upstream_chunks,
                 emitted_events,
-                actual_input_tokens,
-                actual_output_tokens,
+                actual_usage,
                 stop_reason_value.as_deref(),
             );
         } else {
@@ -1704,8 +1747,7 @@ async fn handle_stream(
                 ended,
                 upstream_chunks,
                 emitted_events,
-                actual_input_tokens,
-                actual_output_tokens,
+                actual_usage,
                 stop_reason_value.as_deref(),
             );
         }
@@ -1781,7 +1823,6 @@ fn convert_stream_chunk(
     next_content_block_index: &mut usize,
     ended: &mut bool,
     pending_message_delta: &mut Option<String>,
-    input_tokens: u64,
     output_tokens: &mut usize,
     tool_name_reverse_map: &HashMap<String, String>,
     tool_block_indices: &mut HashMap<usize, usize>,
@@ -1825,7 +1866,7 @@ fn convert_stream_chunk(
                     "role": "assistant",
                     "model": model,
                     "usage": {
-                        "input_tokens": input_tokens,
+                        "input_tokens": 0,
                         "output_tokens": 0
                     }
                 }
@@ -2245,6 +2286,77 @@ mod tests {
     }
 
     #[test]
+    fn stream_message_start_does_not_emit_estimated_input_tokens() {
+        let mut stream_id = String::new();
+        let mut started = false;
+        let mut current_block = None;
+        let mut next_content_block_index = 0;
+        let mut ended = false;
+        let mut pending_message_delta = None;
+        let mut output_tokens = 0;
+        let mut tool_block_indices = HashMap::new();
+        let mut open_tool_blocks = BTreeSet::new();
+        let mut stop_reason_value = None;
+        let tool_name_map = HashMap::new();
+
+        let chunk = json!({
+            "id": "chatcmpl_123",
+            "choices": [{
+                "delta": {"role": "assistant"},
+                "finish_reason": null
+            }]
+        });
+        let events = convert_stream_chunk(
+            &chunk,
+            "deepseek-v4-pro",
+            &mut stream_id,
+            &mut started,
+            &mut current_block,
+            &mut next_content_block_index,
+            &mut ended,
+            &mut pending_message_delta,
+            &mut output_tokens,
+            &tool_name_map,
+            &mut tool_block_indices,
+            &mut open_tool_blocks,
+            &mut stop_reason_value,
+        );
+        let text = events.join("");
+
+        assert!(text.contains(r#""input_tokens":0"#));
+        assert!(text.contains(r#""output_tokens":0"#));
+    }
+
+    #[test]
+    fn usage_parts_include_cache_token_variants() {
+        let usage = json!({
+            "prompt_tokens": 123,
+            "completion_tokens": 45,
+            "prompt_cache_hit_tokens": 67,
+            "prompt_cache_miss_tokens": 89
+        });
+        let anthropic = build_anthropic_usage(extract_openai_usage_parts(&usage), 0);
+
+        assert_eq!(anthropic["input_tokens"].as_u64(), Some(123));
+        assert_eq!(anthropic["output_tokens"].as_u64(), Some(45));
+        assert_eq!(anthropic["cache_read_input_tokens"].as_u64(), Some(67));
+        assert_eq!(anthropic["cache_creation_input_tokens"].as_u64(), Some(89));
+
+        let usage = json!({
+            "input_tokens": 10,
+            "output_tokens": 3,
+            "prompt_tokens_details": {
+                "cached_tokens": 7
+            }
+        });
+        let anthropic = build_anthropic_usage(extract_openai_usage_parts(&usage), 0);
+
+        assert_eq!(anthropic["input_tokens"].as_u64(), Some(10));
+        assert_eq!(anthropic["output_tokens"].as_u64(), Some(3));
+        assert_eq!(anthropic["cache_read_input_tokens"].as_u64(), Some(7));
+    }
+
+    #[test]
     fn stream_tool_use_stop_uses_allocated_block_index() {
         let mut stream_id = String::new();
         let mut started = false;
@@ -2277,7 +2389,6 @@ mod tests {
             &mut next_content_block_index,
             &mut ended,
             &mut pending_message_delta,
-            10,
             &mut output_tokens,
             &tool_name_map,
             &mut tool_block_indices,
@@ -2314,7 +2425,6 @@ mod tests {
             &mut next_content_block_index,
             &mut ended,
             &mut pending_message_delta,
-            10,
             &mut output_tokens,
             &tool_name_map,
             &mut tool_block_indices,
