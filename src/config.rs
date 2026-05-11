@@ -47,6 +47,17 @@ pub struct ProviderConfig {
     pub format: ProviderFormat,
     #[serde(default)]
     pub quirks: ProviderQuirks,
+    #[serde(default)]
+    pub model_routes: Vec<ModelRoute>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelRoute {
+    #[serde(rename = "match")]
+    pub pattern: String,
+    pub target: String,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -57,10 +68,38 @@ pub struct ProviderQuirks {
     /// 是否不支持 json_schema，需降级为 json_object（如 DeepSeek V4）
     #[serde(default)]
     pub no_json_schema: bool,
+    /// 是否为非 OpenAI 内置推理模型也转发 reasoning_effort（如 DeepSeek V4）
+    #[serde(default)]
+    pub supports_reasoning_effort: bool,
     /// Anthropic "max"/"adaptive" 推理强度映射到 OpenAI 的最大值
     /// 保守默认 "high"，若 provider 支持 "xhigh" 则可配置
     #[serde(default = "default_max_reasoning_effort")]
     pub max_reasoning_effort: String,
+}
+
+impl ProviderConfig {
+    fn matching_route<'a>(&'a self, requested_model: Option<&str>) -> Option<&'a ModelRoute> {
+        let requested_model = requested_model?;
+        let requested_model = requested_model.to_ascii_lowercase();
+        self.model_routes.iter().find(|route| {
+            !route.pattern.is_empty()
+                && requested_model.contains(&route.pattern.to_ascii_lowercase())
+        })
+    }
+
+    pub fn resolve_model<'a>(&'a self, requested_model: Option<&str>) -> &'a str {
+        self.matching_route(requested_model)
+            .map(|route| route.target.as_str())
+            .unwrap_or(self.model.as_str())
+    }
+
+    pub fn resolve_route_reasoning_effort<'a>(
+        &'a self,
+        requested_model: Option<&str>,
+    ) -> Option<&'a str> {
+        self.matching_route(requested_model)
+            .and_then(|route| route.reasoning_effort.as_deref())
+    }
 }
 
 impl Config {

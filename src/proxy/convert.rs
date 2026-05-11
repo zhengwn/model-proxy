@@ -259,9 +259,17 @@ pub(crate) fn anthropic_to_openai(
     config: &Config,
 ) -> (Value, HashMap<String, String>) {
     let quirks = &config.provider.quirks;
+    let provider_model = config
+        .provider
+        .resolve_model(body.get("model").and_then(|v| v.as_str()))
+        .to_string();
+    let route_reasoning_effort = config
+        .provider
+        .resolve_route_reasoning_effort(body.get("model").and_then(|v| v.as_str()))
+        .map(str::to_string);
     let mut openai = json!({});
 
-    openai["model"] = json!(config.provider.model.clone());
+    openai["model"] = json!(provider_model.clone());
 
     let mut forward_map = HashMap::new();
     if let Some(tools) = body.get("tools") {
@@ -482,7 +490,7 @@ pub(crate) fn anthropic_to_openai(
 
     openai["messages"] = json!(messages);
 
-    let model_str = config.provider.model.as_str();
+    let model_str = provider_model.as_str();
     if let Some(v) = body.get("max_tokens") {
         if is_openai_o_series(model_str) {
             openai["max_completion_tokens"] = v.clone();
@@ -491,8 +499,10 @@ pub(crate) fn anthropic_to_openai(
         }
     }
 
-    if supports_reasoning_effort(model_str) {
-        if let Some(effort) = resolve_reasoning_effort(&body, &quirks.max_reasoning_effort) {
+    if quirks.supports_reasoning_effort || supports_reasoning_effort(model_str) {
+        if let Some(effort) = route_reasoning_effort
+            .or_else(|| resolve_reasoning_effort(&body, &quirks.max_reasoning_effort))
+        {
             openai["reasoning_effort"] = json!(effort);
         }
     }
@@ -542,7 +552,11 @@ pub(crate) fn prepare_body(
         }
         ProviderFormat::Anthropic => {
             if let Some(obj) = body.as_object_mut() {
-                obj.insert("model".to_string(), json!(config.provider.model.clone()));
+                let provider_model = config
+                    .provider
+                    .resolve_model(obj.get("model").and_then(|v| v.as_str()))
+                    .to_string();
+                obj.insert("model".to_string(), json!(provider_model));
             }
             Ok((body, stream, HashMap::new()))
         }

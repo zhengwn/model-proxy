@@ -43,6 +43,16 @@ fn sse_event_literal(event: &str, json_literal: &str) -> String {
     s
 }
 
+fn sse_content_block_stop(index: usize) -> String {
+    let index = index.to_string();
+    let json_len = r#"{"type":"content_block_stop","index":}"#.len() + index.len();
+    let mut s = String::with_capacity(8 + "content_block_stop".len() + 8 + json_len + 2);
+    s.push_str("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":");
+    s.push_str(&index);
+    s.push_str("}\n\n");
+    s
+}
+
 type StreamEvents = SmallVec<[String; 4]>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,10 +90,7 @@ pub(crate) fn compact_sse_buffer(buffer: &mut String, read_offset: &mut usize) {
 }
 
 fn push_content_block_stop(events: &mut StreamEvents, index: usize) {
-    events.push(sse_event(
-        "content_block_stop",
-        &json!({"type": "content_block_stop", "index": index}),
-    ));
+    events.push(sse_content_block_stop(index));
 }
 
 fn stop_current_stream_block(events: &mut StreamEvents, current_block: &mut Option<CurrentBlock>) {
@@ -188,10 +195,7 @@ async fn send_final_events(
     let mut sent = 0;
     if let Some(block) = *current_block {
         if tx
-            .send(Ok(Bytes::from(sse_event(
-                "content_block_stop",
-                &json!({"type": "content_block_stop", "index": block.index}),
-            ))))
+            .send(Ok(Bytes::from(sse_content_block_stop(block.index))))
             .await
             .is_ok()
         {
@@ -201,10 +205,7 @@ async fn send_final_events(
 
     for index in open_tool_blocks {
         if tx
-            .send(Ok(Bytes::from(sse_event(
-                "content_block_stop",
-                &json!({"type": "content_block_stop", "index": index}),
-            ))))
+            .send(Ok(Bytes::from(sse_content_block_stop(*index))))
             .await
             .is_ok()
         {
@@ -443,7 +444,6 @@ pub(crate) fn convert_stream_chunk(
 pub(crate) async fn handle_stream(
     upstream_resp: reqwest::Response,
     model: &str,
-    _estimated_input_tokens: u64,
     tool_name_reverse_map: Arc<HashMap<String, String>>,
     request_id: String,
     request_start: std::time::Instant,

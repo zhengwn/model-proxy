@@ -37,9 +37,10 @@ pub(crate) async fn handle_non_stream(
         .to_ascii_lowercase();
     let is_json = media_type == "application/json" || media_type.ends_with("+json");
 
-    let body_text = upstream_resp.text().await?;
-    let body: Value = serde_json::from_str(&body_text).map_err(|e| {
-        let preview = truncate_for_log(&body_text, MAX_LOG_BODY_BYTES);
+    let body_bytes = upstream_resp.bytes().await?;
+    let body: Value = serde_json::from_slice(&body_bytes).map_err(|e| {
+        let body_preview = String::from_utf8_lossy(&body_bytes);
+        let preview = truncate_for_log(&body_preview, MAX_LOG_BODY_BYTES);
         if is_json {
             error!(
                 request_id,

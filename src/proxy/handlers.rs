@@ -19,7 +19,7 @@ use super::state::{
     NON_STREAM_REQUEST_TIMEOUT_SECS,
 };
 use super::stream::handle_stream;
-use super::utils::{estimate_input_tokens, message_count, tool_count, truncate_for_log};
+use super::utils::{message_count, tool_count, truncate_for_log};
 use crate::{
     config::Config,
     error::{AppError, Result},
@@ -67,15 +67,17 @@ pub async fn proxy_messages(
         })?;
 
     let body_json: Value = serde_json::from_slice(&bytes)?;
+    let requested_model = body_json
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     request_guard.set_phase("received_body");
     info!(
         request_id = request_id.as_str(),
         body_bytes = bytes.len(),
         body_limit_bytes = state.config.server.max_body_bytes,
-        model = body_json
-            .get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or(""),
+        model = requested_model.as_str(),
         stream = body_json
             .get("stream")
             .and_then(|v| v.as_bool())
@@ -85,14 +87,28 @@ pub async fn proxy_messages(
         "收到客户端请求"
     );
 
-    let input_tokens = estimate_input_tokens(&body_json);
-
     request_guard.set_phase("prepare_body");
     let (body_json, is_stream, tool_name_map) = prepare_body(body_json, &state.config)?;
+    let provider_model = body_json
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or(state.config.provider.model.as_str());
+    let reasoning_effort = body_json
+        .get("reasoning_effort")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let route_reasoning_effort = state
+        .config
+        .provider
+        .resolve_route_reasoning_effort(Some(requested_model.as_str()))
+        .unwrap_or("");
 
     info!(
         request_id = request_id.as_str(),
-        provider_model = state.config.provider.model.as_str(),
+        requested_model = requested_model.as_str(),
+        provider_model,
+        route_reasoning_effort,
+        reasoning_effort,
         provider_format = ?state.config.provider.format,
         stream = is_stream,
         messages = message_count(&body_json),
@@ -172,7 +188,6 @@ pub async fn proxy_messages(
                 handle_stream(
                     upstream_resp,
                     &model,
-                    input_tokens,
                     Arc::new(tool_name_map),
                     request_id,
                     request_start,

@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::{Config, ProviderFormat};
+use crate::config::{Config, ModelRoute, ProviderFormat};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -20,8 +20,26 @@ fn test_config_with_model(model: &str) -> Config {
             model: model.to_string(),
             format: ProviderFormat::Openai,
             quirks: Default::default(),
+            model_routes: Vec::new(),
         },
     }
+}
+
+fn test_config_with_routes() -> Config {
+    let mut config = test_config();
+    config.provider.model_routes = vec![
+        ModelRoute {
+            pattern: "sonnet".to_string(),
+            target: "deepseek-v4-pro".to_string(),
+            reasoning_effort: Some("max".to_string()),
+        },
+        ModelRoute {
+            pattern: "haiku".to_string(),
+            target: "deepseek-v4-flash".to_string(),
+            reasoning_effort: Some("high".to_string()),
+        },
+    ];
+    config
 }
 
 #[test]
@@ -150,6 +168,85 @@ fn max_tokens_uses_provider_model_capabilities() {
 
     assert_eq!(openai["max_completion_tokens"].as_u64(), Some(1024));
     assert!(openai.get("max_tokens").is_none());
+}
+
+#[test]
+fn model_routes_map_claude_families_to_provider_models() {
+    let config = test_config_with_routes();
+
+    let body = json!({
+        "model": "claude-sonnet-4-7",
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let (openai, _) = convert::anthropic_to_openai(body, &config);
+    assert_eq!(openai["model"].as_str(), Some("deepseek-v4-pro"));
+
+    let body = json!({
+        "model": "claude-haiku-4-5-20251001",
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let (openai, _) = convert::anthropic_to_openai(body, &config);
+    assert_eq!(openai["model"].as_str(), Some("deepseek-v4-flash"));
+}
+
+#[test]
+fn model_routes_fallback_to_default_provider_model() {
+    let config = test_config_with_routes();
+    let body = json!({
+        "model": "claude-opus-4-1",
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+
+    let (openai, _) = convert::anthropic_to_openai(body, &config);
+
+    assert_eq!(openai["model"].as_str(), Some("deepseek-v4-pro"));
+}
+
+#[test]
+fn model_capabilities_use_routed_provider_model() {
+    let mut config = test_config();
+    config.provider.model_routes = vec![ModelRoute {
+        pattern: "sonnet".to_string(),
+        target: "o1-mini".to_string(),
+        reasoning_effort: None,
+    }];
+    let body = json!({
+        "model": "claude-sonnet-4-7",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1024
+    });
+
+    let (openai, _) = convert::anthropic_to_openai(body, &config);
+
+    assert_eq!(openai["model"].as_str(), Some("o1-mini"));
+    assert_eq!(openai["max_completion_tokens"].as_u64(), Some(1024));
+    assert!(openai.get("max_tokens").is_none());
+}
+
+#[test]
+fn provider_quirk_forces_route_specific_reasoning_effort_to_deepseek() {
+    let mut config = test_config_with_routes();
+    config.provider.quirks.supports_reasoning_effort = true;
+    let body = json!({
+        "model": "claude-sonnet-4-7",
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": {"type": "enabled", "budget_tokens": 1024}
+    });
+
+    let (openai, _) = convert::anthropic_to_openai(body, &config);
+
+    assert_eq!(openai["model"].as_str(), Some("deepseek-v4-pro"));
+    assert_eq!(openai["reasoning_effort"].as_str(), Some("max"));
+
+    let body = json!({
+        "model": "claude-haiku-4-5-20251001",
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": {"type": "adaptive"}
+    });
+    let (openai, _) = convert::anthropic_to_openai(body, &config);
+
+    assert_eq!(openai["model"].as_str(), Some("deepseek-v4-flash"));
+    assert_eq!(openai["reasoning_effort"].as_str(), Some("high"));
 }
 
 #[test]

@@ -10,8 +10,19 @@ api_key = "replace-with-your-provider-api-key"
 model = "deepseek-v4-pro"
 format = "openai"
 
+[[provider.model_routes]]
+match = "sonnet"
+target = "deepseek-v4-pro"
+reasoning_effort = "max"
+
+[[provider.model_routes]]
+match = "haiku"
+target = "deepseek-v4-flash"
+reasoning_effort = "high"
+
 [provider.quirks]
 # DeepSeek V4 specific behavior.
 reasoning_all_or_nothing = true
 no_json_schema = true
-max_reasoning_effort = "high"
+supports_reasoning_effort = true
+max_reasoning_effort = "max"

@@ -12,6 +12,8 @@ pub(crate) const ANTHROPIC_BILLING_HEADER_PREFIX: &str = "x-anthropic-billing-he
 pub(crate) const MAX_LOG_BODY_BYTES: usize = 4096;
 pub(crate) const UPSTREAM_CONNECT_TIMEOUT_SECS: u64 = 30;
 pub(crate) const NON_STREAM_REQUEST_TIMEOUT_SECS: u64 = 300;
+pub(crate) const UPSTREAM_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
+pub(crate) const UPSTREAM_POOL_MAX_IDLE_PER_HOST: usize = 32;
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn next_request_id() -> String {
@@ -95,6 +97,8 @@ impl AppState {
     pub fn new(config: Config) -> Self {
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(UPSTREAM_CONNECT_TIMEOUT_SECS))
+            .pool_idle_timeout(Duration::from_secs(UPSTREAM_POOL_IDLE_TIMEOUT_SECS))
+            .pool_max_idle_per_host(UPSTREAM_POOL_MAX_IDLE_PER_HOST)
             .tcp_nodelay(true)
             .tcp_keepalive(Duration::from_secs(60))
             .build()
