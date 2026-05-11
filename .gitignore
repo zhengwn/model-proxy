@@ -1,0 +1,15 @@
+.DS_Store
+
+# Local secrets and runtime configuration
+config.toml
+*.local.toml
+.env
+.env.*
+
+# Build artifacts and logs
+target/
+logs/
+*.log
+
+# Local reference material used during development
+reference/

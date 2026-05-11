@@ -1,0 +1,17 @@
+[server]
+port = 4000
+# Optional. If set, clients must provide this value via x-api-key or Authorization.
+api_key = "change-me"
+# max_body_bytes = 67108864
+
+[provider]
+base_url = "https://opencode.ai/zen/go/"
+api_key = "replace-with-your-provider-api-key"
+model = "deepseek-v4-pro"
+format = "openai"
+
+[provider.quirks]
+# DeepSeek V4 specific behavior.
+reasoning_all_or_nothing = true
+no_json_schema = true
+max_reasoning_effort = "high"
