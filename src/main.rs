@@ -1,19 +1,9 @@
-mod config;
-mod error;
-mod proxy;
-
-use axum::{routing::get, routing::post, Json, Router};
-use serde_json::json;
-use std::net::SocketAddr;
-use tower_http::cors::CorsLayer;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use crate::{
-    config::Config,
-    proxy::{event_logging_batch, proxy_messages, AppState},
-};
+use proxy_core::config::Config;
 
 fn stdout_logging_enabled() -> bool {
     std::env::var("MODEL_PROXY_STDOUT_LOG")
@@ -68,9 +58,15 @@ async fn main() {
     // 加载配置
     let config = match Config::load() {
         Ok(c) => {
+            let active_name = c.active_provider.as_deref().unwrap_or_else(|| {
+                c.providers
+                    .first()
+                    .map(|p| p.name.as_str())
+                    .unwrap_or("unknown")
+            });
             info!(
-                "配置加载成功: port={}, provider={}",
-                c.server.port, c.provider.base_url
+                "配置加载成功: port={}, active_provider={}",
+                c.server.port, active_name
             );
             c
         }
@@ -80,34 +76,19 @@ async fn main() {
         }
     };
 
-    let port = config.server.port;
-    let state = AppState::new(config);
+    let token = CancellationToken::new();
+    let shutdown_token = token.clone();
 
-    // 构建路由
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/v1/messages", post(proxy_messages))
-        .route("/api/event_logging/batch", post(event_logging_batch))
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+    // Spawn a task to listen for shutdown signals and cancel the token
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        shutdown_token.cancel();
+    });
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    info!("监听地址: http://{}", addr);
+    let handle = proxy_core::start_server(config, token.clone());
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("绑定端口 {} 失败: {}", port, e);
-            std::process::exit(1);
-        });
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("服务运行错误: {}", e);
-            std::process::exit(1);
-        });
+    // Wait for the server to finish
+    let _ = handle.await;
 }
 
 #[cfg(unix)]
@@ -145,8 +126,4 @@ async fn shutdown_signal() {
         error!("监听 SIGINT 失败: {}", e);
     }
     info!(signal = "SIGINT", "收到退出信号，正在优雅关闭...");
-}
-
-async fn health() -> Json<serde_json::Value> {
-    Json(json!({"status": "ok"}))
 }

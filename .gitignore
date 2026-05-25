@@ -1,5 +1,9 @@
 .DS_Store
 
+# IDE / editor settings
+.kiro/
+.vscode/
+
 # Local secrets and runtime configuration
 config.toml
 *.local.toml
@@ -8,8 +12,12 @@ config.toml
 
 # Build artifacts and logs
 target/
+dist/
 logs/
 *.log
+
+# Node.js
+node_modules/
 
 # Local reference material used during development
 reference/

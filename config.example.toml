@@ -1,28 +1,78 @@
+# Model Proxy Configuration
+# This file defines the proxy server settings and one or more AI providers.
+# Copy this file to config.toml and fill in your actual API keys.
+
+# The name of the provider to use for proxying requests.
+# Must match one of the [[providers]] entries below.
+# If omitted, the first provider in the list is used.
+active_provider = "deepseek"
+
 [server]
 port = 4000
-# Optional. If set, clients must provide this value via x-api-key or Authorization.
+# Optional. If set, clients must provide this value via x-api-key or Authorization header.
 api_key = "change-me"
 # max_body_bytes = 67108864
 
-[provider]
-base_url = "https://opencode.ai/zen/go/"
-api_key = "replace-with-your-provider-api-key"
-model = "deepseek-v4-pro"
-format = "openai"
+# --- Global Model Routes ---
+# Model routes are global rules independent of any provider.
+# When the requested model name contains the "match" substring,
+# it will be routed to the "target" model instead.
 
-[[provider.model_routes]]
+[[model_routes]]
+match = "opus"
+target = "deepseek-v4-pro"
+reasoning_effort = "max"
+
+[[model_routes]]
 match = "sonnet"
 target = "deepseek-v4-pro"
 reasoning_effort = "max"
 
-[[provider.model_routes]]
+[[model_routes]]
 match = "haiku"
 target = "deepseek-v4-flash"
 reasoning_effort = "high"
 
-[provider.quirks]
-# DeepSeek V4 specific behavior.
+# --- Provider Definitions ---
+# Define one or more providers using [[providers]] array sections.
+# Each provider requires: name, base_url, api_key, model
+# Optional fields: format (default "openai"), quirks
+
+[[providers]]
+name = "deepseek"
+base_url = "https://api.deepseek.com/v1"
+api_key = "sk-deepseek-key"
+model = "deepseek-v4-pro"
+format = "openai"
+
+# Provider-specific quirks toggle non-standard behaviors.
+[providers.quirks]
 reasoning_all_or_nothing = true
 no_json_schema = true
 supports_reasoning_effort = true
 max_reasoning_effort = "max"
+
+[[providers]]
+name = "openai"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-openai-key"
+model = "gpt-4o"
+format = "openai"
+
+[[providers]]
+name = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key = "sk-ant-key"
+model = "claude-sonnet-4-20250514"
+format = "anthropic"
+
+# --- Logging Configuration ---
+# Controls request logging (JSONL files + frontend log viewer).
+
+[logging]
+enabled = true            # Set to false to disable request logging entirely
+level = "all"             # "all" logs every request; "errors_only" logs only 4xx/5xx
+# log_dir = "/path/to/logs"  # Custom log directory (default: app data dir / logs)
+record_body = false       # Whether to record request/response bodies (may contain sensitive data)
+max_body_bytes = 4096     # Max bytes to record per body (truncated beyond this)
+retention_days = 7        # Log files older than this are deleted on startup
