@@ -429,6 +429,43 @@ async fn chat_completions_endpoint_forwards_openai_format() {
 }
 
 #[tokio::test]
+async fn openai_provider_base_url_with_v1_does_not_duplicate_path() {
+    let port = find_available_port();
+    let mock_response = json!({
+        "id": "chatcmpl_v1_base",
+        "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 3}
+    });
+    let (mock_addr, mock_token) = start_mock_openai_server(mock_response).await;
+    let config = make_config(port, &format!("http://{}/v1", mock_addr));
+
+    let token = CancellationToken::new();
+    let handle = proxy_core::start_server(config, token.clone());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+        .header("content-type", "application/json")
+        .header("x-api-key", "test-key")
+        .json(&json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "ok");
+
+    token.cancel();
+    let _ = handle.await;
+    mock_token.cancel();
+}
+
+#[tokio::test]
 async fn fallback_tries_next_provider_on_error() {
     let port = find_available_port();
 
