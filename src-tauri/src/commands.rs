@@ -8,7 +8,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 use tokio::sync::Mutex;
 
-use proxy_core::config::{Config, ModelRoute, ProviderConfig};
+use proxy_core::config::{Config, ModelRoute, ProviderConfig, ServerConfig};
 use proxy_core::logging::{LogCollector, LogConfig};
 use proxy_core::proxy::AppState as ProxyCoreAppState;
 use proxy_core::ProviderRegistry;
@@ -85,6 +85,16 @@ pub async fn save_config(state: State<'_, AppState>, mut config: Config) -> Resu
     state.log_config.store(Arc::new(config.logging.clone()));
 
     Ok(())
+}
+
+/// Save only the server section without requiring providers to be configured.
+#[tauri::command]
+pub async fn save_server_config(
+    state: State<'_, AppState>,
+    server: ServerConfig,
+) -> Result<(), String> {
+    let _lock = state.config_lock.lock().await;
+    persist_server_config(&state.config_path, server)
 }
 
 /// Return the path to the configuration file.
@@ -647,6 +657,38 @@ fn persist_active_provider(config_path: &PathBuf, name: &str) -> Result<(), Stri
     Ok(())
 }
 
+/// Persist only the server settings. This supports first launch, where provider
+/// configuration is intentionally absent until the user adds one.
+fn persist_server_config(config_path: &PathBuf, server: ServerConfig) -> Result<(), String> {
+    let mut config = match get_config_internal(config_path) {
+        Ok(c) => c,
+        Err(e) if e.contains("不存在") => Config {
+            server: ServerConfig::default(),
+            provider: ProviderConfig::placeholder(),
+            active_provider: None,
+            providers: Vec::new(),
+            model_routes: Vec::new(),
+            logging: proxy_core::logging::LogConfig::default(),
+            fallback: proxy_core::config::FallbackConfig::default(),
+        },
+        Err(e) => return Err(e),
+    };
+
+    config.normalize();
+    config.server = server;
+    if config.providers.len() == 1
+        && config.providers[0].name == "default"
+        && config.providers[0].base_url.is_empty()
+        && config.providers[0].api_key.is_empty()
+        && config.providers[0].model.is_empty()
+    {
+        config.providers.clear();
+        config.active_provider = None;
+    }
+
+    persist_config(config_path, &config)
+}
+
 /// Persist the full config to the config file using the new format.
 fn persist_config(config_path: &PathBuf, config: &Config) -> Result<(), String> {
     if let Some(parent) = config_path.parent() {
@@ -843,6 +885,83 @@ format = "openai"
         assert_eq!(loaded.providers[0].name, "default");
         assert_eq!(loaded.providers[0].base_url, "https://api.example.com");
         assert_eq!(loaded.providers[0].model, "legacy-model");
+    }
+
+    #[test]
+    fn persist_server_config_creates_first_launch_config_without_provider() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        let server = ServerConfig {
+            port: 5050,
+            api_key: Some("local-secret".to_string()),
+            ..ServerConfig::default()
+        };
+
+        persist_server_config(&config_path, server).unwrap();
+
+        let loaded = get_config_internal(&config_path).unwrap();
+        assert_eq!(loaded.server.port, 5050);
+        assert_eq!(loaded.server.api_key.as_deref(), Some("local-secret"));
+        assert!(loaded.providers.is_empty());
+        assert_eq!(loaded.active_provider, None);
+    }
+
+    #[test]
+    fn persist_server_config_preserves_existing_providers() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        let config = make_config(vec![make_provider("alpha")]);
+        persist_config(&config_path, &config).unwrap();
+
+        let server = ServerConfig {
+            port: 5051,
+            api_key: None,
+            ..ServerConfig::default()
+        };
+
+        persist_server_config(&config_path, server).unwrap();
+
+        let loaded = get_config_internal(&config_path).unwrap();
+        assert_eq!(loaded.server.port, 5051);
+        assert_eq!(loaded.providers.len(), 1);
+        assert_eq!(loaded.providers[0].name, "alpha");
+        assert_eq!(loaded.active_provider, Some("alpha".to_string()));
+    }
+
+    #[test]
+    fn persist_server_config_removes_empty_default_placeholder_provider() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        let config = Config {
+            server: ServerConfig::default(),
+            provider: ProviderConfig::placeholder(),
+            active_provider: Some("default".to_string()),
+            providers: vec![ProviderConfig {
+                name: "default".to_string(),
+                ..ProviderConfig::placeholder()
+            }],
+            model_routes: Vec::new(),
+            logging: LogConfig::default(),
+            fallback: FallbackConfig::default(),
+        };
+        persist_config(&config_path, &config).unwrap();
+
+        persist_server_config(
+            &config_path,
+            ServerConfig {
+                port: 5052,
+                ..ServerConfig::default()
+            },
+        )
+        .unwrap();
+
+        let loaded = get_config_internal(&config_path).unwrap();
+        assert_eq!(loaded.server.port, 5052);
+        assert!(loaded.providers.is_empty());
+        assert_eq!(loaded.active_provider, None);
     }
 
     #[test]

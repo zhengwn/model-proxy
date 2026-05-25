@@ -1,4 +1,5 @@
 use tauri::{
+    image::Image,
     menu::{MenuBuilder, MenuItemBuilder},
     tray::TrayIconBuilder,
     AppHandle, Manager,
@@ -32,10 +33,15 @@ pub fn create_tray(app: &AppHandle) -> tauri::Result<()> {
         .item(&quit_item)
         .build()?;
 
-    // Use the app's default window icon for the tray
-    // This is configured via tauri.conf.json bundle.icon
     let mut builder = TrayIconBuilder::new().menu(&menu).tooltip("Model Proxy");
 
+    #[cfg(target_os = "macos")]
+    {
+        let tray_icon = Image::new(include_bytes!("../icons/tray-template.rgba"), 32, 32);
+        builder = builder.icon(tray_icon).icon_as_template(true);
+    }
+
+    #[cfg(not(target_os = "macos"))]
     if let Some(icon) = app.default_window_icon() {
         builder = builder.icon(icon.clone());
     }

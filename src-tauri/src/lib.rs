@@ -62,6 +62,7 @@ pub fn run() {
             greet,
             commands::get_config,
             commands::save_config,
+            commands::save_server_config,
             commands::get_config_path,
             commands::start_service,
             commands::stop_service,

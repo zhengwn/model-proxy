@@ -48,7 +48,7 @@ function StatusPanel() {
     const interval = setInterval(loadProviders, 15000);
     return () => clearInterval(interval);
   }, [loadProviders]);
-  const { config, configPath, isNew, saveConfig } = useConfig();
+  const { config, configPath, isNew, saveServerConfig } = useConfig();
   const [actionLoading, setActionLoading] = useState(false);
   const [serverPort, setServerPort] = useState<number>(4000);
   const [serverApiKey, setServerApiKey] = useState<string>("");
@@ -65,11 +65,11 @@ function StatusPanel() {
     setActionLoading(true);
     try {
       if (serverDirty && config) {
-        const updated = {
-          ...config,
-          server: { ...config.server, port: serverPort, api_key: serverApiKey || undefined },
-        };
-        await saveConfig(updated);
+        await saveServerConfig({
+          ...config.server,
+          port: serverPort,
+          api_key: serverApiKey || undefined,
+        });
         setServerDirty(false);
       }
       await startService();
@@ -96,11 +96,11 @@ function StatusPanel() {
   const handleSaveServer = async () => {
     if (!config) return;
     try {
-      const updated = {
-        ...config,
-        server: { ...config.server, port: serverPort, api_key: serverApiKey || undefined },
-      };
-      await saveConfig(updated);
+      await saveServerConfig({
+        ...config.server,
+        port: serverPort,
+        api_key: serverApiKey || undefined,
+      });
       setServerDirty(false);
       message.success("服务器设置已保存");
     } catch (err) {

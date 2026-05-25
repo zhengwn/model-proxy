@@ -1,27 +1,12 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { Config } from "../types";
+import type { Config, ServerConfig } from "../types";
 
 const DEFAULT_CONFIG: Config = {
   server: {
     port: 4000,
   },
-  active_provider: "default",
-  providers: [
-    {
-      name: "default",
-      base_url: "",
-      api_key: "",
-      model: "",
-      format: "openai",
-      quirks: {
-        reasoning_all_or_nothing: false,
-        no_json_schema: false,
-        supports_reasoning_effort: false,
-        max_reasoning_effort: "high",
-      },
-    },
-  ],
+  providers: [],
   model_routes: [],
 };
 
@@ -33,6 +18,7 @@ interface UseConfigReturn {
   isNew: boolean;
   loadConfig: () => Promise<void>;
   saveConfig: (config: Config) => Promise<void>;
+  saveServerConfig: (server: ServerConfig) => Promise<void>;
 }
 
 export function useConfig(): UseConfigReturn {
@@ -78,9 +64,24 @@ export function useConfig(): UseConfigReturn {
     setConfig(newConfig);
   }, []);
 
+  const saveServerConfig = useCallback(async (server: ServerConfig) => {
+    await invoke<void>("save_server_config", { server });
+    setConfig((current) => ({ ...(current ?? DEFAULT_CONFIG), server }));
+    setIsNew(false);
+  }, []);
+
   useEffect(() => {
     loadConfig();
   }, [loadConfig]);
 
-  return { config, loading, error, configPath, isNew, loadConfig, saveConfig };
+  return {
+    config,
+    loading,
+    error,
+    configPath,
+    isNew,
+    loadConfig,
+    saveConfig,
+    saveServerConfig,
+  };
 }
