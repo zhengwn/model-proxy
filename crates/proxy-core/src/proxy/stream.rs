@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use smallvec::SmallVec;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
@@ -16,6 +17,71 @@ use super::convert::openai_id_to_anthropic;
 use super::state::elapsed_ms;
 use super::utils::{append_utf8_safe, find_sse_block_end};
 use crate::error::{AppError, Result};
+use crate::logging::{truncate_body, LogCollector, LogEntry};
+
+#[derive(Clone)]
+pub(crate) struct StreamLogContext {
+    pub(crate) collector: Arc<LogCollector>,
+    pub(crate) request_id: String,
+    pub(crate) method: &'static str,
+    pub(crate) path: &'static str,
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    pub(crate) requested_model: String,
+    pub(crate) request_start: Instant,
+    pub(crate) upstream_start: Instant,
+    pub(crate) raw_request_body: String,
+}
+
+impl StreamLogContext {
+    pub(crate) fn emit(
+        &self,
+        status: u16,
+        ttft_ms: Option<u64>,
+        error_message: Option<String>,
+        response_body: Option<&str>,
+    ) {
+        if !self.collector.should_log(status) {
+            return;
+        }
+
+        let log_config = self.collector.config.load();
+        let entry = LogEntry {
+            id: self.request_id.clone(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            method: self.method.to_string(),
+            path: self.path.to_string(),
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            requested_model: Some(self.requested_model.clone()),
+            status,
+            duration_ms: elapsed_ms(self.request_start) as u64,
+            proxy_overhead_ms: Some(
+                self.upstream_start
+                    .duration_since(self.request_start)
+                    .as_millis() as u64,
+            ),
+            ttft_ms,
+            error_message,
+            request_body: if log_config.record_body {
+                Some(truncate_body(
+                    &self.raw_request_body,
+                    log_config.max_body_bytes,
+                ))
+            } else {
+                None
+            },
+            response_body: if log_config.record_body {
+                response_body.map(|body| truncate_body(body, log_config.max_body_bytes))
+            } else {
+                None
+            },
+            is_stream: true,
+            token_count: None,
+        };
+        self.collector.emit(entry);
+    }
+}
 
 // ---- SSE formatting helpers (hot path) ----
 // These helpers centralize SSE framing, pre-allocate the output string, and serialize
@@ -475,6 +541,7 @@ pub(crate) async fn handle_stream(
     request_start: std::time::Instant,
     upstream_start: std::time::Instant,
     upstream_headers_ms: u128,
+    log_ctx: Option<StreamLogContext>,
 ) -> Result<Response> {
     info!(
         request_id = request_id.as_str(),
@@ -503,6 +570,14 @@ pub(crate) async fn handle_stream(
                               emitted_events: u64,
                               actual_usage: UsageParts,
                               stop_reason_value: Option<&str>| {
+            let (status, error_message) = match reason {
+                "done" | "eof_after_finish" | "eof_without_done" => (200, None),
+                "client_disconnected" => {
+                    (499, Some("stream ended: client disconnected".to_string()))
+                }
+                "upstream_error" => (502, Some("stream ended: upstream error".to_string())),
+                other => (502, Some(format!("stream ended: {}", other))),
+            };
             info!(
                 request_id = request_id.as_str(),
                 stream_id,
@@ -522,6 +597,14 @@ pub(crate) async fn handle_stream(
                 request_total_ms = elapsed_ms(request_start),
                 "流式响应结束"
             );
+            if let Some(log_ctx) = &log_ctx {
+                log_ctx.emit(
+                    status,
+                    Some(upstream_headers_ms as u64),
+                    error_message,
+                    None,
+                );
+            }
         };
 
         let mut stream = byte_stream;
@@ -765,4 +848,44 @@ pub(crate) async fn handle_stream(
         .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from_stream(body_stream))
         .map_err(|e| AppError::Request(format!("Failed to build response: {}", e)))
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::StreamLogContext;
+    use crate::logging::{LogCollector, LogConfig};
+    use arc_swap::ArcSwap;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn stream_log_context_uses_completion_time_for_duration() {
+        let log_config = Arc::new(ArcSwap::from_pointee(LogConfig::default()));
+        let collector = Arc::new(LogCollector::new(log_config, 8));
+        let mut receiver = collector.sender.subscribe();
+        let now = Instant::now();
+        let request_start = now - Duration::from_millis(120);
+        let upstream_start = now - Duration::from_millis(100);
+
+        let ctx = StreamLogContext {
+            collector,
+            request_id: "req_test".to_string(),
+            method: "POST",
+            path: "/v1/messages",
+            provider: "provider".to_string(),
+            model: "model".to_string(),
+            requested_model: "requested".to_string(),
+            request_start,
+            upstream_start,
+            raw_request_body: "{}".to_string(),
+        };
+
+        ctx.emit(200, Some(30), None, None);
+        let entry = receiver.try_recv().unwrap();
+
+        assert!(entry.duration_ms >= 120);
+        assert_eq!(entry.proxy_overhead_ms, Some(20));
+        assert_eq!(entry.ttft_ms, Some(30));
+        assert!(entry.is_stream);
+    }
 }

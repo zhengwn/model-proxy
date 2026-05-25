@@ -151,6 +151,7 @@ async fn try_single_provider(
                     request_start,
                     upstream_start,
                     upstream_headers_ms,
+                    None,
                 )
                 .await
             } else {
@@ -174,6 +175,7 @@ async fn try_single_provider(
                     request_start,
                     upstream_start,
                     upstream_headers_ms,
+                    None,
                 )
                 .await
             } else {

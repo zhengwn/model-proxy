@@ -20,7 +20,7 @@ use super::state::{
     elapsed_ms, next_request_id, RequestCompletionGuard, MAX_LOG_BODY_BYTES,
     NON_STREAM_REQUEST_TIMEOUT_SECS,
 };
-use super::stream::handle_stream;
+use super::stream::{handle_stream, StreamLogContext};
 use super::utils::{message_count, tool_count, truncate_for_log};
 use crate::{
     config::Config,
@@ -387,6 +387,18 @@ pub async fn proxy_messages(
                     request_start,
                     upstream_start,
                     upstream_headers_ms,
+                    Some(StreamLogContext {
+                        collector: state.log_collector.clone(),
+                        request_id: request_id.clone(),
+                        method: "POST",
+                        path: "/v1/messages",
+                        provider: log_provider_name.clone(),
+                        model: log_model.clone(),
+                        requested_model: requested_model.clone(),
+                        request_start,
+                        upstream_start,
+                        raw_request_body: raw_request_body.clone(),
+                    }),
                 )
                 .await
             } else {
@@ -410,6 +422,18 @@ pub async fn proxy_messages(
                     request_start,
                     upstream_start,
                     upstream_headers_ms,
+                    Some(StreamLogContext {
+                        collector: state.log_collector.clone(),
+                        request_id: request_id.clone(),
+                        method: "POST",
+                        path: "/v1/messages",
+                        provider: log_provider_name.clone(),
+                        model: log_model.clone(),
+                        requested_model: requested_model.clone(),
+                        request_start,
+                        upstream_start,
+                        raw_request_body: raw_request_body.clone(),
+                    }),
                 )
                 .await
             } else {
@@ -426,27 +450,28 @@ pub async fn proxy_messages(
     };
     request_guard.complete();
 
-    // Emit log entry for successful responses
-    let log_ctx = LogContext {
-        request_id: &request_id,
-        method: "POST",
-        path: "/v1/messages",
-        provider: &log_provider_name,
-        model: &log_model,
-        requested_model: &requested_model,
-        request_start,
-        upstream_start,
-        is_stream,
-        raw_request_body: &raw_request_body,
-    };
-    emit_log_entry(
-        &state.log_collector,
-        &log_ctx,
-        200,
-        Some(upstream_headers_ms as u64),
-        None,
-        None,
-    );
+    if !is_stream {
+        let log_ctx = LogContext {
+            request_id: &request_id,
+            method: "POST",
+            path: "/v1/messages",
+            provider: &log_provider_name,
+            model: &log_model,
+            requested_model: &requested_model,
+            request_start,
+            upstream_start,
+            is_stream,
+            raw_request_body: &raw_request_body,
+        };
+        emit_log_entry(
+            &state.log_collector,
+            &log_ctx,
+            200,
+            Some(upstream_headers_ms as u64),
+            None,
+            None,
+        );
+    }
 
     response
 }
@@ -608,14 +633,26 @@ pub async fn proxy_chat_completions(
 
             // Pass through the response as-is (already in OpenAI format)
             let response = if is_stream {
-                use axum::http::header;
-                let byte_stream = upstream_resp.bytes_stream();
-                Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "text/event-stream")
-                    .header(header::CACHE_CONTROL, "no-cache")
-                    .body(Body::from_stream(byte_stream))
-                    .map_err(|e| AppError::Request(format!("Failed to build response: {}", e)))?)
+                handle_stream_passthrough(
+                    upstream_resp,
+                    request_id.clone(),
+                    request_start,
+                    upstream_start,
+                    upstream_headers_ms,
+                    Some(StreamLogContext {
+                        collector: state.log_collector.clone(),
+                        request_id: request_id.clone(),
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        provider: log_provider_name.clone(),
+                        model: log_model.clone(),
+                        requested_model: requested_model.clone(),
+                        request_start,
+                        upstream_start,
+                        raw_request_body: raw_request_body.clone(),
+                    }),
+                )
+                .await
             } else {
                 let body_bytes = upstream_resp.bytes().await?;
                 info!(
@@ -631,27 +668,28 @@ pub async fn proxy_chat_completions(
                     .map_err(|e| AppError::Request(format!("Failed to build response: {}", e)))?)
             };
 
-            // Log successful response
-            let log_ctx = LogContext {
-                request_id: &request_id,
-                method: "POST",
-                path: "/v1/chat/completions",
-                provider: &log_provider_name,
-                model: &log_model,
-                requested_model: &requested_model,
-                request_start,
-                upstream_start,
-                is_stream,
-                raw_request_body: &raw_request_body,
-            };
-            emit_log_entry(
-                &state.log_collector,
-                &log_ctx,
-                200,
-                Some(upstream_headers_ms as u64),
-                None,
-                None,
-            );
+            if !is_stream {
+                let log_ctx = LogContext {
+                    request_id: &request_id,
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    provider: &log_provider_name,
+                    model: &log_model,
+                    requested_model: &requested_model,
+                    request_start,
+                    upstream_start,
+                    is_stream,
+                    raw_request_body: &raw_request_body,
+                };
+                emit_log_entry(
+                    &state.log_collector,
+                    &log_ctx,
+                    200,
+                    Some(upstream_headers_ms as u64),
+                    None,
+                    None,
+                );
+            }
 
             response
         }

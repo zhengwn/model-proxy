@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info};
 
 use super::state::elapsed_ms;
+use super::stream::StreamLogContext;
 use crate::error::AppError;
 
 pub(crate) async fn handle_non_stream_passthrough(
@@ -40,6 +41,7 @@ pub(crate) async fn handle_stream_passthrough(
     request_start: std::time::Instant,
     upstream_start: std::time::Instant,
     upstream_headers_ms: u128,
+    log_ctx: Option<StreamLogContext>,
 ) -> crate::error::Result<Response> {
     info!(
         request_id = request_id.as_str(),
@@ -70,6 +72,14 @@ pub(crate) async fn handle_stream_passthrough(
                             request_total_ms = elapsed_ms(request_start),
                             "流式透传: 客户端断开"
                         );
+                        if let Some(log_ctx) = &log_ctx {
+                            log_ctx.emit(
+                                499,
+                                Some(upstream_headers_ms as u64),
+                                Some("stream ended: client disconnected".to_string()),
+                                None,
+                            );
+                        }
                         return;
                     }
                 }
@@ -86,6 +96,14 @@ pub(crate) async fn handle_stream_passthrough(
                         "上游流式透传读取错误"
                     );
                     let _ = tx.send(Err(std::io::Error::other(e))).await;
+                    if let Some(log_ctx) = &log_ctx {
+                        log_ctx.emit(
+                            502,
+                            Some(upstream_headers_ms as u64),
+                            Some("stream ended: upstream error".to_string()),
+                            None,
+                        );
+                    }
                     return;
                 }
             }
@@ -101,6 +119,9 @@ pub(crate) async fn handle_stream_passthrough(
             request_total_ms = elapsed_ms(request_start),
             "流式透传响应结束"
         );
+        if let Some(log_ctx) = &log_ctx {
+            log_ctx.emit(200, Some(upstream_headers_ms as u64), None, None);
+        }
     });
 
     let body_stream = futures::stream::unfold(rx, |mut rx| async move {
