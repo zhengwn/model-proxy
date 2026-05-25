@@ -85,15 +85,25 @@ fn tool_choice_uses_sanitized_tool_name() {
 fn historical_tool_use_uses_sanitized_tool_name() {
     let body = json!({
         "model": "claude-test",
-        "messages": [{
-            "role": "assistant",
-            "content": [{
-                "type": "tool_use",
-                "id": "toolu_abc",
-                "name": "tool.search",
-                "input": {"query": "rust"}
-            }]
-        }],
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_abc",
+                    "name": "tool.search",
+                    "input": {"query": "rust"}
+                }]
+            },
+            {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_abc",
+                    "content": "result"
+                }]
+            }
+        ],
         "tools": [{
             "name": "tool.search",
             "description": "Search",
@@ -117,37 +127,61 @@ fn historical_tool_use_uses_sanitized_tool_name() {
 fn mixed_tool_result_preserves_user_text() {
     let body = json!({
         "model": "claude-test",
-        "messages": [{
-            "role": "user",
-            "content": [
-                {
-                    "type": "tool_result",
-                    "tool_use_id": "toolu_abc",
-                    "content": "result text"
-                },
-                {
-                    "type": "text",
-                    "text": "please continue"
-                }
-            ]
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_abc",
+                    "name": "tool.search",
+                    "input": {"query": "rust"}
+                }]
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_abc",
+                        "content": "result text"
+                    },
+                    {
+                        "type": "text",
+                        "text": "please continue"
+                    }
+                ]
+            }
+        ],
+        "tools": [{
+            "name": "tool.search",
+            "description": "Search",
+            "input_schema": {
+                "type": "object",
+                "properties": {}
+            }
         }]
     });
 
     let config = test_config();
     let (openai, _) = convert::anthropic_to_openai(body, &config.provider, &config.model_routes);
 
-    assert_eq!(openai["messages"][0]["role"].as_str(), Some("tool"));
+    assert_eq!(openai["messages"][0]["role"].as_str(), Some("assistant"));
     assert_eq!(
-        openai["messages"][0]["tool_call_id"].as_str(),
+        openai["messages"][0]["tool_calls"][0]["id"].as_str(),
+        Some("call_abc")
+    );
+    assert_eq!(openai["messages"][1]["role"].as_str(), Some("tool"));
+    assert_eq!(
+        openai["messages"][1]["tool_call_id"].as_str(),
         Some("call_abc")
     );
     assert_eq!(
-        openai["messages"][0]["content"].as_str(),
+        openai["messages"][1]["content"].as_str(),
         Some("result text")
     );
-    assert_eq!(openai["messages"][1]["role"].as_str(), Some("user"));
+    assert_eq!(openai["messages"][2]["role"].as_str(), Some("user"));
     assert_eq!(
-        openai["messages"][1]["content"].as_str(),
+        openai["messages"][2]["content"].as_str(),
         Some("please continue")
     );
 }
@@ -259,7 +293,7 @@ fn provider_quirk_forces_route_specific_reasoning_effort_to_deepseek() {
 
 #[test]
 fn json_schema_output_config_uses_openai_response_format_shape() {
-    let config = test_config();
+    let config = test_config_with_model("gpt-4o");
     let body = json!({
         "model": "claude-sonnet-4-6",
         "messages": [{"role": "user", "content": "hi"}],
@@ -297,7 +331,7 @@ fn json_schema_output_config_uses_openai_response_format_shape() {
 
 #[test]
 fn no_json_schema_quirk_downgrades_to_json_object() {
-    let mut config = test_config();
+    let mut config = test_config_with_model("gpt-4o");
     config.provider.quirks.no_json_schema = true;
     let body = json!({
         "model": "claude-sonnet-4-6",
@@ -327,6 +361,137 @@ fn no_json_schema_quirk_downgrades_to_json_object() {
         .as_str()
         .unwrap_or_default()
         .contains("JSON Schema"));
+}
+
+#[test]
+fn deepseek_models_use_schema_prompt_instead_of_response_format() {
+    let config = test_config_with_model("deepseek-v4-pro");
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{"role": "user", "content": "hi"}],
+        "output_config": {
+            "format": {
+                "type": "json_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "ok": { "type": "boolean" }
+                    }
+                }
+            }
+        }
+    });
+
+    let (openai, _) = convert::anthropic_to_openai(body, &config.provider, &config.model_routes);
+
+    assert!(openai.get("response_format").is_none());
+    assert_eq!(openai["messages"][0]["role"].as_str(), Some("system"));
+    assert!(openai["messages"][0]["content"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("JSON Schema"));
+}
+
+#[test]
+fn incomplete_assistant_tool_calls_are_removed_from_history() {
+    let config = test_config();
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_missing",
+                        "name": "tool.search",
+                        "input": {"query": "rust"}
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": "continue"
+            }
+        ],
+        "tools": [{
+            "name": "tool.search",
+            "description": "Search",
+            "input_schema": {"type": "object", "properties": {}}
+        }]
+    });
+
+    let (openai, _) = convert::anthropic_to_openai(body, &config.provider, &config.model_routes);
+
+    assert!(openai["messages"][0].get("tool_calls").is_none());
+    assert_eq!(openai["messages"][0]["content"].as_str(), Some(""));
+    assert_eq!(openai["messages"][1]["role"].as_str(), Some("user"));
+}
+
+#[test]
+fn partial_assistant_tool_calls_keep_only_answered_calls() {
+    let config = test_config();
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_answered",
+                        "name": "tool.search",
+                        "input": {"query": "rust"}
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_missing",
+                        "name": "tool.lookup",
+                        "input": {"id": 1}
+                    }
+                ]
+            },
+            {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_answered",
+                    "content": "result"
+                }]
+            }
+        ],
+        "tools": [
+            {
+                "name": "tool.search",
+                "description": "Search",
+                "input_schema": {"type": "object", "properties": {}}
+            },
+            {
+                "name": "tool.lookup",
+                "description": "Lookup",
+                "input_schema": {"type": "object", "properties": {}}
+            }
+        ]
+    });
+
+    let (openai, _) = convert::anthropic_to_openai(body, &config.provider, &config.model_routes);
+
+    assert_eq!(
+        openai["messages"][0]["tool_calls"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        openai["messages"][0]["tool_calls"][0]["id"].as_str(),
+        Some("call_answered")
+    );
+    assert_eq!(openai["messages"][1]["role"].as_str(), Some("tool"));
+    assert_eq!(
+        openai["messages"][1]["tool_call_id"].as_str(),
+        Some("call_answered")
+    );
 }
 
 #[test]

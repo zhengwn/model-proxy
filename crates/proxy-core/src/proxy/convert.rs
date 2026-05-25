@@ -28,6 +28,20 @@ pub(crate) fn supports_reasoning_effort(model: &str) -> bool {
             .is_some_and(|c| c.is_ascii_digit() && c >= '5')
 }
 
+fn response_format_unavailable(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("deepseek")
+}
+
+fn json_schema_instruction(schema: Option<&Value>) -> String {
+    match schema.and_then(|schema| serde_json::to_string(schema).ok()) {
+        Some(schema_str) => format!(
+            "You must respond with a valid JSON object that strictly conforms to the following JSON Schema. Do not include any markdown code fences, explanations, or extra text outside the JSON object.\n\nSchema:\n{}",
+            schema_str
+        ),
+        None => "Respond with a valid JSON object. Do not include any markdown code fences, explanations, or extra text outside the JSON object.".to_string(),
+    }
+}
+
 pub(crate) fn resolve_reasoning_effort(body: &Value, max_effort: &str) -> Option<String> {
     if let Some(effort) = body
         .pointer("/output_config/effort")
@@ -457,6 +471,8 @@ pub(crate) fn anthropic_to_openai(
         }
     }
 
+    normalize_tool_call_messages(&mut messages);
+
     // output_config -> response_format
     let mut json_schema_hint = None;
     if let Some(output_config) = body.get("output_config") {
@@ -467,22 +483,19 @@ pub(crate) fn anthropic_to_openai(
                 .unwrap_or("text");
             match format_type {
                 "json_schema" => {
-                    if quirks.no_json_schema {
+                    if response_format_unavailable(&provider_model) {
+                        json_schema_hint = Some(json_schema_instruction(format_val.get("schema")));
+                    } else if quirks.no_json_schema {
                         openai["response_format"] = json!({"type": "json_object"});
-                        if let Some(schema) = format_val.get("schema") {
-                            if let Ok(schema_str) = serde_json::to_string(schema) {
-                                json_schema_hint = Some(format!(
-                                    "You must respond with a valid JSON object that strictly conforms to the following JSON Schema. Do not include any markdown code fences, explanations, or extra text outside the JSON object.\n\nSchema:\n{}",
-                                    schema_str
-                                ));
-                            }
-                        }
+                        json_schema_hint = Some(json_schema_instruction(format_val.get("schema")));
                     } else {
                         openai["response_format"] = openai_json_schema_response_format(format_val);
                     }
                 }
                 "json_object" => {
-                    openai["response_format"] = json!({"type": "json_object"});
+                    if !response_format_unavailable(&provider_model) {
+                        openai["response_format"] = json!({"type": "json_object"});
+                    }
                     json_schema_hint = Some("Respond with a valid JSON object. Do not include any markdown code fences, explanations, or extra text outside the JSON object.".to_string());
                 }
                 other => {
@@ -552,6 +565,86 @@ pub(crate) fn anthropic_to_openai(
     }
 
     (openai, sanitized_to_original)
+}
+
+fn normalize_tool_call_messages(messages: &mut Vec<Value>) {
+    let mut normalized = Vec::with_capacity(messages.len());
+    let mut i = 0;
+
+    while i < messages.len() {
+        let mut msg = messages[i].clone();
+        if msg.get("role").and_then(|v| v.as_str()) == Some("assistant") {
+            let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) else {
+                normalized.push(msg);
+                i += 1;
+                continue;
+            };
+            if tool_calls.is_empty() {
+                normalized.push(msg);
+                i += 1;
+                continue;
+            }
+
+            let requested_ids: Vec<String> = tool_calls
+                .iter()
+                .filter_map(|call| call.get("id").and_then(|v| v.as_str()).map(str::to_string))
+                .collect();
+
+            let mut j = i + 1;
+            let mut following_tools = Vec::new();
+            while j < messages.len()
+                && messages[j].get("role").and_then(|v| v.as_str()) == Some("tool")
+            {
+                following_tools.push(messages[j].clone());
+                j += 1;
+            }
+
+            let mut retained_ids = Vec::new();
+            let mut retained_tool_calls = Vec::new();
+            for id in &requested_ids {
+                if following_tools.iter().any(|tool| {
+                    tool.get("tool_call_id").and_then(|v| v.as_str()) == Some(id.as_str())
+                }) {
+                    if let Some(call) = tool_calls
+                        .iter()
+                        .find(|call| call.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+                    {
+                        retained_ids.push(id.clone());
+                        retained_tool_calls.push(call.clone());
+                    }
+                }
+            }
+
+            if retained_tool_calls.is_empty() {
+                if let Some(obj) = msg.as_object_mut() {
+                    obj.remove("tool_calls");
+                    if obj.get("content").is_none_or(Value::is_null) {
+                        obj.insert("content".to_string(), json!(""));
+                    }
+                }
+                normalized.push(msg);
+            } else {
+                msg["tool_calls"] = json!(retained_tool_calls);
+                normalized.push(msg);
+                for id in retained_ids {
+                    if let Some(tool) = following_tools.iter().find(|tool| {
+                        tool.get("tool_call_id").and_then(|v| v.as_str()) == Some(id.as_str())
+                    }) {
+                        normalized.push(tool.clone());
+                    }
+                }
+            }
+
+            i = j;
+        } else if msg.get("role").and_then(|v| v.as_str()) == Some("tool") {
+            i += 1;
+        } else {
+            normalized.push(msg);
+            i += 1;
+        }
+    }
+
+    *messages = normalized;
 }
 
 fn openai_json_schema_response_format(format_val: &Value) -> Value {

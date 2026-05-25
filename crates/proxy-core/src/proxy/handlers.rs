@@ -208,7 +208,7 @@ pub async fn proxy_messages(
 
     // Capture provider name and model for logging
     let log_provider_name = provider.name.clone();
-    let log_model = provider.model.clone();
+    let log_model = provider_model.to_string();
 
     let mut req = build_provider_request(&state.client, &provider, body_json);
     if !is_stream {
@@ -527,7 +527,7 @@ pub async fn proxy_chat_completions(
     // Capture for logging
     let raw_request_body = String::from_utf8_lossy(&bytes).into_owned();
     let log_provider_name = provider.name.clone();
-    let log_model = provider.model.clone();
+    let log_model = provider_model.clone();
 
     info!(
         request_id = request_id.as_str(),
