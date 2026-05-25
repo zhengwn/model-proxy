@@ -478,7 +478,7 @@ pub(crate) fn anthropic_to_openai(
                             }
                         }
                     } else {
-                        openai["response_format"] = format_val.clone();
+                        openai["response_format"] = openai_json_schema_response_format(format_val);
                     }
                 }
                 "json_object" => {
@@ -552,6 +552,37 @@ pub(crate) fn anthropic_to_openai(
     }
 
     (openai, sanitized_to_original)
+}
+
+fn openai_json_schema_response_format(format_val: &Value) -> Value {
+    if let Some(json_schema) = format_val.get("json_schema") {
+        return json!({
+            "type": "json_schema",
+            "json_schema": json_schema,
+        });
+    }
+
+    let name = format_val
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("response_schema");
+    let schema = format_val
+        .get("schema")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let strict = format_val
+        .get("strict")
+        .cloned()
+        .unwrap_or(Value::Bool(true));
+
+    json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": name,
+            "schema": schema,
+            "strict": strict,
+        },
+    })
 }
 
 pub(crate) fn prepare_body(

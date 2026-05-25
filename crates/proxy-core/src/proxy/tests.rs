@@ -258,6 +258,78 @@ fn provider_quirk_forces_route_specific_reasoning_effort_to_deepseek() {
 }
 
 #[test]
+fn json_schema_output_config_uses_openai_response_format_shape() {
+    let config = test_config();
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{"role": "user", "content": "hi"}],
+        "output_config": {
+            "format": {
+                "type": "json_schema",
+                "name": "tool_result",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "ok": { "type": "boolean" }
+                    },
+                    "required": ["ok"]
+                }
+            }
+        }
+    });
+
+    let (openai, _) = convert::anthropic_to_openai(body, &config.provider, &config.model_routes);
+
+    assert_eq!(
+        openai["response_format"]["type"].as_str(),
+        Some("json_schema")
+    );
+    assert!(openai["response_format"].get("schema").is_none());
+    assert_eq!(
+        openai["response_format"]["json_schema"]["name"].as_str(),
+        Some("tool_result")
+    );
+    assert_eq!(
+        openai["response_format"]["json_schema"]["schema"]["required"][0].as_str(),
+        Some("ok")
+    );
+}
+
+#[test]
+fn no_json_schema_quirk_downgrades_to_json_object() {
+    let mut config = test_config();
+    config.provider.quirks.no_json_schema = true;
+    let body = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [{"role": "user", "content": "hi"}],
+        "output_config": {
+            "format": {
+                "type": "json_schema",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "ok": { "type": "boolean" }
+                    }
+                }
+            }
+        }
+    });
+
+    let (openai, _) = convert::anthropic_to_openai(body, &config.provider, &config.model_routes);
+
+    assert_eq!(
+        openai["response_format"]["type"].as_str(),
+        Some("json_object")
+    );
+    assert!(openai["response_format"].get("json_schema").is_none());
+    assert_eq!(openai["messages"][0]["role"].as_str(), Some("system"));
+    assert!(openai["messages"][0]["content"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("JSON Schema"));
+}
+
+#[test]
 fn sse_block_end_supports_lf_and_crlf() {
     assert_eq!(utils::find_sse_block_end("data: {}\n\nrest"), Some((8, 2)));
     assert_eq!(

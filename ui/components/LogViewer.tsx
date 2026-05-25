@@ -11,6 +11,7 @@ import {
   Switch,
   InputNumber,
   message,
+  Tooltip,
 } from "antd";
 import { DeleteOutlined, SearchOutlined, SettingOutlined } from "@ant-design/icons";
 import { listen } from "@tauri-apps/api/event";
@@ -27,12 +28,33 @@ import {
 
 const MAX_LOG_ENTRIES = 100;
 
+function summarizeErrorMessage(message?: string): string {
+  if (!message) return "-";
+  try {
+    const parsed = JSON.parse(message);
+    const nestedMessage =
+      parsed?.error?.message ?? parsed?.message ?? parsed?.error ?? message;
+    if (typeof nestedMessage === "string") {
+      return nestedMessage;
+    }
+  } catch {
+    // Fall through to the plain-text cleanup below.
+  }
+
+  const titleMatch = message.match(/<title[^>]*>(.*?)<\/title>/i);
+  const cleaned = (titleMatch?.[1] ?? message)
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned.length > 180 ? `${cleaned.slice(0, 177)}...` : cleaned;
+}
+
 const columns: ColumnsType<LogEntry> = [
   {
     title: "时间",
     dataIndex: "timestamp",
     key: "timestamp",
-    width: 180,
+    width: 118,
     render: (val: string) => {
       try {
         return new Date(val).toLocaleTimeString();
@@ -45,7 +67,7 @@ const columns: ColumnsType<LogEntry> = [
     title: "方法",
     dataIndex: "method",
     key: "method",
-    width: 80,
+    width: 82,
     render: (method: string) => {
       const color = method === "POST" ? "blue" : method === "GET" ? "green" : "default";
       return <Tag color={color}>{method}</Tag>;
@@ -55,19 +77,21 @@ const columns: ColumnsType<LogEntry> = [
     title: "路径",
     dataIndex: "path",
     key: "path",
+    width: 132,
     ellipsis: true,
   },
   {
     title: "Provider",
     dataIndex: "provider",
     key: "provider",
-    width: 120,
+    width: 170,
+    ellipsis: true,
   },
   {
     title: "模型",
     dataIndex: "model",
     key: "model",
-    width: 200,
+    width: 360,
     ellipsis: true,
     render: (_: string, record: LogEntry) => {
       const requested = record.requested_model;
@@ -88,7 +112,7 @@ const columns: ColumnsType<LogEntry> = [
     title: "状态码",
     dataIndex: "status",
     key: "status",
-    width: 80,
+    width: 92,
     render: (status: number) => {
       const color = status >= 500 ? "red" : status >= 400 ? "orange" : "green";
       return <Tag color={color}>{status}</Tag>;
@@ -98,27 +122,43 @@ const columns: ColumnsType<LogEntry> = [
     title: "代理",
     dataIndex: "proxy_overhead_ms",
     key: "proxy_overhead_ms",
-    width: 70,
+    width: 82,
     render: (ms?: number) => ms != null ? `${ms}ms` : "-",
   },
   {
     title: "首token",
     dataIndex: "ttft_ms",
     key: "ttft_ms",
-    width: 80,
+    width: 96,
     render: (ms?: number) => ms != null ? `${ms}ms` : "-",
   },
   {
     title: "传输",
     dataIndex: "duration_ms",
     key: "transfer_ms",
-    width: 70,
+    width: 82,
     render: (_: number, record: LogEntry) => {
       if (record.ttft_ms != null && record.proxy_overhead_ms != null) {
         const transfer = record.duration_ms - record.proxy_overhead_ms - record.ttft_ms;
         return transfer >= 0 ? `${transfer}ms` : "-";
       }
       return "-";
+    },
+  },
+  {
+    title: "错误",
+    dataIndex: "error_message",
+    key: "error_message",
+    width: 280,
+    ellipsis: true,
+    render: (message?: string) => {
+      if (!message) return "-";
+      const summary = summarizeErrorMessage(message);
+      return (
+        <Tooltip title={message}>
+          <span style={{ color: "#faad14" }}>{summary}</span>
+        </Tooltip>
+      );
     },
   },
 ];
@@ -340,7 +380,8 @@ function LogViewer() {
         rowKey="id"
         size="small"
         pagination={false}
-        scroll={{ y: 400 }}
+        tableLayout="fixed"
+        scroll={{ x: 1494, y: 400 }}
         locale={{ emptyText: "暂无请求日志" }}
       />
     </div>
