@@ -136,7 +136,7 @@ const columns: ColumnsType<LogEntry> = [
     title: "传输",
     dataIndex: "duration_ms",
     key: "transfer_ms",
-    width: 82,
+    width: 112,
     render: (_: number, record: LogEntry) => {
       if (record.ttft_ms != null && record.proxy_overhead_ms != null) {
         const transfer = record.duration_ms - record.proxy_overhead_ms - record.ttft_ms;
@@ -381,7 +381,7 @@ function LogViewer() {
         size="small"
         pagination={false}
         tableLayout="fixed"
-        scroll={{ x: 1494, y: 400 }}
+        scroll={{ x: 1524, y: 400 }}
         locale={{ emptyText: "暂无请求日志" }}
       />
     </div>
