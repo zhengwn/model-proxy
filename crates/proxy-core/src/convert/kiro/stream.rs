@@ -12,12 +12,13 @@ use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use super::eventstream::{Event, EventStreamDecoder};
 use super::model_map::context_window_size;
+use super::thinking_parser::{ThinkingHandlingMode, ThinkingOutput, ThinkingParser};
 use crate::convert::anthropic_openai::stream::StreamLogContext;
 use crate::error::{AppError, Result};
 use crate::server::state::elapsed_ms;
@@ -73,10 +74,9 @@ struct AnthropicStreamState {
     input_tokens: u64,
     completion_tokens: u64,
     last_content: String,  // for text dedup
-    #[allow(dead_code)]
-    thinking_buffer: String, // for thinking tag extraction (used in extended mode)
     in_thinking: bool,
     tool_input_buffers: HashMap<String, String>, // tool_use_id → accumulated input
+    thinking_parser: Option<ThinkingParser>,      // FSM for thinking tag extraction
 }
 
 impl AnthropicStreamState {
@@ -96,9 +96,9 @@ impl AnthropicStreamState {
             input_tokens: 0,
             completion_tokens: 0,
             last_content: String::new(),
-            thinking_buffer: String::new(),
             in_thinking: false,
             tool_input_buffers: HashMap::new(),
+            thinking_parser: None,
         }
     }
 
@@ -192,32 +192,98 @@ fn process_event(
             }
             state.close_open_tool_blocks(&mut events);
 
-            // Start text block if needed
-            if state.current_block_type.as_deref() != Some("text") {
-                state.stop_current_block(&mut events);
-                let idx = state.alloc_block_index();
+            // Use ThinkingParser if configured, otherwise emit directly
+            if let Some(ref mut parser) = state.thinking_parser {
+                let outputs = parser.feed(new_text);
+                for output in outputs {
+                    match output {
+                        ThinkingOutput::ThinkingDelta(thinking_text) => {
+                            if !state.in_thinking {
+                                state.stop_current_block(&mut events);
+                                let idx = state.alloc_block_index();
+                                events.push(sse_event(
+                                    "content_block_start",
+                                    &json!({
+                                        "type": "content_block_start",
+                                        "index": idx,
+                                        "content_block": {"type": "thinking", "thinking": ""}
+                                    }),
+                                ));
+                                state.current_block_type = Some("thinking".to_string());
+                                state.current_block_index = Some(idx);
+                                state.in_thinking = true;
+                            }
+                            let idx = state.current_block_index.unwrap_or(0);
+                            events.push(sse_event(
+                                "content_block_delta",
+                                &json!({
+                                    "type": "content_block_delta",
+                                    "index": idx,
+                                    "delta": {"type": "thinking_delta", "thinking": thinking_text}
+                                }),
+                            ));
+                        }
+                        ThinkingOutput::ContentDelta(text) => {
+                            if state.in_thinking {
+                                state.in_thinking = false;
+                                state.stop_current_block(&mut events);
+                            }
+                            if state.current_block_type.as_deref() != Some("text") {
+                                state.stop_current_block(&mut events);
+                                let idx = state.alloc_block_index();
+                                events.push(sse_event(
+                                    "content_block_start",
+                                    &json!({
+                                        "type": "content_block_start",
+                                        "index": idx,
+                                        "content_block": {"type": "text", "text": ""}
+                                    }),
+                                ));
+                                state.current_block_type = Some("text".to_string());
+                                state.current_block_index = Some(idx);
+                            }
+                            let idx = state.current_block_index.unwrap_or(0);
+                            events.push(sse_event(
+                                "content_block_delta",
+                                &json!({
+                                    "type": "content_block_delta",
+                                    "index": idx,
+                                    "delta": {"type": "text_delta", "text": text}
+                                }),
+                            ));
+                            state.output_tokens += estimate_tokens(&text);
+                        }
+                        ThinkingOutput::None => {}
+                    }
+                }
+            } else {
+                // Direct text emission without ThinkingParser
+                if state.current_block_type.as_deref() != Some("text") {
+                    state.stop_current_block(&mut events);
+                    let idx = state.alloc_block_index();
+                    events.push(sse_event(
+                        "content_block_start",
+                        &json!({
+                            "type": "content_block_start",
+                            "index": idx,
+                            "content_block": {"type": "text", "text": ""}
+                        }),
+                    ));
+                    state.current_block_type = Some("text".to_string());
+                    state.current_block_index = Some(idx);
+                }
+
+                let idx = state.current_block_index.unwrap_or(0);
                 events.push(sse_event(
-                    "content_block_start",
+                    "content_block_delta",
                     &json!({
-                        "type": "content_block_start",
+                        "type": "content_block_delta",
                         "index": idx,
-                        "content_block": {"type": "text", "text": ""}
+                        "delta": {"type": "text_delta", "text": new_text}
                     }),
                 ));
-                state.current_block_type = Some("text".to_string());
-                state.current_block_index = Some(idx);
+                state.output_tokens += estimate_tokens(&new_text);
             }
-
-            let idx = state.current_block_index.unwrap_or(0);
-            events.push(sse_event(
-                "content_block_delta",
-                &json!({
-                    "type": "content_block_delta",
-                    "index": idx,
-                    "delta": {"type": "text_delta", "text": new_text}
-                }),
-            ));
-            state.output_tokens += new_text.len() / 4 + 1;
         }
 
         Event::ReasoningContent { text } => {
@@ -269,7 +335,7 @@ fn process_event(
                     "delta": {"type": "thinking_delta", "thinking": text}
                 }),
             ));
-            state.output_tokens += text.len() / 4 + 1;
+            state.output_tokens += estimate_tokens(&text);
         }
 
         Event::ToolUse {
@@ -400,6 +466,7 @@ pub async fn handle_stream_anthropic_output(
     upstream_start: Instant,
     upstream_headers_ms: u128,
     log_ctx: Option<StreamLogContext>,
+    thinking_mode: Option<&str>,
 ) -> Result<Response> {
     info!(
         request_id = request_id.as_str(),
@@ -409,11 +476,17 @@ pub async fn handle_stream_anthropic_output(
     let byte_stream = upstream_resp.bytes_stream();
     let (tx, rx) = mpsc::channel::<std::result::Result<Bytes, AppError>>(128);
     let model = model.to_string();
+    let thinking_mode_owned: Option<String> = thinking_mode.map(|s| s.to_string());
 
     tokio::spawn(async move {
         let stream_start = Instant::now();
         let mut decoder = EventStreamDecoder::new();
         let mut state = AnthropicStreamState::new();
+        // Initialize ThinkingParser if thinking_mode is configured
+        if let Some(ref mode_str) = thinking_mode_owned {
+            let mode = ThinkingHandlingMode::from_str(mode_str);
+            state.thinking_parser = Some(ThinkingParser::new(mode));
+        }
         let mut upstream_chunks: u64 = 0;
         let mut emitted_events: u64 = 0;
         let mut has_emitted_message_delta = false;
@@ -448,8 +521,25 @@ pub async fn handle_stream_anthropic_output(
         };
 
         let mut stream = byte_stream;
+        const STREAMING_CHUNK_TIMEOUT: Duration = Duration::from_secs(300);
+        const FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(15);
+        let mut first_chunk = true;
 
-        while let Some(result) = stream.next().await {
+        loop {
+            let timeout_duration = if first_chunk { FIRST_TOKEN_TIMEOUT } else { STREAMING_CHUNK_TIMEOUT };
+            let next_result = tokio::time::timeout(timeout_duration, stream.next()).await;
+            let result = match next_result {
+                Ok(Some(result)) => result,
+                Ok(None) => break,
+                Err(_) => {
+                    let reason = if first_chunk { "first_token_timeout" } else { "chunk_timeout" };
+                    warn!("Kiro 流式超时: {}", reason);
+                    log_stream_end(reason, &state, upstream_chunks, emitted_events);
+                    return;
+                }
+            };
+            first_chunk = false;
+
             match result {
                 Ok(bytes) => {
                     if let Err(e) = decoder.feed(&bytes) {
@@ -523,8 +613,64 @@ pub async fn handle_stream_anthropic_output(
             state.stop_current_block(&mut vec![]);
             state.close_open_tool_blocks(&mut vec![]);
 
+            // Finalize ThinkingParser to flush remaining buffer
+            if let Some(ref mut parser) = state.thinking_parser {
+                let final_outputs = parser.finalize();
+                for output in final_outputs {
+                    match output {
+                        ThinkingOutput::ThinkingDelta(text) => {
+                            // Emit remaining thinking content
+                            if !state.in_thinking {
+                                let idx = state.alloc_block_index();
+                                let start = sse_event("content_block_start", &json!({
+                                    "type": "content_block_start", "index": idx,
+                                    "content_block": {"type": "thinking", "thinking": ""}
+                                }));
+                                let _ = tx.send(Ok(Bytes::from(start))).await;
+                                state.in_thinking = true;
+                                state.current_block_type = Some("thinking".to_string());
+                                state.current_block_index = Some(idx);
+                            }
+                            let idx = state.current_block_index.unwrap_or(0);
+                            let delta = sse_event("content_block_delta", &json!({
+                                "type": "content_block_delta", "index": idx,
+                                "delta": {"type": "thinking_delta", "thinking": text}
+                            }));
+                            let _ = tx.send(Ok(Bytes::from(delta))).await;
+                        }
+                        ThinkingOutput::ContentDelta(text) => {
+                            if state.in_thinking {
+                                state.stop_current_block(&mut vec![]);
+                            }
+                            let idx = state.alloc_block_index();
+                            let start = sse_event("content_block_start", &json!({
+                                "type": "content_block_start", "index": idx,
+                                "content_block": {"type": "text", "text": ""}
+                            }));
+                            let _ = tx.send(Ok(Bytes::from(start))).await;
+                            let delta = sse_event("content_block_delta", &json!({
+                                "type": "content_block_delta", "index": idx,
+                                "delta": {"type": "text_delta", "text": text}
+                            }));
+                            let _ = tx.send(Ok(Bytes::from(delta))).await;
+                            let stop = sse_content_block_stop(idx);
+                            let _ = tx.send(Ok(Bytes::from(stop))).await;
+                        }
+                        ThinkingOutput::None => {}
+                    }
+                }
+            }
+
             // Emit message_delta with stop_reason and usage
             if !has_emitted_message_delta {
+                // Truncation detection: if no usage event was received, the stream may be truncated
+                if state.input_tokens == 0 && state.output_tokens > 0 {
+                    warn!(
+                        request_id = request_id.as_str(),
+                        "检测到可能的流截断: 未收到 contextUsage 事件"
+                    );
+                }
+
                 let stop_reason = state.get_stop_reason().to_string();
                 let delta = sse_event(
                     "message_delta",
@@ -677,7 +823,7 @@ fn process_event_openai(
                 "model": model,
                 "choices": [{"index": 0, "delta": {"content": new_text}, "finish_reason": null}]
             })));
-            state.output_tokens += new_text.len() / 4 + 1;
+            state.output_tokens += estimate_tokens(&new_text);
         }
 
         Event::ReasoningContent { text } => {
@@ -704,7 +850,7 @@ fn process_event_openai(
                 "model": model,
                 "choices": [{"index": 0, "delta": {"reasoning_content": text}, "finish_reason": null}]
             })));
-            state.output_tokens += text.len() / 4 + 1;
+            state.output_tokens += estimate_tokens(&text);
         }
 
         Event::ToolUse {
@@ -813,6 +959,7 @@ pub async fn handle_stream_openai_output(
     upstream_start: Instant,
     upstream_headers_ms: u128,
     log_ctx: Option<StreamLogContext>,
+    thinking_mode: Option<&str>,
 ) -> Result<Response> {
     info!(
         request_id = request_id.as_str(),
@@ -858,8 +1005,25 @@ pub async fn handle_stream_openai_output(
         };
 
         let mut stream = byte_stream;
+        const STREAMING_CHUNK_TIMEOUT: Duration = Duration::from_secs(300);
+        const FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(15);
+        let mut first_chunk = true;
 
-        while let Some(result) = stream.next().await {
+        loop {
+            let timeout_duration = if first_chunk { FIRST_TOKEN_TIMEOUT } else { STREAMING_CHUNK_TIMEOUT };
+            let next_result = tokio::time::timeout(timeout_duration, stream.next()).await;
+            let result = match next_result {
+                Ok(Some(result)) => result,
+                Ok(None) => break,
+                Err(_) => {
+                    let reason = if first_chunk { "first_token_timeout" } else { "chunk_timeout" };
+                    warn!("Kiro 流式超时: {}", reason);
+                    log_stream_end(reason, &state, upstream_chunks, emitted_events);
+                    return;
+                }
+            };
+            first_chunk = false;
+
             match result {
                 Ok(bytes) => {
                     if let Err(e) = decoder.feed(&bytes) {
@@ -983,6 +1147,17 @@ fn generate_id() -> String {
         .unwrap_or_default()
         .as_millis();
     format!("{:016x}", t)
+}
+
+/// Estimate token count from text using word-count heuristic.
+/// More accurate than `text.len() / 4` for mixed CJK/Latin text.
+pub(crate) fn estimate_tokens(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    let words = text.split_whitespace().count();
+    let punctuation = text.chars().filter(|c| c.is_ascii_punctuation()).count();
+    ((words + punctuation) as f64 * 1.3) as usize + 1
 }
 
 #[cfg(test)]

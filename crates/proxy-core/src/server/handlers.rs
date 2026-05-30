@@ -16,6 +16,7 @@ use tracing::{debug, error, info, warn};
 use crate::convert::anthropic_openai::request::{build_provider_request, prepare_body, prepare_chat_completions_body};
 use crate::convert::anthropic_openai::response::{handle_non_stream, handle_non_stream_openai_output};
 use crate::convert::anthropic_openai::stream::{handle_stream, handle_stream_openai_output, StreamLogContext};
+use crate::convert::kiro::auth::KiroAuthManager;
 use crate::convert::passthrough::{handle_non_stream_passthrough, handle_stream_passthrough};
 use crate::convert::utils::{message_count, tool_count, truncate_for_log};
 use super::fallback::{self, try_fallback, InputFormat};
@@ -938,6 +939,115 @@ pub async fn event_logging_batch(body: String) -> Json<Value> {
     Json(json!({"status": "ok"}))
 }
 
+/// Build headers for Kiro API requests.
+fn build_kiro_headers(token: &str, amz_user_agent: &str, user_agent: &str) -> Vec<(String, String)> {
+    vec![
+        ("Content-Type".into(), "application/x-amz-json-1.0".into()),
+        ("Authorization".into(), format!("Bearer {}", token)),
+        ("x-amz-target".into(), "AmazonCodeWhispererStreamingService.GenerateAssistantResponse".into()),
+        ("x-amzn-codewhisperer-optout".into(), "true".into()),
+        ("x-amzn-kiro-agent-mode".into(), "vibe".into()),
+        ("x-amz-user-agent".into(), amz_user_agent.to_string()),
+        ("user-agent".into(), user_agent.to_string()),
+        ("amz-sdk-invocation-id".into(), uuid::Uuid::new_v4().to_string()),
+        ("amz-sdk-request".into(), "attempt=1; max=3".into()),
+    ]
+}
+
+/// Send a request to the Kiro API with retry logic.
+/// - 403: force_refresh token + retry once
+/// - 429/5xx: exponential backoff (1s × 2^attempt), max 3 retries
+async fn kiro_request_with_retry(
+    client: &reqwest::Client,
+    url: &str,
+    payload: &[u8],
+    headers: &[(String, String)],
+    auth: Option<&Arc<tokio::sync::Mutex<KiroAuthManager>>>,
+    request_id: &str,
+    timeout: Option<Duration>,
+) -> Result<reqwest::Response> {
+    const MAX_RETRIES: u32 = 3;
+    const BASE_DELAY_SECS: f64 = 1.0;
+
+    let mut last_resp: Option<reqwest::Response> = None;
+
+    for attempt in 0..=MAX_RETRIES {
+        // Build request
+        let mut req = client.post(url);
+        for (k, v) in headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        req = req.body(payload.to_vec());
+        if let Some(t) = timeout {
+            req = req.timeout(t);
+        }
+
+        // Send
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                if attempt < MAX_RETRIES {
+                    let delay = BASE_DELAY_SECS * 2.0_f64.powi(attempt as i32);
+                    warn!(
+                        request_id,
+                        attempt,
+                        error = %e,
+                        delay_secs = delay,
+                        "Kiro 请求发送失败，重试中"
+                    );
+                    tokio::time::sleep(Duration::from_secs_f64(delay)).await;
+                    continue;
+                }
+                return Err(AppError::Http(e));
+            }
+        };
+
+        let status = resp.status().as_u16();
+
+        // 403: force refresh token and retry once
+        if status == 403 {
+            if let Some(auth_arc) = auth {
+                if attempt == 0 {
+                    warn!(request_id, "Kiro 返回 403，强制刷新 token");
+                    if let Ok(mut auth_guard) = auth_arc.try_lock() {
+                        let _ = auth_guard.force_refresh().await;
+                    }
+                    last_resp = Some(resp);
+                    continue;
+                }
+            }
+            last_resp = Some(resp);
+            break;
+        }
+
+        // 429/5xx: exponential backoff
+        if status == 429 || (500..600).contains(&status) {
+            if attempt < MAX_RETRIES {
+                let delay = BASE_DELAY_SECS * 2.0_f64.powi(attempt as i32);
+                warn!(
+                    request_id,
+                    status,
+                    attempt,
+                    delay_secs = delay,
+                    "Kiro 返回 {}，重试中",
+                    status
+                );
+                tokio::time::sleep(Duration::from_secs_f64(delay)).await;
+                last_resp = Some(resp);
+                continue;
+            }
+            last_resp = Some(resp);
+            break;
+        }
+
+        // Success or non-retryable error: return immediately
+        return Ok(resp);
+    }
+
+    // Exhausted retries — return last response
+    last_resp.ok_or_else(|| AppError::Request("Kiro 重试耗尽且无响应".to_string()))
+}
+
 /// Handle `/v1/messages` request with Kiro as upstream provider.
 /// This is a separate function because Kiro uses a completely different
 /// request/response protocol (AWS EventStream instead of SSE).
@@ -953,7 +1063,6 @@ async fn handle_kiro_messages(
 ) -> Result<Response> {
     use crate::convert::kiro::request::anthropic_to_kiro;
     use crate::convert::kiro::stream::handle_stream_anthropic_output;
-    use crate::convert::kiro::auth::KiroAuthManager;
 
     let provider = state.current_provider();
     let model_routes = state.current_model_routes();
@@ -987,14 +1096,20 @@ async fn handle_kiro_messages(
         AppError::Request("Kiro provider 缺少 kiro_config 配置".to_string())
     })?;
 
-    // Use shared auth manager if available, otherwise create a new one
-    let auth_guard = state.kiro_auth.as_ref().map(|a| a.clone());
-    let (token, amz_user_agent, user_agent_str) = if let Some(auth_arc) = auth_guard {
-        let auth = auth_arc.lock().await;
+    // Use multi-account manager if available, otherwise single auth manager
+    let (token, amz_user_agent, user_agent_str) = if let Some(ref account_mgr) = state.kiro_account_manager {
+        let mut mgr = account_mgr.lock().await;
+        let (_id, auth_arc) = mgr.get_available_account(&[])
+            .ok_or_else(|| AppError::Request("所有 Kiro 账户不可用".to_string()))?;
+        let mut auth = auth_arc.lock().await;
+        let token = auth.get_valid_token().await?;
+        (token, auth.amz_user_agent(), auth.user_agent())
+    } else if let Some(ref auth_arc) = state.kiro_auth {
+        let mut auth = auth_arc.lock().await;
         let token = auth.get_valid_token().await?;
         (token, auth.amz_user_agent(), auth.user_agent())
     } else {
-        let auth = KiroAuthManager::new(kiro_config, state.client.clone());
+        let mut auth = KiroAuthManager::new(kiro_config, state.client.clone());
         let token = auth.get_valid_token().await?;
         (token, auth.amz_user_agent(), auth.user_agent())
     };
@@ -1006,45 +1121,48 @@ async fn handle_kiro_messages(
         .as_deref()
         .unwrap_or(&kiro_config.region);
     let url = format!(
-        "https://q.{}.amazonaws.com/generateAssistantResponse",
+        "https://runtime.{}.kiro.dev/generateAssistantResponse",
         region
     );
 
-    let mut req = state
-        .client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("x-amzn-codewhisperer-optout", "true")
-        .header("x-amzn-kiro-agent-mode", "vibe")
-        .header("x-amz-user-agent", &amz_user_agent)
-        .header("user-agent", &user_agent_str)
-        .header(
-            "amz-sdk-invocation-id",
-            uuid::Uuid::new_v4().to_string(),
-        )
-        .header("amz-sdk-request", "attempt=1; max=3")
-        .json(&kiro_payload);
+    let payload_bytes = serde_json::to_vec(&kiro_payload)
+        .map_err(|e| AppError::Json(e))?;
 
-    if !is_stream {
-        req = req.timeout(Duration::from_secs(super::state::NON_STREAM_REQUEST_TIMEOUT_SECS));
-    }
+    let request_headers = build_kiro_headers(&token, &amz_user_agent, &user_agent_str);
+
+    // Acquire concurrency permit
+    let _permit = if let Some(ref sem) = state.concurrency_semaphore {
+        match sem.try_acquire() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                request_guard.complete();
+                state.inc_failed_requests();
+                return Err(AppError::TooManyRequests);
+            }
+        }
+    } else {
+        None
+    };
 
     let upstream_start = Instant::now();
     request_guard.set_phase("kiro_send");
 
-    let upstream_resp = match req.send().await {
-        Ok(resp) => resp,
-        Err(e) => {
-            error!(
-                request_id = request_id.as_str(),
-                error = %e,
-                "Kiro 上游请求失败"
-            );
-            request_guard.complete();
-            return Err(AppError::Http(e));
-        }
+    let timeout = if !is_stream {
+        Some(Duration::from_secs(super::state::NON_STREAM_REQUEST_TIMEOUT_SECS))
+    } else {
+        None
     };
+
+    let upstream_resp = kiro_request_with_retry(
+        &state.client,
+        &url,
+        &payload_bytes,
+        &request_headers,
+        state.kiro_auth.as_ref(),
+        &request_id,
+        timeout,
+    )
+    .await?;
 
     let status = upstream_resp.status();
     let upstream_headers_ms = elapsed_ms(upstream_start);
@@ -1095,6 +1213,7 @@ async fn handle_kiro_messages(
                 upstream_start,
                 raw_request_body: raw_request_body.clone(),
             }),
+            kiro_config.thinking_mode.as_deref(),
         )
         .await;
         request_guard.complete();
@@ -1213,7 +1332,7 @@ async fn handle_kiro_non_stream(
     }
 
     let has_tool_use = !tool_uses.is_empty();
-    output_tokens = visible_text.len() as u64 / 4 + 1;
+    output_tokens = crate::convert::kiro::stream::estimate_tokens(&visible_text) as u64;
 
     let stop_reason = if has_tool_use { "tool_use" } else { "end_turn" };
 
@@ -1259,7 +1378,6 @@ async fn handle_kiro_chat_completions(
     request_start: Instant,
 ) -> Result<Response> {
     use crate::convert::anthropic_openai::request::openai_to_anthropic;
-    use crate::convert::kiro::auth::KiroAuthManager;
     use crate::convert::kiro::request::anthropic_to_kiro;
     use crate::convert::kiro::stream::handle_stream_openai_output;
 
@@ -1296,13 +1414,19 @@ async fn handle_kiro_chat_completions(
         AppError::Request("Kiro provider 缺少 kiro_config 配置".to_string())
     })?;
 
-    let auth_guard = state.kiro_auth.as_ref().map(|a| a.clone());
-    let (token, amz_user_agent, user_agent_str) = if let Some(auth_arc) = auth_guard {
-        let auth = auth_arc.lock().await;
+    let (token, amz_user_agent, user_agent_str) = if let Some(ref account_mgr) = state.kiro_account_manager {
+        let mut mgr = account_mgr.lock().await;
+        let (_id, auth_arc) = mgr.get_available_account(&[])
+            .ok_or_else(|| AppError::Request("所有 Kiro 账户不可用".to_string()))?;
+        let mut auth = auth_arc.lock().await;
+        let token = auth.get_valid_token().await?;
+        (token, auth.amz_user_agent(), auth.user_agent())
+    } else if let Some(ref auth_arc) = state.kiro_auth {
+        let mut auth = auth_arc.lock().await;
         let token = auth.get_valid_token().await?;
         (token, auth.amz_user_agent(), auth.user_agent())
     } else {
-        let auth = KiroAuthManager::new(kiro_config, state.client.clone());
+        let mut auth = KiroAuthManager::new(kiro_config, state.client.clone());
         let token = auth.get_valid_token().await?;
         (token, auth.amz_user_agent(), auth.user_agent())
     };
@@ -1313,35 +1437,45 @@ async fn handle_kiro_chat_completions(
         .as_deref()
         .unwrap_or(&kiro_config.region);
     let url = format!(
-        "https://q.{}.amazonaws.com/generateAssistantResponse",
+        "https://runtime.{}.kiro.dev/generateAssistantResponse",
         region
     );
 
-    let mut req = state
-        .client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("x-amzn-codewhisperer-optout", "true")
-        .header("x-amzn-kiro-agent-mode", "vibe")
-        .header("x-amz-user-agent", &amz_user_agent)
-        .header("user-agent", &user_agent_str)
-        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
-        .header("amz-sdk-request", "attempt=1; max=3")
-        .json(&kiro_payload);
+    let payload_bytes = serde_json::to_vec(&kiro_payload)
+        .map_err(|e| AppError::Json(e))?;
 
-    if !is_stream {
-        req = req.timeout(Duration::from_secs(super::state::NON_STREAM_REQUEST_TIMEOUT_SECS));
-    }
+    let request_headers = build_kiro_headers(&token, &amz_user_agent, &user_agent_str);
+
+    // Acquire concurrency permit
+    let _permit = if let Some(ref sem) = state.concurrency_semaphore {
+        match sem.try_acquire() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                state.inc_failed_requests();
+                return Err(AppError::TooManyRequests);
+            }
+        }
+    } else {
+        None
+    };
+
+    let timeout = if !is_stream {
+        Some(Duration::from_secs(super::state::NON_STREAM_REQUEST_TIMEOUT_SECS))
+    } else {
+        None
+    };
 
     let upstream_start = Instant::now();
-    let upstream_resp = match req.send().await {
-        Ok(resp) => resp,
-        Err(e) => {
-            error!(request_id = request_id.as_str(), error = %e, "Kiro 上游请求失败");
-            return Err(AppError::Http(e));
-        }
-    };
+    let upstream_resp = kiro_request_with_retry(
+        &state.client,
+        &url,
+        &payload_bytes,
+        &request_headers,
+        state.kiro_auth.as_ref(),
+        &request_id,
+        timeout,
+    )
+    .await?;
 
     let status = upstream_resp.status();
     let upstream_headers_ms = elapsed_ms(upstream_start);
@@ -1374,6 +1508,7 @@ async fn handle_kiro_chat_completions(
             upstream_start,
             upstream_headers_ms,
             None,
+            kiro_config.thinking_mode.as_deref(),
         )
         .await
     } else {
@@ -1519,4 +1654,244 @@ fn now_epoch_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Handle `GET /v1/models` — returns available models in OpenAI format.
+pub async fn proxy_models(
+    State(state): State<super::state::AppState>,
+) -> Result<Response> {
+    use crate::convert::kiro::model_map::KIRO_MODELS;
+
+    const MODEL_CACHE_TTL_SECS: u64 = 3600; // 1 hour
+
+    let provider = state.current_provider();
+
+    // Check cache first
+    if let Some(ref cache_arc) = state.model_cache {
+        let cache = cache_arc.lock().await;
+        if cache.0.elapsed().as_secs() < MODEL_CACHE_TTL_SECS {
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(cache.1.to_string()))
+                .map_err(|e| AppError::Request(format!("构建响应失败: {}", e)))?);
+        }
+    }
+
+    // Build model list
+    let models: Vec<Value> = if provider.format == crate::config::ProviderFormat::Kiro {
+        // Try to fetch from Kiro API
+        let region = provider
+            .kiro_config
+            .as_ref()
+            .and_then(|k| k.api_region.as_deref().or(Some(k.region.as_str())))
+            .unwrap_or("us-east-1");
+        let list_url = format!("https://runtime.{}.kiro.dev/ListAvailableModels", region);
+
+        // Get auth token
+        let token = if let Some(ref auth_arc) = state.kiro_auth {
+            let mut auth = auth_arc.lock().await;
+            auth.get_valid_token().await.unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        // Try API call
+        let api_models = if !token.is_empty() {
+            match state
+                .client
+                .get(&list_url)
+                .header("Authorization", format!("Bearer {}", token))
+                .header("x-amz-target", "AmazonCodeWhispererStreamingService.ListAvailableModels")
+                .header("Content-Type", "application/x-amz-json-1.0")
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    resp.json::<Value>().await.ok()
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        // Parse API response or fall back to static list
+        if let Some(api_resp) = api_models {
+            // Kiro API returns array of model objects with modelId field
+            if let Some(arr) = api_resp.as_array() {
+                arr.iter()
+                    .filter_map(|m| {
+                        let id = m.get("modelId").or_else(|| m.get("id"))?.as_str()?;
+                        Some(json!({
+                            "id": id,
+                            "object": "model",
+                            "created": now_epoch_secs(),
+                            "owned_by": "kiro"
+                        }))
+                    })
+                    .collect()
+            } else {
+                static_kiro_model_list()
+            }
+        } else {
+            static_kiro_model_list()
+        }
+    } else {
+        // Non-Kiro provider: return configured model + model routes
+        let mut models = vec![json!({
+            "id": provider.model,
+            "object": "model",
+            "created": now_epoch_secs(),
+            "owned_by": provider.name
+        })];
+        for route in provider.model_routes.iter() {
+            models.push(json!({
+                "id": route.target,
+                "object": "model",
+                "created": now_epoch_secs(),
+                "owned_by": provider.name
+            }));
+        }
+        models
+    };
+
+    let response = json!({
+        "object": "list",
+        "data": models
+    });
+
+    // Update cache
+    if let Some(ref cache_arc) = state.model_cache {
+        let mut cache = cache_arc.lock().await;
+        *cache = (Instant::now(), response.clone());
+    }
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(response.to_string()))
+        .map_err(|e| AppError::Request(format!("构建响应失败: {}", e)))?)
+}
+
+/// Static fallback model list from KIRO_MODELS constant.
+fn static_kiro_model_list() -> Vec<Value> {
+    use crate::convert::kiro::model_map::KIRO_MODELS;
+    KIRO_MODELS
+        .iter()
+        .map(|(name, _)| {
+            json!({
+                "id": name,
+                "object": "model",
+                "created": 0u64,
+                "owned_by": "kiro"
+            })
+        })
+        .collect()
+}
+
+/// Handle `POST /v1/messages/count_tokens` — estimates token count for an Anthropic request.
+/// Used by Claude Code to decide conversation compaction timing.
+pub async fn proxy_count_tokens(
+    State(state): State<super::state::AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Response> {
+    // Validate auth
+    check_auth(&headers, &state.config)?;
+
+    let provider = state.current_provider();
+
+    // Estimate tokens from the request body
+    let mut total_tokens: u64 = 0;
+
+    // System prompt tokens
+    if let Some(system) = body.get("system") {
+        let text = match system {
+            Value::String(s) => s.clone(),
+            Value::Array(arr) => arr
+                .iter()
+                .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        total_tokens += crate::convert::kiro::stream::estimate_tokens(&text) as u64;
+    }
+
+    // Message tokens
+    if let Some(messages) = body.get("messages").and_then(|v| v.as_array()) {
+        for msg in messages {
+            // Role overhead
+            total_tokens += 4;
+            if let Some(content) = msg.get("content") {
+                match content {
+                    Value::String(s) => {
+                        total_tokens += crate::convert::kiro::stream::estimate_tokens(s) as u64;
+                    }
+                    Value::Array(arr) => {
+                        for block in arr {
+                            match block.get("type").and_then(|v| v.as_str()) {
+                                Some("text") => {
+                                    if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                                        total_tokens +=
+                                            crate::convert::kiro::stream::estimate_tokens(t) as u64;
+                                    }
+                                }
+                                Some("image") => total_tokens += 100,
+                                Some("tool_use") => {
+                                    let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                    let input = block.get("input").map(|v| v.to_string()).unwrap_or_default();
+                                    total_tokens += crate::convert::kiro::stream::estimate_tokens(&format!("{} {}", name, input)) as u64;
+                                }
+                                Some("tool_result") => {
+                                    let result_text = match block.get("content") {
+                                        Some(Value::String(s)) => s.clone(),
+                                        Some(Value::Array(arr)) => arr
+                                            .iter()
+                                            .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+                                            .collect::<Vec<_>>()
+                                            .join("\n"),
+                                        _ => String::new(),
+                                    };
+                                    total_tokens += crate::convert::kiro::stream::estimate_tokens(&result_text) as u64;
+                                }
+                                Some("thinking") => {
+                                    if let Some(t) = block.get("thinking").and_then(|v| v.as_str()) {
+                                        total_tokens += crate::convert::kiro::stream::estimate_tokens(t) as u64;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Tool definition tokens
+    if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
+        for tool in tools {
+            let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let desc = tool.get("description").and_then(|v| v.as_str()).unwrap_or("");
+            total_tokens += crate::convert::kiro::stream::estimate_tokens(&format!("{} {}", name, desc)) as u64;
+            // Schema tokens
+            if let Some(schema) = tool.get("input_schema") {
+                total_tokens += crate::convert::kiro::stream::estimate_tokens(&schema.to_string()) as u64;
+            }
+        }
+    }
+
+    let response = json!({
+        "input_tokens": total_tokens
+    });
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(response.to_string()))
+        .map_err(|e| AppError::Request(format!("构建响应失败: {}", e)))?)
 }

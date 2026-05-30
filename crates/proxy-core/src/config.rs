@@ -222,6 +222,24 @@ pub struct KiroConfig {
     /// API 区域（默认同 region）
     #[serde(default)]
     pub api_region: Option<String>,
+    /// 模型别名映射 (别名 → 真实模型 ID)
+    #[serde(default)]
+    pub model_aliases: Option<std::collections::HashMap<String, String>>,
+    /// 隐藏模型列表（不暴露给客户端但可使用）
+    #[serde(default)]
+    pub hidden_models: Option<Vec<String>>,
+    /// Kiro IDE 版本号（默认 "0.11.107"）
+    #[serde(default)]
+    pub kiro_version: Option<String>,
+    /// HTTP/SOCKS5 代理地址
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    /// Thinking 处理模式: "as_reasoning_content" | "remove" | "pass" | "strip_tags"
+    #[serde(default)]
+    pub thinking_mode: Option<String>,
+    /// 是否启用 Web Search MCP 工具注入
+    #[serde(default)]
+    pub web_search_enabled: Option<bool>,
 }
 
 impl ProviderConfig {

@@ -3,6 +3,8 @@
 //! Converts various Claude model name formats to Kiro's expected format.
 //! Handles date suffixes, version separators, legacy names, and GPT mapping.
 
+use std::collections::HashMap;
+
 /// Known Kiro model IDs and their context window sizes.
 pub const KIRO_MODELS: &[(&str, u32)] = &[
     ("claude-sonnet-4", 200_000),
@@ -21,6 +23,13 @@ pub fn context_window_size(model_id: &str) -> u32 {
         .find(|(name, _)| *name == model_id)
         .map(|(_, size)| *size)
         .unwrap_or(200_000)
+}
+
+/// Resolve a model alias using the configured aliases map.
+/// Returns the aliased name if found, otherwise the original input.
+pub fn resolve_alias(input: &str, aliases: &HashMap<String, String>) -> String {
+    let lower = input.to_ascii_lowercase();
+    aliases.get(&lower).cloned().unwrap_or_else(|| input.to_string())
 }
 
 /// Normalize a client-provided model name to a Kiro model ID.

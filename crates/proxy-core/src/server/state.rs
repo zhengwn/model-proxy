@@ -106,6 +106,10 @@ pub struct AppState {
     pub concurrency_semaphore: Option<Arc<Semaphore>>,
     /// Shared Kiro auth manager (only initialized when a Kiro provider exists).
     pub kiro_auth: Option<Arc<tokio::sync::Mutex<crate::convert::kiro::auth::KiroAuthManager>>>,
+    /// Multi-account manager for Kiro failover (when multiple Kiro configs exist).
+    pub kiro_account_manager: Option<Arc<tokio::sync::Mutex<crate::convert::kiro::account::AccountManager>>>,
+    /// Cached /v1/models response (Instant = last update time, Value = JSON response).
+    pub model_cache: Option<Arc<tokio::sync::Mutex<(Instant, serde_json::Value)>>>,
 }
 
 impl AppState {
@@ -162,6 +166,8 @@ impl AppState {
             counters: None,
             concurrency_semaphore,
             kiro_auth,
+            kiro_account_manager: None,
+            model_cache: None,
         }
     }
 
@@ -209,6 +215,8 @@ impl AppState {
             counters: None,
             concurrency_semaphore,
             kiro_auth,
+            kiro_account_manager: None,
+            model_cache: None,
         }
     }
 

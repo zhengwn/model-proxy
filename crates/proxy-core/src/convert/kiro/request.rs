@@ -13,11 +13,14 @@ use crate::error::{AppError, Result};
 
 // ---- Constants ----
 
-/// Maximum tool name length in Kiro API
-const TOOL_NAME_MAX_LEN: usize = 63;
+/// Maximum tool name length in Kiro API (characters, not bytes)
+const TOOL_NAME_MAX_LEN: usize = 64;
 
 /// Maximum tool description length
 const TOOL_DESC_MAX_LEN: usize = 10_000;
+
+/// Maximum payload size for Kiro API (600KB)
+const KIRO_MAX_PAYLOAD_BYTES: usize = 600_000;
 
 /// Chunked policy injected into system prompt
 const SYSTEM_CHUNKED_POLICY: &str = "When the Write or Edit tool has content size limits, always comply silently. Never suggest bypassing these limits via alternative tools. Never ask the user whether to switch approaches. Complete all chunked operations without commentary.";
@@ -33,32 +36,87 @@ pub fn anthropic_to_kiro(
     provider: &ProviderConfig,
     global_routes: &[ModelRoute],
 ) -> Result<(Value, HashMap<String, String>)> {
-    // 1. Model ID normalization
+    // 1. Model ID normalization with alias resolution
     let requested_model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
-    let kiro_model = normalize_model_id(
-        provider
-            .resolve_model_with_routes(Some(requested_model), global_routes),
-    )
-    .unwrap_or_else(|| "claude-sonnet-4.5".to_string());
+    let resolved_model = provider
+        .resolve_model_with_routes(Some(requested_model), global_routes);
+    let aliased_model = if let Some(aliases) = provider.kiro_config.as_ref().and_then(|k| k.model_aliases.as_ref()) {
+        super::model_map::resolve_alias(&resolved_model, aliases)
+    } else {
+        resolved_model.to_string()
+    };
+    let kiro_model = normalize_model_id(&aliased_model)
+        .unwrap_or_else(|| "claude-sonnet-4.5".to_string());
 
     let mut tool_name_map: HashMap<String, String> = HashMap::new();
 
     // 2. Extract system prompt
     let system_text = extract_system_text(body);
 
-    // 3. Extract thinking config
+    // 3. Extract thinking config (supports both Anthropic thinking and OpenAI reasoning_effort)
     let thinking_config = body.get("thinking");
+    let reasoning_effort = body.get("reasoning_effort").and_then(|v| v.as_str());
+    let effective_thinking = if thinking_config.is_some() {
+        thinking_config.cloned()
+    } else if let Some(effort) = reasoning_effort {
+        // Map OpenAI reasoning_effort to Anthropic thinking config
+        let budget_pct = match effort {
+            "none" => 0.0,
+            "minimal" => 0.10,
+            "low" => 0.20,
+            "medium" => 0.50,
+            "high" => 0.80,
+            "xhigh" => 0.95,
+            _ => 0.50,
+        };
+        let max_tokens = body.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(16000);
+        let budget = (max_tokens as f64 * budget_pct) as u64;
+        if budget > 0 {
+            Some(json!({"type": "enabled", "budget_tokens": budget}))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let thinking_ref = effective_thinking.as_ref();
 
-    // 4. Extract tools
+    // 4. Extract max_tokens for reasoning effort budget calculation
+    // Note: Kiro API does not natively support temperature/top_p/stop_sequences
+    // in conversationState, so we only forward max_tokens for thinking budget.
+
+    // 5. Extract tools and convert
     let tools = body.get("tools").and_then(|v| v.as_array());
-    let kiro_tools = tools.map(|t| convert_tools(t, &mut tool_name_map));
+    let (mut kiro_tools, tool_docs) = match tools {
+        Some(t) => convert_tools(t, &mut tool_name_map),
+        None => (json!([]), String::new()),
+    };
 
-    // 5. Process messages
+    // 5b. Inject web_search tool if enabled
+    if provider.kiro_config.as_ref().and_then(|k| k.web_search_enabled).unwrap_or(false) {
+        if let Some(arr) = kiro_tools.as_array_mut() {
+            arr.push(super::mcp::web_search_tool_definition());
+        }
+    }
+
+    // 6. Merge system text with tool documentation
+    let mut full_system_text = system_text;
+    if !tool_docs.is_empty() {
+        if full_system_text.is_empty() {
+            full_system_text = tool_docs;
+        } else {
+            full_system_text.push_str("\n\n# Tool Documentation\n\n");
+            full_system_text.push_str(&tool_docs);
+        }
+    }
+
+    // 7. Process messages
     let messages = body.get("messages").and_then(|v| v.as_array());
+    let has_tools = kiro_tools.as_array().map(|a| !a.is_empty()).unwrap_or(false);
     let (history, current_content, current_images, current_tool_results) =
-        process_messages(messages, &system_text, thinking_config, &kiro_model);
+        process_messages(messages, &full_system_text, thinking_ref, &kiro_model, has_tools);
 
-    // 6. Build currentMessage
+    // 8. Build currentMessage
     let mut user_input_message = json!({
         "content": current_content,
         "modelId": kiro_model,
@@ -70,17 +128,15 @@ pub fn anthropic_to_kiro(
     }
 
     let mut context = json!({});
-    if let Some(tools_val) = &kiro_tools {
-        if tools_val.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
-            context["tools"] = tools_val.clone();
-        }
+    if kiro_tools.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+        context["tools"] = kiro_tools;
     }
     if !current_tool_results.is_empty() {
         context["toolResults"] = json!(current_tool_results);
     }
     user_input_message["userInputMessageContext"] = context;
 
-    // 7. Build conversationState
+    // 9. Build conversationState
     let conversation_id = uuid_v4();
     let agent_continuation_id = uuid_v4();
 
@@ -98,7 +154,43 @@ pub fn anthropic_to_kiro(
         conversation_state["history"] = json!(history);
     }
 
-    Ok((json!({"conversationState": conversation_state}), tool_name_map))
+    let mut payload = json!({"conversationState": conversation_state});
+
+    // 10. Payload size guard with auto-trim
+    let mut serialized_len = serde_json::to_vec(&payload)
+        .map(|v| v.len())
+        .unwrap_or(0);
+    if serialized_len > KIRO_MAX_PAYLOAD_BYTES {
+        // Try trimming oldest history pairs
+        if let Some(history) = payload["conversationState"].get_mut("history").and_then(|v| v.as_array_mut()) {
+            let original_len = history.len();
+            while serialized_len > KIRO_MAX_PAYLOAD_BYTES && history.len() > 2 {
+                history.remove(0);
+                if history.len() > 1 {
+                    history.remove(0);
+                }
+                // Re-serialize to check size (serialize just the history to avoid borrow conflict)
+                serialized_len = serde_json::to_vec(history)
+                    .map(|v| v.len())
+                    .unwrap_or(0)
+                    + 200; // overhead for conversationState wrapper
+            }
+            if serialized_len > KIRO_MAX_PAYLOAD_BYTES {
+                return Err(AppError::Request(format!(
+                    "Kiro API payload 过大: {} 字节 (最大 {} 字节)，修剪 {} 条历史后仍超限",
+                    serialized_len, KIRO_MAX_PAYLOAD_BYTES, original_len - history.len()
+                )));
+            }
+            debug!("Payload 自动修剪: 移除 {} 条历史", original_len - history.len());
+        } else {
+            return Err(AppError::Request(format!(
+                "Kiro API payload 过大: {} 字节 (最大 {} 字节)",
+                serialized_len, KIRO_MAX_PAYLOAD_BYTES
+            )));
+        }
+    }
+
+    Ok((payload, tool_name_map))
 }
 
 // ---- System prompt extraction ----
@@ -125,6 +217,7 @@ fn process_messages(
     system_text: &str,
     thinking_config: Option<&Value>,
     model: &str,
+    has_tools: bool,
 ) -> (Vec<Value>, String, Vec<Value>, Vec<Value>) {
     let messages = match messages {
         Some(m) => m,
@@ -155,8 +248,25 @@ fn process_messages(
         return (history, String::new(), vec![], vec![]);
     }
 
+    // Strip tool content when no tools defined, and repair orphan tool_results
+    // Note: the last message (current) is handled separately by extract_current_message,
+    // so we only strip/repair the history messages.
+    let stripped_messages: Vec<Value> = if !has_tools {
+        effective_messages.iter().map(|m| strip_tool_content(m)).collect()
+    } else {
+        // Only repair orphan tool_results in history messages (not the current message)
+        let mut msgs: Vec<Value> = effective_messages[..effective_messages.len().saturating_sub(1)]
+            .iter()
+            .map(|m| repair_orphan_tool_results(m))
+            .collect();
+        if let Some(last) = effective_messages.last() {
+            msgs.push(last.clone());
+        }
+        msgs
+    };
+
     // Split: last message = current, rest = history
-    let (history_msgs, current_msg) = effective_messages.split_at(effective_messages.len() - 1);
+    let (history_msgs, current_msg) = stripped_messages.split_at(stripped_messages.len() - 1);
 
     // Build history with system prompt as first entry
     let mut history = build_system_history(system_text, thinking_config, model);
@@ -207,6 +317,7 @@ fn build_system_history(
     if !system_text.is_empty() {
         parts.push(system_text.to_string());
         parts.push(SYSTEM_CHUNKED_POLICY.to_string());
+        parts.push(super::truncation::get_truncation_recovery_system_prompt().to_string());
     }
 
     if parts.is_empty() {
@@ -219,6 +330,147 @@ fn build_system_history(
         json!({"userInputMessage": {"content": content, "modelId": model, "origin": "AI_EDITOR"}}),
         json!({"assistantResponseMessage": {"content": "I will follow these instructions."}}),
     ]
+}
+
+/// Strip tool_calls and tool_results from a message, converting them to text.
+/// Used when no tools are defined.
+fn strip_tool_content(msg: &Value) -> Value {
+    let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+    let mut result = msg.clone();
+
+    if role == "assistant" {
+        // Convert tool_use blocks to text descriptions
+        if let Some(content) = msg.get("content").and_then(|v| v.as_array()) {
+            let mut text_parts = Vec::new();
+            let mut has_tool_use = false;
+            for block in content {
+                match block.get("type").and_then(|v| v.as_str()) {
+                    Some("text") => {
+                        if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                            text_parts.push(t.to_string());
+                        }
+                    }
+                    Some("tool_use") => {
+                        has_tool_use = true;
+                        let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let input = block.get("input").cloned().unwrap_or(json!({}));
+                        text_parts.push(format!("[Called {} with args: {}]", name, input));
+                    }
+                    _ => {}
+                }
+            }
+            if has_tool_use {
+                result["content"] = json!(text_parts.join("\n"));
+            }
+        }
+        // Remove tool_calls field (OpenAI format)
+        if result.get("tool_calls").is_some() {
+            if let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                let mut text = result.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                for tc in tool_calls {
+                    let func = tc.get("function");
+                    let name = func.and_then(|f| f.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+                    let args = func.and_then(|f| f.get("arguments")).and_then(|v| v.as_str()).unwrap_or("{}");
+                    text.push_str(&format!("\n[Called {} with args: {}]", name, args));
+                }
+                result["content"] = json!(text);
+            }
+            result.as_object_mut().unwrap().remove("tool_calls");
+        }
+    }
+
+    if role == "user" {
+        // Convert tool_result blocks to text
+        if let Some(content) = msg.get("content").and_then(|v| v.as_array()) {
+            let mut text_parts = Vec::new();
+            let mut has_tool_result = false;
+            for block in content {
+                match block.get("type").and_then(|v| v.as_str()) {
+                    Some("text") => {
+                        if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                            text_parts.push(t.to_string());
+                        }
+                    }
+                    Some("tool_result") => {
+                        has_tool_result = true;
+                        let tool_id = block.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
+                        let result_text = match block.get("content") {
+                            Some(Value::String(s)) => s.clone(),
+                            Some(Value::Array(arr)) => {
+                                arr.iter()
+                                    .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            }
+                            _ => String::new(),
+                        };
+                        text_parts.push(format!("[Tool result for {}: {}]", tool_id, result_text));
+                    }
+                    _ => {}
+                }
+            }
+            if has_tool_result {
+                result["content"] = json!(text_parts.join("\n"));
+            }
+        }
+    }
+
+    result
+}
+
+/// Repair orphan tool_results that have no preceding assistant tool_use.
+/// Converts them to text descriptions instead.
+fn repair_orphan_tool_results(msg: &Value) -> Value {
+    let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+    if role != "user" {
+        return msg.clone();
+    }
+
+    if let Some(content) = msg.get("content").and_then(|v| v.as_array()) {
+        let has_orphan = content.iter().any(|b| {
+            b.get("type").and_then(|v| v.as_str()) == Some("tool_result")
+        });
+        if !has_orphan {
+            return msg.clone();
+        }
+
+        let mut result = msg.clone();
+        let text_parts: Vec<String> = content
+            .iter()
+            .map(|b| {
+                match b.get("type").and_then(|v| v.as_str()) {
+                    Some("text") => b.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    Some("tool_result") => {
+                        let tool_id = b.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("");
+                        let result_text = match b.get("content") {
+                            Some(Value::String(s)) => s.clone(),
+                            Some(Value::Array(arr)) => {
+                                arr.iter()
+                                    .filter_map(|x| x.get("text").and_then(|v| v.as_str()))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            }
+                            _ => String::new(),
+                        };
+                        format!("[Tool result for {}: {}]", tool_id, result_text)
+                    }
+                    _ => String::new(),
+                }
+            })
+            .collect();
+        result["content"] = json!(text_parts.join("\n"));
+        return result;
+    }
+
+    msg.clone()
+}
+
+/// Normalize unknown roles to "user" (e.g., "developer", "system" in message array).
+fn normalize_role(role: &str) -> &str {
+    match role {
+        "user" | "assistant" => role,
+        _ => "user",
+    }
 }
 
 /// Convert history messages, merging consecutive same-role messages.
@@ -268,7 +520,8 @@ fn convert_history_messages(messages: &[Value]) -> Vec<Value> {
     };
 
     for msg in messages {
-        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        let raw_role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        let role = normalize_role(raw_role);
 
         if role == "user" {
             if current_role == Some("assistant") {
@@ -408,6 +661,30 @@ fn convert_history_messages(messages: &[Value]) -> Vec<Value> {
         }
     }
 
+    // Ensure first message is a user message
+    if let Some(first) = result.first() {
+        if first.get("assistantResponseMessage").is_some() {
+            result.insert(
+                0,
+                json!({"userInputMessage": {"content": "(continued)", "modelId": "auto", "origin": "AI_EDITOR"}}),
+            );
+        }
+    }
+
+    // Ensure alternating roles: insert synthetic assistant between consecutive user messages
+    let mut i = 0;
+    while i + 1 < result.len() {
+        let curr_is_user = result[i].get("userInputMessage").is_some();
+        let next_is_user = result[i + 1].get("userInputMessage").is_some();
+        if curr_is_user && next_is_user {
+            result.insert(
+                i + 1,
+                json!({"assistantResponseMessage": {"content": "OK"}}),
+            );
+        }
+        i += 1;
+    }
+
     result
 }
 
@@ -531,7 +808,10 @@ fn convert_tool_result(block: &Value) -> Option<Value> {
 // ---- Tool conversion ----
 
 /// Convert Anthropic tools to Kiro tool format.
-fn convert_tools(tools: &[Value], name_map: &mut HashMap<String, String>) -> Value {
+/// Returns `(kiro_tools, tool_documentation)` where `tool_documentation` contains
+/// full descriptions of tools that exceeded the length limit.
+fn convert_tools(tools: &[Value], name_map: &mut HashMap<String, String>) -> (Value, String) {
+    let mut tool_docs = String::new();
     let kiro_tools: Vec<Value> = tools
         .iter()
         .filter_map(|tool| {
@@ -554,15 +834,10 @@ fn convert_tools(tools: &[Value], name_map: &mut HashMap<String, String>) -> Val
             // Normalize JSON Schema
             let schema = normalize_json_schema(input_schema);
 
-            // Truncate description if too long
+            // Long descriptions: move to system prompt instead of truncating
             let effective_desc = if description.len() > TOOL_DESC_MAX_LEN {
-                // Safe UTF-8 truncation
-                let truncated: String = description
-                    .char_indices()
-                    .take_while(|(i, _)| *i < TOOL_DESC_MAX_LEN)
-                    .map(|(_, c)| c)
-                    .collect();
-                format!("{}...", truncated)
+                tool_docs.push_str(&format!("## Tool: {}\n\n{}\n\n", name, description));
+                format!("[Full documentation in system prompt under '## Tool: {}']", name)
             } else {
                 description.to_string()
             };
@@ -577,17 +852,17 @@ fn convert_tools(tools: &[Value], name_map: &mut HashMap<String, String>) -> Val
         })
         .collect();
 
-    json!(kiro_tools)
+    (json!(kiro_tools), tool_docs)
 }
 
 /// Shorten a tool name if it exceeds the Kiro limit.
 /// Returns (shortened_name, was_shortened).
 fn shorten_tool_name(name: &str) -> (String, bool) {
-    if name.len() <= TOOL_NAME_MAX_LEN {
+    if name.chars().count() <= TOOL_NAME_MAX_LEN {
         return (name.to_string(), false);
     }
 
-    // SHA256-based shortening: prefix + "_" + 8 hex chars
+    // Hash-based shortening: prefix + "_" + 8 hex chars
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -596,20 +871,36 @@ fn shorten_tool_name(name: &str) -> (String, bool) {
     let hash = hasher.finish();
     let hash_hex = format!("{:08x}", hash as u32);
 
-    let prefix_len = TOOL_NAME_MAX_LEN - 1 - 8; // 54
-    let prefix: String = name
-        .char_indices()
-        .take_while(|(i, _)| *i < prefix_len)
-        .map(|(_, c)| c)
-        .collect();
+    let prefix_len = TOOL_NAME_MAX_LEN - 1 - 8; // 55 chars
+    let prefix: String = name.chars().take(prefix_len).collect();
 
     (format!("{}_{}", prefix, hash_hex), true)
 }
 
 /// Normalize a JSON Schema for Kiro compatibility.
+/// Kiro API rejects `additionalProperties` and empty `required` arrays.
+/// Recursively processes nested schemas.
 fn normalize_json_schema(mut schema: Value) -> Value {
     if !schema.is_object() {
-        return json!({"type": "object", "properties": {}, "required": [], "additionalProperties": true});
+        return json!({"type": "object", "properties": {}});
+    }
+
+    // First, recursively normalize nested schemas in properties
+    if let Some(props) = schema.get_mut("properties") {
+        if let Some(obj) = props.as_object_mut() {
+            for (_key, val) in obj.iter_mut() {
+                if val.is_object() {
+                    *val = normalize_json_schema(val.take());
+                }
+            }
+        }
+    }
+    // Recursively normalize items schema (for arrays)
+    if let Some(items) = schema.get_mut("items") {
+        if items.is_object() {
+            let taken = items.take();
+            *items = normalize_json_schema(taken);
+        }
     }
 
     let obj = schema.as_object_mut().unwrap();
@@ -633,29 +924,30 @@ fn normalize_json_schema(mut schema: Value) -> Value {
         obj.insert("properties".to_string(), json!({}));
     }
 
-    // Ensure required is a valid array
+    // Handle required: keep non-empty, remove empty
     match obj.get("required") {
         None => {
-            obj.insert("required".to_string(), json!([]));
+            // No required field — don't add empty one
         }
         Some(Value::Array(arr)) => {
-            // Filter to only string values
             let filtered: Vec<Value> = arr
                 .iter()
                 .filter(|v| v.is_string())
                 .cloned()
                 .collect();
-            obj.insert("required".to_string(), json!(filtered));
+            if filtered.is_empty() {
+                obj.remove("required");
+            } else {
+                obj.insert("required".to_string(), json!(filtered));
+            }
         }
         _ => {
-            obj.insert("required".to_string(), json!([]));
+            obj.remove("required");
         }
     }
 
-    // Ensure additionalProperties is set
-    if !obj.contains_key("additionalProperties") {
-        obj.insert("additionalProperties".to_string(), json!(true));
-    }
+    // Remove additionalProperties — Kiro API rejects it
+    obj.remove("additionalProperties");
 
     schema
 }
@@ -770,7 +1062,7 @@ mod tests {
         assert_eq!(tools.len(), 1);
 
         let tool_name = tools[0]["toolSpecification"]["name"].as_str().unwrap();
-        assert_eq!(tool_name.len(), 63);
+        assert_eq!(tool_name.chars().count(), 64);
         assert!(name_map.contains_key(tool_name));
     }
 
@@ -784,7 +1076,8 @@ mod tests {
                     {"type": "tool_result", "tool_use_id": "toolu_abc123", "content": "result text"},
                     {"type": "text", "extra": "ignored"}
                 ]}
-            ]
+            ],
+            "tools": [{"name": "test_tool", "description": "A test tool", "input_schema": {"type": "object"}}]
         });
         let provider = test_provider();
         let (payload, _) = anthropic_to_kiro(&body, &provider, &[]).unwrap();
@@ -820,8 +1113,9 @@ mod tests {
         let schema = json!({"type": "object", "properties": {"x": {"type": "string"}}});
         let result = normalize_json_schema(schema);
         assert_eq!(result["type"], "object");
-        assert!(result["required"].as_array().unwrap().is_empty());
-        assert_eq!(result["additionalProperties"], true);
+        // Kiro API: empty required and additionalProperties should be removed
+        assert!(result.get("required").is_none());
+        assert!(result.get("additionalProperties").is_none());
     }
 
     #[test]

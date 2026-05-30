@@ -6,7 +6,7 @@
 use crate::config::KiroConfig;
 use chrono::{DateTime, Duration, Utc};
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -53,16 +53,15 @@ impl KiroCredential {
     pub fn from_config(config: &KiroConfig) -> Self {
         let region = config.region.clone();
         let api_region = config.api_region.clone().unwrap_or_else(|| region.clone());
-        let machine_id = format!(
-            "{:016x}",
-            // Use a hash of the refresh token or a random value as machine ID
-            config
-                .refresh_token
-                .as_deref()
-                .unwrap_or("default")
-                .len() as u64
-                ^ 0xDEADBEEF
-        );
+        // Generate a stable machine ID from refresh token using a proper hash
+        let machine_id = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            config.refresh_token.as_deref().unwrap_or("default").hash(&mut hasher);
+            config.region.hash(&mut hasher);
+            format!("{:016x}", hasher.finish())
+        };
         Self {
             auth_method: AuthMethod::from_str(&config.auth_method),
             access_token: None,
@@ -111,12 +110,77 @@ struct RefreshResponse {
     profile_arn: Option<String>,
 }
 
+// ---- Token persistence ----
+
+/// Serializable token record for file persistence.
+#[derive(Serialize, Deserialize)]
+struct TokenRecord {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at: Option<String>,
+    profile_arn: Option<String>,
+    region: String,
+}
+
+/// Save token to a JSON file for persistence across restarts.
+fn persist_token(cred: &KiroCredential) {
+    let path = format!(
+        "{}/.config/model-proxy/kiro-token-{}.json",
+        std::env::var("HOME").unwrap_or_else(|_| ".".to_string()),
+        cred.region
+    );
+
+    let record = TokenRecord {
+        access_token: cred.access_token.clone().unwrap_or_default(),
+        refresh_token: cred.refresh_token.clone(),
+        expires_at: cred.expires_at.map(|dt| dt.to_rfc3339()),
+        profile_arn: cred.profile_arn.clone(),
+        region: cred.region.clone(),
+    };
+
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    match serde_json::to_string_pretty(&record) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, json) {
+                tracing::warn!(path = path.as_str(), error = %e, "保存 Kiro token 失败");
+            } else {
+                tracing::debug!(path = path.as_str(), "Kiro token 已保存");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "序列化 Kiro token 失败");
+        }
+    }
+}
+
+/// Try to load a persisted token from file.
+fn load_persisted_token(region: &str) -> Option<TokenRecord> {
+    let path = format!(
+        "{}/.config/model-proxy/kiro-token-{}.json",
+        std::env::var("HOME").unwrap_or_else(|_| ".".to_string()),
+        region
+    );
+    let data = std::fs::read_to_string(&path).ok()?;
+    let record: TokenRecord = serde_json::from_str(&data).ok()?;
+    // Check if not expired
+    if let Some(ref expires_str) = record.expires_at {
+        if let Ok(expires) = chrono::DateTime::parse_from_rfc3339(expires_str) {
+            if expires < Utc::now() + Duration::minutes(5) {
+                return None; // Expired
+            }
+        }
+    }
+    Some(record)
+}
+
 // ---- Auth manager ----
 
 /// Manages Kiro authentication tokens with automatic refresh.
 pub struct KiroAuthManager {
     credentials: Vec<KiroCredential>,
-    #[allow(dead_code)]
     client: Client,
     /// Machine ID for User-Agent header
     machine_id: String,
@@ -129,46 +193,91 @@ impl KiroAuthManager {
     pub fn new(config: &KiroConfig, client: Client) -> Self {
         let cred = KiroCredential::from_config(config);
         let machine_id = cred.machine_id.clone();
+        let kiro_version = config.kiro_version.clone().unwrap_or_else(|| "0.11.107".to_string());
         Self {
             credentials: vec![cred],
             client,
             machine_id,
-            kiro_version: "0.11.107".to_string(),
+            kiro_version,
         }
     }
 
     /// Get a valid access token, refreshing if necessary.
-    pub async fn get_valid_token(&self) -> crate::error::Result<String> {
-        // Find the first non-disabled credential
-        let cred = self
+    pub async fn get_valid_token(&mut self) -> crate::error::Result<String> {
+        // Find the first non-disabled credential index
+        let idx = self
             .credentials
             .iter()
-            .find(|c| !c.disabled)
+            .position(|c| !c.disabled)
             .ok_or_else(|| {
                 crate::error::AppError::Request("所有 Kiro 凭证已禁用".to_string())
             })?;
 
         // API key credentials don't need refresh
-        if cred.is_api_key() {
-            return cred.access_token.clone().ok_or_else(|| {
+        if self.credentials[idx].is_api_key() {
+            return self.credentials[idx].access_token.clone().ok_or_else(|| {
                 crate::error::AppError::Request("Kiro API Key 未配置".to_string())
             });
         }
 
         // Check if token is still valid
-        if !cred.is_expired() {
-            if let Some(token) = &cred.access_token {
+        if !self.credentials[idx].is_expired() {
+            if let Some(token) = &self.credentials[idx].access_token {
                 return Ok(token.clone());
             }
         }
 
-        // Need to refresh - but we need mutable access
-        // For now, we'll do the refresh and update the credential
-        // In production, this should use interior mutability (Mutex/RwLock)
-        Err(crate::error::AppError::Request(
-            "Kiro token 已过期，需要刷新（auth 模块需配合 KiroAuthManager 的 Arc<Mutex> 使用）"
-                .to_string(),
-        ))
+        // Try loading persisted token before doing a network refresh
+        if self.credentials[idx].access_token.is_none() {
+            if let Some(record) = load_persisted_token(&self.credentials[idx].region) {
+                info!("从持久化文件加载 Kiro token");
+                self.credentials[idx].access_token = Some(record.access_token.clone());
+                self.credentials[idx].refresh_token = record.refresh_token;
+                self.credentials[idx].profile_arn = record.profile_arn;
+                if !self.credentials[idx].is_expired() {
+                    return Ok(record.access_token);
+                }
+            }
+        }
+
+        // Token is expired or missing — refresh it
+        info!("Kiro token 已过期或缺失，正在刷新...");
+        Self::refresh_token(&mut self.credentials[idx], &self.client).await?;
+
+        // Persist refreshed token
+        persist_token(&self.credentials[idx]);
+
+        self.credentials[idx].access_token.clone().ok_or_else(|| {
+            crate::error::AppError::Request("Kiro token 刷新后仍为空".to_string())
+        })
+    }
+
+    /// Force refresh the token regardless of expiry status.
+    /// Used when receiving 403 from the Kiro API.
+    pub async fn force_refresh(&mut self) -> crate::error::Result<String> {
+        let idx = self
+            .credentials
+            .iter()
+            .position(|c| !c.disabled)
+            .ok_or_else(|| {
+                crate::error::AppError::Request("所有 Kiro 凭证已禁用".to_string())
+            })?;
+
+        if self.credentials[idx].is_api_key() {
+            return self.credentials[idx].access_token.clone().ok_or_else(|| {
+                crate::error::AppError::Request("Kiro API Key 未配置".to_string())
+            });
+        }
+
+        info!("Kiro 强制刷新 token（403 触发）");
+        Self::refresh_token(&mut self.credentials[idx], &self.client).await?;
+
+        // Persist refreshed token
+        persist_token(&self.credentials[idx]);
+
+        self.credentials[idx].access_token.clone().ok_or_else(|| {
+            crate::error::AppError::Request("Kiro token 强制刷新后仍为空".to_string())
+        })
     }
 
     /// Refresh the token for a credential.
@@ -417,6 +526,12 @@ mod tests {
             profile_arn: None,
             region: "us-west-2".to_string(),
             api_region: Some("us-west-2".to_string()),
+            model_aliases: None,
+            hidden_models: None,
+            kiro_version: None,
+            proxy_url: None,
+            thinking_mode: None,
+            web_search_enabled: None,
         };
         let cred = KiroCredential::from_config(&config);
         assert_eq!(cred.auth_method, AuthMethod::Social);

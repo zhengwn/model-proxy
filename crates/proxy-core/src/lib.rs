@@ -19,7 +19,7 @@ use tower_http::cors::CorsLayer;
 use tracing::info;
 
 use crate::config::Config;
-use crate::server::{event_logging_batch, proxy_chat_completions, proxy_messages};
+use crate::server::{event_logging_batch, proxy_chat_completions, proxy_count_tokens, proxy_messages, proxy_models};
 
 pub use tokio_util::sync::CancellationToken as ServerCancellationToken;
 
@@ -78,7 +78,9 @@ fn start_server_with_state(state: AppState, port: u16, token: CancellationToken)
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/messages", post(proxy_messages))
+        .route("/v1/messages/count_tokens", post(proxy_count_tokens))
         .route("/v1/chat/completions", post(proxy_chat_completions))
+        .route("/v1/models", get(proxy_models))
         .route("/api/event_logging/batch", post(event_logging_batch))
         .layer(CorsLayer::permissive())
         .with_state(state);
