@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use tracing::{debug, warn};
 
-use super::state::strip_leading_anthropic_billing_header;
+use crate::server::state::strip_leading_anthropic_billing_header;
 use crate::config::ProviderFormat;
 use crate::error::Result;
 
@@ -1050,6 +1050,12 @@ pub(crate) fn prepare_chat_completions_body(
             let anthropic_body = openai_to_anthropic(body, provider, global_routes);
             Ok((anthropic_body, stream, HashMap::new()))
         }
+        ProviderFormat::Kiro => {
+            // Kiro 转换由 convert/kiro/request.rs 处理
+            Err(crate::error::AppError::Request(
+                "Kiro format should use prepare_kiro_body() instead".to_string(),
+            ))
+        }
     }
 }
 
@@ -1080,6 +1086,12 @@ pub(crate) fn prepare_body(
             }
             Ok((body, stream, HashMap::new()))
         }
+        ProviderFormat::Kiro => {
+            // Kiro 转换由 convert/kiro/request.rs 处理，此路径不应到达
+            Err(crate::error::AppError::Request(
+                "Kiro format should use prepare_kiro_body() instead of prepare_body()".to_string(),
+            ))
+        }
     }
 }
 
@@ -1104,6 +1116,23 @@ pub(crate) fn build_provider_request(
                 .header("content-type", "application/json")
                 .header("x-api-key", provider.api_key.as_str())
                 .header("anthropic-version", "2023-06-01")
+                .json(&body)
+        }
+        ProviderFormat::Kiro => {
+            // Kiro 请求构建由 convert/kiro 模块处理，此为占位
+            // 实际的 Kiro 请求需要特殊 headers（x-amzn-kiro-agent-mode 等）
+            let url = format!(
+                "https://q.{region}.amazonaws.com/generateAssistantResponse",
+                region = provider
+                    .kiro_config
+                    .as_ref()
+                    .and_then(|k| k.api_region.as_deref())
+                    .or(provider.kiro_config.as_ref().map(|k| k.region.as_str()))
+                    .unwrap_or("us-east-1")
+            );
+            client
+                .post(&url)
+                .header("content-type", "application/json")
                 .json(&body)
         }
     }

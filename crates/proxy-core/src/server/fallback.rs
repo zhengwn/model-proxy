@@ -7,11 +7,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
-use super::convert::{build_provider_request, prepare_body, prepare_chat_completions_body};
-use super::passthrough::{handle_non_stream_passthrough, handle_stream_passthrough};
-use super::response::{handle_non_stream, handle_non_stream_openai_output};
+use crate::convert::anthropic_openai::request::{build_provider_request, prepare_body, prepare_chat_completions_body};
+use crate::convert::anthropic_openai::response::{handle_non_stream, handle_non_stream_openai_output};
+use crate::convert::anthropic_openai::stream::{handle_stream, handle_stream_openai_output};
+use crate::convert::passthrough::{handle_non_stream_passthrough, handle_stream_passthrough};
 use super::state::NON_STREAM_REQUEST_TIMEOUT_SECS;
-use super::stream::{handle_stream, handle_stream_openai_output};
 use crate::config::{ModelRoute, ProviderConfig};
 use crate::error::Result;
 use crate::ProviderRegistry;
@@ -250,6 +250,35 @@ async fn try_single_provider(
                 handle_non_stream_openai_output(
                     fallback_resp,
                     &fallback_model,
+                    request_id,
+                    request_start,
+                    upstream_start,
+                    upstream_headers_ms,
+                )
+                .await
+            }
+        }
+        // Kiro provider: passthrough (response is already in the correct format
+        // since prepare_body/prepare_chat_completions_body handle the conversion)
+        (_, crate::config::ProviderFormat::Kiro) => {
+            // For Kiro fallback, the response is EventStream format
+            // Since Kiro requires auth tokens that the fallback may not have,
+            // this path primarily handles the case where the Kiro provider
+            // was the original target and we're retrying after a transient error.
+            // The response format depends on the input format.
+            if fallback_is_stream {
+                handle_stream_passthrough(
+                    fallback_resp,
+                    request_id.to_string(),
+                    request_start,
+                    upstream_start,
+                    upstream_headers_ms,
+                    None,
+                )
+                .await
+            } else {
+                handle_non_stream_passthrough(
+                    fallback_resp,
                     request_id,
                     request_start,
                     upstream_start,

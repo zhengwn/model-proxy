@@ -8,8 +8,8 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
-use super::state::elapsed_ms;
-use super::stream::StreamLogContext;
+use crate::server::state::elapsed_ms;
+use crate::convert::anthropic_openai::stream::StreamLogContext;
 use crate::error::AppError;
 
 pub(crate) async fn handle_non_stream_passthrough(

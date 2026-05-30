@@ -1,5 +1,9 @@
 use super::*;
+use super::request as convert;
+use super::response;
+use super::stream;
 use crate::config::{Config, ModelRoute, ProviderFormat};
+use crate::convert::utils;
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -18,6 +22,7 @@ fn test_config_with_model(model: &str) -> Config {
             format: ProviderFormat::Openai,
             quirks: Default::default(),
             model_routes: Vec::new(),
+            kiro_config: None,
         },
         active_provider: None,
         providers: Vec::new(),
@@ -671,6 +676,7 @@ fn anthropic_provider_config() -> crate::config::ProviderConfig {
         format: ProviderFormat::Anthropic,
         quirks: Default::default(),
         model_routes: Vec::new(),
+        kiro_config: None,
     }
 }
 

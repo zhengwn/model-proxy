@@ -70,6 +70,7 @@ mod tests {
             format: ProviderFormat::Openai,
             quirks: ProviderQuirks::default(),
             model_routes: Vec::new(),
+            kiro_config: None,
         }
     }
 

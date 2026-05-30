@@ -117,11 +117,12 @@ fn default_max_body_bytes() -> usize {
     DEFAULT_MAX_BODY_BYTES
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderFormat {
     Openai,
     Anthropic,
+    Kiro,
 }
 
 fn default_format() -> ProviderFormat {
@@ -147,6 +148,9 @@ pub struct ProviderConfig {
     /// 已废弃：模型路由已移至全局 Config.model_routes，此字段保留用于向后兼容反序列化
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_routes: Vec<ModelRoute>,
+    /// Kiro (Amazon Q Developer) 专用配置，仅 format="kiro" 时需要
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kiro_config: Option<KiroConfig>,
 }
 
 /// 旧格式 Provider（无 name 字段），用于向后兼容反序列化
@@ -161,6 +165,8 @@ pub struct LegacyProviderConfig {
     pub quirks: ProviderQuirks,
     #[serde(default)]
     pub model_routes: Vec<ModelRoute>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kiro_config: Option<KiroConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,6 +195,35 @@ pub struct ProviderQuirks {
     pub max_reasoning_effort: String,
 }
 
+fn default_kiro_region() -> String {
+    "us-east-1".to_string()
+}
+
+/// Kiro (Amazon Q Developer) 专用配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KiroConfig {
+    /// 认证方式: "social" | "idc" | "api_key"
+    pub auth_method: String,
+    /// 刷新 token（social 和 idc 时需要）
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    /// OIDC 客户端 ID（idc 时需要）
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// OIDC 客户端密钥（idc 时需要）
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// AWS profile ARN（可选，自动从刷新响应获取）
+    #[serde(default)]
+    pub profile_arn: Option<String>,
+    /// 区域（默认 us-east-1）
+    #[serde(default = "default_kiro_region")]
+    pub region: String,
+    /// API 区域（默认同 region）
+    #[serde(default)]
+    pub api_region: Option<String>,
+}
+
 impl ProviderConfig {
     /// Creates a placeholder ProviderConfig used as serde default.
     /// This is replaced during normalize() with the actual active provider.
@@ -201,6 +236,7 @@ impl ProviderConfig {
             format: ProviderFormat::Openai,
             quirks: ProviderQuirks::default(),
             model_routes: Vec::new(),
+            kiro_config: None,
         }
     }
 
@@ -482,6 +518,7 @@ mod config_tests {
             format: ProviderFormat::Openai,
             quirks: ProviderQuirks::default(),
             model_routes: Vec::new(),
+            kiro_config: None,
         }
     }
 
@@ -562,6 +599,7 @@ mod config_tests {
                 format: ProviderFormat::Openai,
                 quirks: ProviderQuirks::default(),
                 model_routes: Vec::new(),
+                kiro_config: None,
             },
             active_provider: None,
             providers: Vec::new(),

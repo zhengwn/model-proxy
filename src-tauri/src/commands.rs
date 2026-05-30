@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 
 use proxy_core::config::{Config, ModelRoute, ProviderConfig, ServerConfig};
 use proxy_core::logging::{LogCollector, LogConfig};
-use proxy_core::proxy::AppState as ProxyCoreAppState;
+use proxy_core::AppState as ProxyCoreAppState;
 use proxy_core::ProviderRegistry;
 
 use crate::logging::event_emitter_task;
@@ -516,7 +516,7 @@ pub async fn test_provider(provider: ProviderConfig) -> Result<TestProviderResul
 
     let (url, body, auth_header) = match provider.format {
         proxy_core::config::ProviderFormat::Openai => {
-            let url = proxy_core::proxy::openai_chat_completions_url(&provider.base_url);
+            let url = proxy_core::convert::openai_chat_completions_url(&provider.base_url);
             let body = serde_json::json!({
                 "model": provider.model,
                 "messages": [{"role": "user", "content": "hi"}],
@@ -525,7 +525,7 @@ pub async fn test_provider(provider: ProviderConfig) -> Result<TestProviderResul
             (url, body, format!("Bearer {}", provider.api_key))
         }
         proxy_core::config::ProviderFormat::Anthropic => {
-            let url = proxy_core::proxy::anthropic_messages_url(&provider.base_url);
+            let url = proxy_core::convert::anthropic_messages_url(&provider.base_url);
             let body = serde_json::json!({
                 "model": provider.model,
                 "messages": [{"role": "user", "content": "hi"}],

@@ -1,5 +1,5 @@
 use proxy_core::config::Config;
-use proxy_core::proxy::AppState as ProxyCoreAppState;
+use proxy_core::AppState as ProxyCoreAppState;
 use proxy_core::RequestCounters;
 use serde::Serialize;
 use std::sync::atomic::Ordering;

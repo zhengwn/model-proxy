@@ -1,27 +1,28 @@
 use axum::{
     body::{to_bytes, Body},
     extract::State,
-    http::HeaderMap,
+    http::{header, HeaderMap},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use tracing::{debug, error, info, warn};
 
-use super::convert::{build_provider_request, prepare_body, prepare_chat_completions_body};
+use crate::convert::anthropic_openai::request::{build_provider_request, prepare_body, prepare_chat_completions_body};
+use crate::convert::anthropic_openai::response::{handle_non_stream, handle_non_stream_openai_output};
+use crate::convert::anthropic_openai::stream::{handle_stream, handle_stream_openai_output, StreamLogContext};
+use crate::convert::passthrough::{handle_non_stream_passthrough, handle_stream_passthrough};
+use crate::convert::utils::{message_count, tool_count, truncate_for_log};
 use super::fallback::{self, try_fallback, InputFormat};
-use super::passthrough::{handle_non_stream_passthrough, handle_stream_passthrough};
-use super::response::{handle_non_stream, handle_non_stream_openai_output};
 use super::state::{
     elapsed_ms, next_request_id, RequestCompletionGuard, MAX_LOG_BODY_BYTES,
     NON_STREAM_REQUEST_TIMEOUT_SECS,
 };
-use super::stream::{handle_stream, handle_stream_openai_output, StreamLogContext};
-use super::utils::{message_count, tool_count, truncate_for_log};
 use crate::{
     config::Config,
     error::{AppError, Result},
@@ -177,6 +178,21 @@ pub async fn proxy_messages(
     // Load the current active provider (lock-free via ArcSwap)
     let provider = state.current_provider();
     let model_routes = state.current_model_routes();
+
+    // Kiro provider uses a completely different request/response flow
+    if provider.format == crate::config::ProviderFormat::Kiro {
+        return handle_kiro_messages(
+            state,
+            body_json,
+            bytes,
+            requested_model,
+            raw_request_body,
+            request_id,
+            request_guard,
+            request_start,
+        )
+        .await;
+    }
 
     request_guard.set_phase("prepare_body");
     let global_routes = model_routes.as_slice();
@@ -448,8 +464,11 @@ pub async fn proxy_messages(
                 .await
             }
         }
+        crate::config::ProviderFormat::Kiro => {
+            // Kiro is handled by early return above — this is unreachable
+            unreachable!("Kiro requests are handled before this match")
+        }
     };
-    request_guard.complete();
 
     if !is_stream {
         let log_ctx = LogContext {
@@ -517,6 +536,19 @@ pub async fn proxy_chat_completions(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+
+    // Kiro provider: convert OpenAI → Kiro → Anthropic → OpenAI
+    if provider.format == crate::config::ProviderFormat::Kiro {
+        return handle_kiro_chat_completions(
+            state,
+            body_json,
+            requested_model,
+            request_id.clone(),
+            request_start,
+        )
+        .await;
+    }
+
     let global_routes = model_routes.as_slice();
     let provider_model = provider
         .resolve_model_with_routes(Some(requested_model.as_str()), global_routes)
@@ -883,6 +915,10 @@ pub async fn proxy_chat_completions(
 
             response
         }
+        crate::config::ProviderFormat::Kiro => {
+            // Kiro is handled by early return above — this is unreachable
+            unreachable!("Kiro requests are handled before this match")
+        }
     }
 }
 
@@ -900,4 +936,587 @@ pub async fn event_logging_batch(body: String) -> Json<Value> {
         "收到遥测事件"
     );
     Json(json!({"status": "ok"}))
+}
+
+/// Handle `/v1/messages` request with Kiro as upstream provider.
+/// This is a separate function because Kiro uses a completely different
+/// request/response protocol (AWS EventStream instead of SSE).
+async fn handle_kiro_messages(
+    state: super::state::AppState,
+    body_json: Value,
+    _raw_bytes: bytes::Bytes,
+    requested_model: String,
+    raw_request_body: String,
+    request_id: String,
+    mut request_guard: RequestCompletionGuard,
+    request_start: Instant,
+) -> Result<Response> {
+    use crate::convert::kiro::request::anthropic_to_kiro;
+    use crate::convert::kiro::stream::handle_stream_anthropic_output;
+    use crate::convert::kiro::auth::KiroAuthManager;
+
+    let provider = state.current_provider();
+    let model_routes = state.current_model_routes();
+    let global_routes = model_routes.as_slice();
+
+    request_guard.set_phase("kiro_convert");
+
+    // Convert Anthropic request to Kiro payload
+    let (kiro_payload, tool_name_map) = anthropic_to_kiro(&body_json, &provider, global_routes)?;
+
+    let kiro_model = kiro_payload
+        .pointer("/conversationState/currentMessage/userInputMessage/modelId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    let is_stream = body_json
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    info!(
+        request_id = request_id.as_str(),
+        kiro_model,
+        stream = is_stream,
+        "Kiro 请求转换完成"
+    );
+
+    // Get auth token
+    request_guard.set_phase("kiro_auth");
+    let kiro_config = provider.kiro_config.as_ref().ok_or_else(|| {
+        AppError::Request("Kiro provider 缺少 kiro_config 配置".to_string())
+    })?;
+
+    // Use shared auth manager if available, otherwise create a new one
+    let auth_guard = state.kiro_auth.as_ref().map(|a| a.clone());
+    let (token, amz_user_agent, user_agent_str) = if let Some(auth_arc) = auth_guard {
+        let auth = auth_arc.lock().await;
+        let token = auth.get_valid_token().await?;
+        (token, auth.amz_user_agent(), auth.user_agent())
+    } else {
+        let auth = KiroAuthManager::new(kiro_config, state.client.clone());
+        let token = auth.get_valid_token().await?;
+        (token, auth.amz_user_agent(), auth.user_agent())
+    };
+
+    // Build Kiro HTTP request
+    request_guard.set_phase("kiro_request");
+    let region = kiro_config
+        .api_region
+        .as_deref()
+        .unwrap_or(&kiro_config.region);
+    let url = format!(
+        "https://q.{}.amazonaws.com/generateAssistantResponse",
+        region
+    );
+
+    let mut req = state
+        .client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("x-amzn-codewhisperer-optout", "true")
+        .header("x-amzn-kiro-agent-mode", "vibe")
+        .header("x-amz-user-agent", &amz_user_agent)
+        .header("user-agent", &user_agent_str)
+        .header(
+            "amz-sdk-invocation-id",
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .header("amz-sdk-request", "attempt=1; max=3")
+        .json(&kiro_payload);
+
+    if !is_stream {
+        req = req.timeout(Duration::from_secs(super::state::NON_STREAM_REQUEST_TIMEOUT_SECS));
+    }
+
+    let upstream_start = Instant::now();
+    request_guard.set_phase("kiro_send");
+
+    let upstream_resp = match req.send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            error!(
+                request_id = request_id.as_str(),
+                error = %e,
+                "Kiro 上游请求失败"
+            );
+            request_guard.complete();
+            return Err(AppError::Http(e));
+        }
+    };
+
+    let status = upstream_resp.status();
+    let upstream_headers_ms = elapsed_ms(upstream_start);
+
+    if !status.is_success() {
+        let text = upstream_resp.text().await.unwrap_or_default();
+        error!(
+            request_id = request_id.as_str(),
+            status = %status,
+            body = text.as_str(),
+            "Kiro 上游返回错误"
+        );
+        request_guard.complete();
+        return Ok((
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            Json(json!({
+                "type": "error",
+                "error": {
+                    "type": "upstream_error",
+                    "message": text
+                }
+            })),
+        )
+            .into_response());
+    }
+
+    // Handle response
+    request_guard.set_phase("kiro_response");
+
+    if is_stream {
+        let response = handle_stream_anthropic_output(
+            upstream_resp,
+            kiro_model,
+            tool_name_map,
+            request_id.clone(),
+            request_start,
+            upstream_start,
+            upstream_headers_ms,
+            Some(StreamLogContext {
+                collector: state.log_collector.clone(),
+                request_id: request_id.clone(),
+                method: "POST",
+                path: "/v1/messages",
+                provider: provider.name.clone(),
+                model: kiro_model.to_string(),
+                requested_model: requested_model.clone(),
+                request_start,
+                upstream_start,
+                raw_request_body: raw_request_body.clone(),
+            }),
+        )
+        .await;
+        request_guard.complete();
+        response
+    } else {
+        // Non-streaming: collect all events and build Anthropic response
+        let response = handle_kiro_non_stream(
+            upstream_resp,
+            kiro_model,
+            &tool_name_map,
+            &request_id,
+            request_start,
+            upstream_start,
+            upstream_headers_ms,
+        )
+        .await;
+        request_guard.complete();
+        response
+    }
+}
+
+/// Handle non-streaming Kiro response → Anthropic Messages response.
+async fn handle_kiro_non_stream(
+    upstream_resp: reqwest::Response,
+    model: &str,
+    tool_name_map: &HashMap<String, String>,
+    request_id: &str,
+    request_start: Instant,
+    upstream_start: Instant,
+    upstream_headers_ms: u128,
+) -> Result<Response> {
+    use crate::convert::kiro::eventstream::{Event, EventStreamDecoder};
+
+    let body_bytes = upstream_resp.bytes().await?;
+    let mut decoder = EventStreamDecoder::new();
+    decoder
+        .feed(&body_bytes)
+        .map_err(|e| AppError::Request(format!("EventStream 解析错误: {}", e)))?;
+
+    // Collect all events
+    let mut text_parts = Vec::new();
+    let mut thinking_parts = Vec::new();
+    let mut tool_uses = Vec::new();
+    let mut input_tokens = 0u64;
+    let mut output_tokens: u64;
+
+    loop {
+        match decoder.decode() {
+            Ok(Some(frame)) => {
+                if let Ok(event) = Event::from_frame(&frame) {
+                    match event {
+                        Event::AssistantResponse { content } => {
+                            text_parts.push(content);
+                        }
+                        Event::ReasoningContent { text } => {
+                            thinking_parts.push(text);
+                        }
+                        Event::ToolUse {
+                            name,
+                            tool_use_id,
+                            input,
+                            stop,
+                        } => {
+                            if stop {
+                                let original_name = tool_name_map
+                                    .get(name.as_str())
+                                    .map(|s| s.as_str())
+                                    .unwrap_or(name.as_str());
+                                let input_val: Value =
+                                    serde_json::from_str(&input).unwrap_or(json!({}));
+                                tool_uses.push(json!({
+                                    "type": "tool_use",
+                                    "id": tool_use_id,
+                                    "name": original_name,
+                                    "input": input_val
+                                }));
+                            }
+                        }
+                        Event::ContextUsage { percentage } => {
+                            let window =
+                                crate::convert::kiro::model_map::context_window_size(model);
+                            input_tokens = (percentage * window as f64 / 100.0) as u64;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {
+                if decoder.is_stopped() {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Build Anthropic response
+    let mut content_blocks = Vec::new();
+
+    let thinking_text = thinking_parts.join("");
+    if !thinking_text.is_empty() {
+        content_blocks.push(json!({
+            "type": "thinking",
+            "thinking": thinking_text,
+            "signature": ""
+        }));
+    }
+
+    let visible_text = text_parts.join("");
+    if !visible_text.is_empty() {
+        content_blocks.push(json!({"type": "text", "text": visible_text}));
+    }
+
+    for tu in &tool_uses {
+        content_blocks.push(tu.clone());
+    }
+
+    let has_tool_use = !tool_uses.is_empty();
+    output_tokens = visible_text.len() as u64 / 4 + 1;
+
+    let stop_reason = if has_tool_use { "tool_use" } else { "end_turn" };
+
+    let response = json!({
+        "id": format!("msg_{}", next_request_id()),
+        "type": "message",
+        "role": "assistant",
+        "content": content_blocks,
+        "model": model,
+        "stop_reason": stop_reason,
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens
+        }
+    });
+
+    info!(
+        request_id,
+        has_tool_use,
+        input_tokens,
+        output_tokens,
+        upstream_headers_ms,
+        upstream_total_ms = elapsed_ms(upstream_start),
+        request_total_ms = elapsed_ms(request_start),
+        "Kiro 非流式响应完成"
+    );
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(response.to_string()))
+        .map_err(|e| AppError::Request(format!("Failed to build response: {}", e)))?)
+}
+
+/// Handle `/v1/chat/completions` with Kiro as upstream.
+/// Flow: OpenAI request → Anthropic format → Kiro payload → Kiro API → response → OpenAI format
+async fn handle_kiro_chat_completions(
+    state: super::state::AppState,
+    body_json: Value,
+    requested_model: String,
+    request_id: String,
+    request_start: Instant,
+) -> Result<Response> {
+    use crate::convert::anthropic_openai::request::openai_to_anthropic;
+    use crate::convert::kiro::auth::KiroAuthManager;
+    use crate::convert::kiro::request::anthropic_to_kiro;
+    use crate::convert::kiro::stream::handle_stream_openai_output;
+
+    let provider = state.current_provider();
+    let model_routes = state.current_model_routes();
+    let global_routes = model_routes.as_slice();
+
+    let is_stream = body_json
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Step 1: OpenAI → Anthropic format
+    let anthropic_body = openai_to_anthropic(body_json, &provider, global_routes);
+
+    // Step 2: Anthropic → Kiro payload
+    let (kiro_payload, tool_name_map) =
+        anthropic_to_kiro(&anthropic_body, &provider, global_routes)?;
+
+    let kiro_model = kiro_payload
+        .pointer("/conversationState/currentMessage/userInputMessage/modelId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    info!(
+        request_id = request_id.as_str(),
+        kiro_model,
+        stream = is_stream,
+        "Kiro chat/completions 请求转换完成"
+    );
+
+    // Step 3: Get auth token
+    let kiro_config = provider.kiro_config.as_ref().ok_or_else(|| {
+        AppError::Request("Kiro provider 缺少 kiro_config 配置".to_string())
+    })?;
+
+    let auth_guard = state.kiro_auth.as_ref().map(|a| a.clone());
+    let (token, amz_user_agent, user_agent_str) = if let Some(auth_arc) = auth_guard {
+        let auth = auth_arc.lock().await;
+        let token = auth.get_valid_token().await?;
+        (token, auth.amz_user_agent(), auth.user_agent())
+    } else {
+        let auth = KiroAuthManager::new(kiro_config, state.client.clone());
+        let token = auth.get_valid_token().await?;
+        (token, auth.amz_user_agent(), auth.user_agent())
+    };
+
+    // Step 4: Send to Kiro API
+    let region = kiro_config
+        .api_region
+        .as_deref()
+        .unwrap_or(&kiro_config.region);
+    let url = format!(
+        "https://q.{}.amazonaws.com/generateAssistantResponse",
+        region
+    );
+
+    let mut req = state
+        .client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("x-amzn-codewhisperer-optout", "true")
+        .header("x-amzn-kiro-agent-mode", "vibe")
+        .header("x-amz-user-agent", &amz_user_agent)
+        .header("user-agent", &user_agent_str)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=3")
+        .json(&kiro_payload);
+
+    if !is_stream {
+        req = req.timeout(Duration::from_secs(super::state::NON_STREAM_REQUEST_TIMEOUT_SECS));
+    }
+
+    let upstream_start = Instant::now();
+    let upstream_resp = match req.send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            error!(request_id = request_id.as_str(), error = %e, "Kiro 上游请求失败");
+            return Err(AppError::Http(e));
+        }
+    };
+
+    let status = upstream_resp.status();
+    let upstream_headers_ms = elapsed_ms(upstream_start);
+
+    if !status.is_success() {
+        let text = upstream_resp.text().await.unwrap_or_default();
+        error!(
+            request_id = request_id.as_str(),
+            status = %status,
+            body = text.as_str(),
+            "Kiro 上游返回错误"
+        );
+        return Ok((
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            Json(json!({
+                "error": {"message": text, "type": "upstream_error"}
+            })),
+        )
+            .into_response());
+    }
+
+    // Step 5: Convert response
+    if is_stream {
+        handle_stream_openai_output(
+            upstream_resp,
+            kiro_model,
+            tool_name_map,
+            request_id.clone(),
+            request_start,
+            upstream_start,
+            upstream_headers_ms,
+            None,
+        )
+        .await
+    } else {
+        // Non-streaming: collect events and build OpenAI response
+        handle_kiro_non_stream_openai(
+            upstream_resp,
+            kiro_model,
+            &request_id,
+            request_start,
+            upstream_start,
+            upstream_headers_ms,
+        )
+        .await
+    }
+}
+
+/// Handle non-streaming Kiro response → OpenAI Chat Completions response.
+async fn handle_kiro_non_stream_openai(
+    upstream_resp: reqwest::Response,
+    model: &str,
+    request_id: &str,
+    request_start: Instant,
+    upstream_start: Instant,
+    upstream_headers_ms: u128,
+) -> Result<Response> {
+    use crate::convert::kiro::eventstream::{Event, EventStreamDecoder};
+
+    let body_bytes = upstream_resp.bytes().await?;
+    let mut decoder = EventStreamDecoder::new();
+    decoder
+        .feed(&body_bytes)
+        .map_err(|e| AppError::Request(format!("EventStream 解析错误: {}", e)))?;
+
+    let mut text_parts = Vec::new();
+    let mut thinking_parts = Vec::new();
+    let mut tool_calls: Vec<Value> = Vec::new();
+    let mut input_tokens = 0u64;
+    let mut tool_call_index = 0usize;
+
+    loop {
+        match decoder.decode() {
+            Ok(Some(frame)) => {
+                if let Ok(event) = Event::from_frame(&frame) {
+                    match event {
+                        Event::AssistantResponse { content } => text_parts.push(content),
+                        Event::ReasoningContent { text } => thinking_parts.push(text),
+                        Event::ToolUse {
+                            name,
+                            tool_use_id,
+                            input,
+                            stop,
+                        } => {
+                            if stop {
+                                let input_val: Value =
+                                    serde_json::from_str(&input).unwrap_or(json!({}));
+                                tool_calls.push(json!({
+                                    "id": format!("call_{}", &tool_use_id[tool_use_id.len().min(6)..]),
+                                    "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": serde_json::to_string(&input_val).unwrap_or_default()
+                                    }
+                                }));
+                                tool_call_index += 1;
+                            }
+                        }
+                        Event::ContextUsage { percentage } => {
+                            let window =
+                                crate::convert::kiro::model_map::context_window_size(model);
+                            input_tokens = (percentage * window as f64 / 100.0) as u64;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {
+                if decoder.is_stopped() {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Build OpenAI response
+    let content_text = text_parts.join("");
+    let thinking_text = thinking_parts.join("");
+    let content_len = content_text.len();
+
+    let mut message = json!({
+        "role": "assistant",
+        "content": if content_text.is_empty() { Value::Null } else { Value::String(content_text) }
+    });
+
+    if !thinking_text.is_empty() {
+        message["reasoning_content"] = json!(thinking_text);
+    }
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = json!(tool_calls);
+    }
+
+    let has_tool_use = !tool_calls.is_empty();
+    let output_tokens = content_len as u64 / 4 + 1;
+    let finish_reason = if has_tool_use { "tool_calls" } else { "stop" };
+
+    let response = json!({
+        "id": format!("chatcmpl-{}", next_request_id()),
+        "object": "chat.completion",
+        "created": now_epoch_secs(),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason
+        }],
+        "usage": {
+            "prompt_tokens": input_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens
+        }
+    });
+
+    info!(
+        request_id,
+        has_tool_use,
+        input_tokens,
+        output_tokens,
+        upstream_headers_ms,
+        upstream_total_ms = elapsed_ms(upstream_start),
+        request_total_ms = elapsed_ms(request_start),
+        "Kiro 非流式 OpenAI 响应完成"
+    );
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(response.to_string()))
+        .map_err(|e| AppError::Request(format!("Failed to build response: {}", e)))?)
+}
+
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }

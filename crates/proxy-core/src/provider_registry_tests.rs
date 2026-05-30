@@ -3,7 +3,7 @@ use proptest::prelude::*;
 use crate::config::{
     Config, ConfigError, ProviderConfig, ProviderFormat, ProviderQuirks, ServerConfig,
 };
-use crate::proxy::AppState;
+use crate::server::AppState;
 
 // ============================================================================
 // Property 5: Runtime provider switch correctness
@@ -19,6 +19,7 @@ fn make_provider(name: &str) -> ProviderConfig {
         format: ProviderFormat::Openai,
         quirks: ProviderQuirks::default(),
         model_routes: Vec::new(),
+        kiro_config: None,
     }
 }
 

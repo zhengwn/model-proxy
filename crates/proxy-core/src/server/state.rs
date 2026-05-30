@@ -104,6 +104,8 @@ pub struct AppState {
     pub counters: Option<RequestCounters>,
     /// Optional semaphore for concurrency limiting.
     pub concurrency_semaphore: Option<Arc<Semaphore>>,
+    /// Shared Kiro auth manager (only initialized when a Kiro provider exists).
+    pub kiro_auth: Option<Arc<tokio::sync::Mutex<crate::convert::kiro::auth::KiroAuthManager>>>,
 }
 
 impl AppState {
@@ -142,6 +144,14 @@ impl AppState {
             None
         };
 
+        // Initialize Kiro auth manager if any provider uses Kiro format
+        let kiro_auth = config.providers.iter().find(|p| p.format == crate::config::ProviderFormat::Kiro)
+            .and_then(|p| p.kiro_config.as_ref())
+            .map(|kiro_config| {
+                let auth = crate::convert::kiro::auth::KiroAuthManager::new(kiro_config, client.clone());
+                Arc::new(tokio::sync::Mutex::new(auth))
+            });
+
         Self {
             config: Arc::new(config),
             active_provider,
@@ -151,6 +161,7 @@ impl AppState {
             log_collector,
             counters: None,
             concurrency_semaphore,
+            kiro_auth,
         }
     }
 
@@ -180,6 +191,14 @@ impl AppState {
             None
         };
 
+        // Initialize Kiro auth manager if any provider uses Kiro format
+        let kiro_auth = config.providers.iter().find(|p| p.format == crate::config::ProviderFormat::Kiro)
+            .and_then(|p| p.kiro_config.as_ref())
+            .map(|kiro_config| {
+                let auth = crate::convert::kiro::auth::KiroAuthManager::new(kiro_config, client.clone());
+                Arc::new(tokio::sync::Mutex::new(auth))
+            });
+
         Self {
             config: Arc::new(config),
             active_provider,
@@ -189,6 +208,7 @@ impl AppState {
             log_collector,
             counters: None,
             concurrency_semaphore,
+            kiro_auth,
         }
     }
 

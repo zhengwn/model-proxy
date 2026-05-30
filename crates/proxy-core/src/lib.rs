@@ -1,11 +1,12 @@
 pub mod config;
+pub mod convert;
 pub mod error;
 pub mod logging;
 pub mod provider_registry;
-pub mod proxy;
+pub mod server;
 
 pub use provider_registry::ProviderRegistry;
-pub use proxy::AppState;
+pub use server::AppState;
 
 use axum::{routing::get, routing::post, Json, Router};
 use serde_json::json;
@@ -18,7 +19,7 @@ use tower_http::cors::CorsLayer;
 use tracing::info;
 
 use crate::config::Config;
-use crate::proxy::{event_logging_batch, proxy_chat_completions, proxy_messages};
+use crate::server::{event_logging_batch, proxy_chat_completions, proxy_messages};
 
 pub use tokio_util::sync::CancellationToken as ServerCancellationToken;
 
