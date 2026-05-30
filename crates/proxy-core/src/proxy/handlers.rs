@@ -12,15 +12,15 @@ use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use tracing::{debug, error, info, warn};
 
-use super::convert::{build_provider_request, prepare_body};
-use super::fallback::{self, try_fallback};
+use super::convert::{build_provider_request, prepare_body, prepare_chat_completions_body};
+use super::fallback::{self, try_fallback, InputFormat};
 use super::passthrough::{handle_non_stream_passthrough, handle_stream_passthrough};
-use super::response::handle_non_stream;
+use super::response::{handle_non_stream, handle_non_stream_openai_output};
 use super::state::{
     elapsed_ms, next_request_id, RequestCompletionGuard, MAX_LOG_BODY_BYTES,
     NON_STREAM_REQUEST_TIMEOUT_SECS,
 };
-use super::stream::{handle_stream, StreamLogContext};
+use super::stream::{handle_stream, handle_stream_openai_output, StreamLogContext};
 use super::utils::{message_count, tool_count, truncate_for_log};
 use crate::{
     config::Config,
@@ -304,6 +304,7 @@ pub async fn proxy_messages(
                 request_start,
                 upstream_start,
                 upstream_headers_ms,
+                input_format: InputFormat::Anthropic,
             };
 
             if let Some(response) = try_fallback(
@@ -694,12 +695,193 @@ pub async fn proxy_chat_completions(
             response
         }
         crate::config::ProviderFormat::Anthropic => {
-            // Cannot forward OpenAI format to Anthropic provider without conversion
-            // (reverse conversion is not implemented)
-            state.inc_failed_requests();
-            Err(AppError::Request(
-                "Current provider uses Anthropic format. The /v1/chat/completions endpoint only supports OpenAI-format providers. Use /v1/messages instead.".to_string()
-            ))
+            // Convert OpenAI request to Anthropic format
+            let (body_json, is_stream, _tool_name_map) =
+                prepare_chat_completions_body(body_json, &provider, global_routes)?;
+
+            let provider_model = body_json
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or(provider.model.as_str())
+                .to_string();
+            let log_model = provider_model.clone();
+
+            let mut req = build_provider_request(&state.client, &provider, body_json);
+            if !is_stream {
+                req = req.timeout(Duration::from_secs(NON_STREAM_REQUEST_TIMEOUT_SECS));
+            }
+
+            let _permit = if let Some(ref sem) = state.concurrency_semaphore {
+                match sem.try_acquire() {
+                    Ok(permit) => Some(permit),
+                    Err(_) => {
+                        state.inc_failed_requests();
+                        return Err(AppError::TooManyRequests);
+                    }
+                }
+            } else {
+                None
+            };
+
+            let upstream_resp = match req.send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    state.inc_failed_requests();
+                    let log_ctx = LogContext {
+                        request_id: &request_id,
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        provider: &log_provider_name,
+                        model: &log_model,
+                        requested_model: &requested_model,
+                        request_start,
+                        upstream_start,
+                        is_stream,
+                        raw_request_body: &raw_request_body,
+                    };
+                    emit_log_entry(
+                        &state.log_collector,
+                        &log_ctx,
+                        502,
+                        None,
+                        Some(e.to_string()),
+                        None,
+                    );
+                    return Err(AppError::Http(e));
+                }
+            };
+
+            let status = upstream_resp.status();
+            let upstream_headers_ms = elapsed_ms(upstream_start);
+            if !status.is_success() {
+                let text = upstream_resp.text().await.unwrap_or_default();
+                let status_code = status.as_u16();
+
+                // Try fallback
+                if state.config.fallback.enabled
+                    && state.config.fallback.on_status_codes.contains(&status_code)
+                {
+                    let registry = state.registry.load();
+                    let current_name = provider.name.clone();
+                    let ctx = fallback::FallbackContext {
+                        client: &state.client,
+                        raw_body_bytes: &raw_request_body.as_bytes(),
+                        global_routes,
+                        request_id: &request_id,
+                        request_start,
+                        upstream_start,
+                        upstream_headers_ms,
+                        input_format: InputFormat::OpenAI,
+                    };
+                    if let Some(response) = try_fallback(
+                        ctx,
+                        &registry,
+                        &current_name,
+                        state.config.fallback.max_attempts,
+                        status_code,
+                    )
+                    .await
+                    {
+                        return response;
+                    }
+                }
+
+                state.inc_failed_requests();
+                let upstream_headers_ms = elapsed_ms(upstream_start);
+                let log_ctx = LogContext {
+                    request_id: &request_id,
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    provider: &log_provider_name,
+                    model: &log_model,
+                    requested_model: &requested_model,
+                    request_start,
+                    upstream_start,
+                    is_stream,
+                    raw_request_body: &raw_request_body,
+                };
+                emit_log_entry(
+                    &state.log_collector,
+                    &log_ctx,
+                    status_code,
+                    Some(upstream_headers_ms as u64),
+                    Some(truncate_for_log(&text, MAX_LOG_BODY_BYTES)),
+                    Some(&text),
+                );
+
+                return Ok((
+                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY),
+                    Json(json!({
+                        "error": {
+                            "message": text,
+                            "type": "upstream_error"
+                        }
+                    })),
+                )
+                    .into_response());
+            }
+
+            let upstream_headers_ms = elapsed_ms(upstream_start);
+
+            // Convert Anthropic response to OpenAI format
+            let response = if is_stream {
+                handle_stream_openai_output(
+                    upstream_resp,
+                    &log_model,
+                    request_id.clone(),
+                    request_start,
+                    upstream_start,
+                    upstream_headers_ms,
+                    Some(StreamLogContext {
+                        collector: state.log_collector.clone(),
+                        request_id: request_id.clone(),
+                        method: "POST",
+                        path: "/v1/chat/completions",
+                        provider: log_provider_name.clone(),
+                        model: log_model.clone(),
+                        requested_model: requested_model.clone(),
+                        request_start,
+                        upstream_start,
+                        raw_request_body: raw_request_body.clone(),
+                    }),
+                )
+                .await
+            } else {
+                handle_non_stream_openai_output(
+                    upstream_resp,
+                    &log_model,
+                    &request_id,
+                    request_start,
+                    upstream_start,
+                    upstream_headers_ms,
+                )
+                .await
+            };
+
+            if !is_stream {
+                let log_ctx = LogContext {
+                    request_id: &request_id,
+                    method: "POST",
+                    path: "/v1/chat/completions",
+                    provider: &log_provider_name,
+                    model: &log_model,
+                    requested_model: &requested_model,
+                    request_start,
+                    upstream_start,
+                    is_stream,
+                    raw_request_body: &raw_request_body,
+                };
+                emit_log_entry(
+                    &state.log_collector,
+                    &log_ctx,
+                    200,
+                    Some(upstream_headers_ms as u64),
+                    None,
+                    None,
+                );
+            }
+
+            response
         }
     }
 }

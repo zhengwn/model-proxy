@@ -7,14 +7,23 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
-use super::convert::{build_provider_request, prepare_body};
+use super::convert::{build_provider_request, prepare_body, prepare_chat_completions_body};
 use super::passthrough::{handle_non_stream_passthrough, handle_stream_passthrough};
-use super::response::handle_non_stream;
+use super::response::{handle_non_stream, handle_non_stream_openai_output};
 use super::state::NON_STREAM_REQUEST_TIMEOUT_SECS;
-use super::stream::handle_stream;
+use super::stream::{handle_stream, handle_stream_openai_output};
 use crate::config::{ModelRoute, ProviderConfig};
 use crate::error::Result;
 use crate::ProviderRegistry;
+
+/// The format of the original client request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InputFormat {
+    /// Request came from `/v1/messages` (Anthropic Messages API format)
+    Anthropic,
+    /// Request came from `/v1/chat/completions` (OpenAI Chat Completions format)
+    OpenAI,
+}
 
 /// Context needed to attempt a fallback request.
 pub(crate) struct FallbackContext<'a> {
@@ -25,6 +34,7 @@ pub(crate) struct FallbackContext<'a> {
     pub(crate) request_start: Instant,
     pub(crate) upstream_start: Instant,
     pub(crate) upstream_headers_ms: u128,
+    pub(crate) input_format: InputFormat,
 }
 
 /// Attempt fallback to other providers in the registry.
@@ -66,6 +76,7 @@ pub(crate) async fn try_fallback(
             ctx.request_start,
             ctx.upstream_start,
             ctx.upstream_headers_ms,
+            ctx.input_format,
         )
         .await;
 
@@ -88,17 +99,25 @@ async fn try_single_provider(
     request_start: Instant,
     upstream_start: Instant,
     upstream_headers_ms: u128,
+    input_format: InputFormat,
 ) -> Option<Result<Response>> {
     let fallback_body: Value = match serde_json::from_slice(raw_body_bytes) {
         Ok(v) => v,
         Err(_) => return None,
     };
 
-    let (fallback_body_json, fallback_is_stream, fallback_tool_name_map) =
-        match prepare_body(fallback_body, provider, global_routes) {
+    let (fallback_body_json, fallback_is_stream, fallback_tool_name_map) = match input_format {
+        InputFormat::Anthropic => match prepare_body(fallback_body, provider, global_routes) {
             Ok(v) => v,
             Err(_) => return None,
-        };
+        },
+        InputFormat::OpenAI => {
+            match prepare_chat_completions_body(fallback_body, provider, global_routes) {
+                Ok(v) => v,
+                Err(_) => return None,
+            }
+        }
+    };
 
     let fallback_model = fallback_body_json
         .get("model")
@@ -140,8 +159,9 @@ async fn try_single_provider(
         "Fallback 成功"
     );
 
-    let response = match provider.format {
-        crate::config::ProviderFormat::Openai => {
+    let response = match (input_format, &provider.format) {
+        // Anthropic input → OpenAI provider: convert response back to Anthropic
+        (InputFormat::Anthropic, crate::config::ProviderFormat::Openai) => {
             if fallback_is_stream {
                 handle_stream(
                     fallback_resp,
@@ -167,7 +187,8 @@ async fn try_single_provider(
                 .await
             }
         }
-        crate::config::ProviderFormat::Anthropic => {
+        // Anthropic input → Anthropic provider: passthrough
+        (InputFormat::Anthropic, crate::config::ProviderFormat::Anthropic) => {
             if fallback_is_stream {
                 handle_stream_passthrough(
                     fallback_resp,
@@ -181,6 +202,54 @@ async fn try_single_provider(
             } else {
                 handle_non_stream_passthrough(
                     fallback_resp,
+                    request_id,
+                    request_start,
+                    upstream_start,
+                    upstream_headers_ms,
+                )
+                .await
+            }
+        }
+        // OpenAI input → OpenAI provider: passthrough
+        (InputFormat::OpenAI, crate::config::ProviderFormat::Openai) => {
+            if fallback_is_stream {
+                handle_stream_passthrough(
+                    fallback_resp,
+                    request_id.to_string(),
+                    request_start,
+                    upstream_start,
+                    upstream_headers_ms,
+                    None,
+                )
+                .await
+            } else {
+                handle_non_stream_passthrough(
+                    fallback_resp,
+                    request_id,
+                    request_start,
+                    upstream_start,
+                    upstream_headers_ms,
+                )
+                .await
+            }
+        }
+        // OpenAI input → Anthropic provider: convert response to OpenAI
+        (InputFormat::OpenAI, crate::config::ProviderFormat::Anthropic) => {
+            if fallback_is_stream {
+                handle_stream_openai_output(
+                    fallback_resp,
+                    &fallback_model,
+                    request_id.to_string(),
+                    request_start,
+                    upstream_start,
+                    upstream_headers_ms,
+                    None,
+                )
+                .await
+            } else {
+                handle_non_stream_openai_output(
+                    fallback_resp,
+                    &fallback_model,
                     request_id,
                     request_start,
                     upstream_start,

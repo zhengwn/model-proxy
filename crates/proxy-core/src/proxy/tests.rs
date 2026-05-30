@@ -659,3 +659,525 @@ async fn non_stream_response_restores_original_tool_name() {
         Some("rust")
     );
 }
+
+// ---- openai_to_anthropic tests ----
+
+fn anthropic_provider_config() -> crate::config::ProviderConfig {
+    crate::config::ProviderConfig {
+        name: "anthropic-test".to_string(),
+        base_url: "http://127.0.0.1:9999".to_string(),
+        api_key: "test-key".to_string(),
+        model: "claude-sonnet-4-20250514".to_string(),
+        format: ProviderFormat::Anthropic,
+        quirks: Default::default(),
+        model_routes: Vec::new(),
+    }
+}
+
+#[test]
+fn openai_to_anthropic_basic_user_message() {
+    let body = json!({
+        "model": "gpt-4",
+        "messages": [
+            {"role": "user", "content": "Hello"}
+        ]
+    });
+    let provider = anthropic_provider_config();
+    let result = convert::openai_to_anthropic(body, &provider, &[]);
+
+    assert_eq!(result["messages"][0]["role"].as_str(), Some("user"));
+    assert_eq!(result["messages"][0]["content"].as_str(), Some("Hello"));
+    assert_eq!(result["model"].as_str(), Some("claude-sonnet-4-20250514"));
+}
+
+#[test]
+fn openai_to_anthropic_system_messages() {
+    let body = json!({
+        "model": "gpt-4",
+        "messages": [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "system", "content": "Be concise."},
+            {"role": "user", "content": "Hi"}
+        ]
+    });
+    let provider = anthropic_provider_config();
+    let result = convert::openai_to_anthropic(body, &provider, &[]);
+
+    // Multiple system messages become array in `system` field
+    let system = result.get("system").unwrap();
+    assert!(system.is_array());
+    assert_eq!(system.as_array().unwrap().len(), 2);
+    assert_eq!(system[0]["text"].as_str(), Some("You are helpful."));
+    assert_eq!(system[1]["text"].as_str(), Some("Be concise."));
+    // Only user message in messages array
+    assert_eq!(result["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(result["messages"][0]["role"].as_str(), Some("user"));
+}
+
+#[test]
+fn openai_to_anthropic_single_system_message_as_string() {
+    let body = json!({
+        "model": "gpt-4",
+        "messages": [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hi"}
+        ]
+    });
+    let provider = anthropic_provider_config();
+    let result = convert::openai_to_anthropic(body, &provider, &[]);
+
+    // Single system message becomes a string
+    assert_eq!(result["system"].as_str(), Some("You are helpful."));
+}
+
+#[test]
+fn openai_to_anthropic_assistant_tool_calls() {
+    let body = json!({
+        "model": "gpt-4",
+        "messages": [
+            {"role": "user", "content": "Search for Rust"},
+            {
+                "role": "assistant",
+                "content": "I'll search for that.",
+                "tool_calls": [{
+                    "id": "call_abc123",
+                    "type": "function",
+                    "function": {
+                        "name": "search",
+                        "arguments": "{\"query\": \"Rust\"}"
+                    }
+                }]
+            }
+        ]
+    });
+    let provider = anthropic_provider_config();
+    let result = convert::openai_to_anthropic(body, &provider, &[]);
+
+    let assistant_msg = &result["messages"][1];
+    assert_eq!(assistant_msg["role"].as_str(), Some("assistant"));
+    let content = assistant_msg["content"].as_array().unwrap();
+    // Should have text block + tool_use block
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[0]["type"].as_str(), Some("text"));
+    assert_eq!(content[0]["text"].as_str(), Some("I'll search for that."));
+    assert_eq!(content[1]["type"].as_str(), Some("tool_use"));
+    assert_eq!(content[1]["id"].as_str(), Some("toolu_abc123"));
+    assert_eq!(content[1]["name"].as_str(), Some("search"));
+    assert_eq!(content[1]["input"]["query"].as_str(), Some("Rust"));
+}
+
+#[test]
+fn openai_to_anthropic_tool_result_messages() {
+    let body = json!({
+        "model": "gpt-4",
+        "messages": [
+            {"role": "user", "content": "Search for Rust"},
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_abc123",
+                    "type": "function",
+                    "function": {"name": "search", "arguments": "{\"query\":\"Rust\"}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_abc123", "content": "Rust is a language."}
+        ]
+    });
+    let provider = anthropic_provider_config();
+    let result = convert::openai_to_anthropic(body, &provider, &[]);
+
+    let tool_msg = &result["messages"][2];
+    assert_eq!(tool_msg["role"].as_str(), Some("user"));
+    let content = tool_msg["content"].as_array().unwrap();
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0]["type"].as_str(), Some("tool_result"));
+    assert_eq!(content[0]["tool_use_id"].as_str(), Some("toolu_abc123"));
+    assert_eq!(content[0]["content"].as_str(), Some("Rust is a language."));
+}
+
+#[test]
+fn openai_to_anthropic_consecutive_tool_results_merged() {
+    let body = json!({
+        "model": "gpt-4",
+        "messages": [
+            {"role": "user", "content": "Do two things"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_a1", "type": "function", "function": {"name": "search", "arguments": "{}"}},
+                    {"id": "call_a2", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}
+                ]
+            },
+            {"role": "tool", "tool_call_id": "call_a1", "content": "result1"},
+            {"role": "tool", "tool_call_id": "call_a2", "content": "result2"}
+        ]
+    });
+    let provider = anthropic_provider_config();
+    let result = convert::openai_to_anthropic(body, &provider, &[]);
+
+    // Consecutive tool messages should be merged into one user message
+    let tool_msg = &result["messages"][2];
+    assert_eq!(tool_msg["role"].as_str(), Some("user"));
+    let content = tool_msg["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[0]["tool_use_id"].as_str(), Some("toolu_a1"));
+    assert_eq!(content[0]["content"].as_str(), Some("result1"));
+    assert_eq!(content[1]["tool_use_id"].as_str(), Some("toolu_a2"));
+    assert_eq!(content[1]["content"].as_str(), Some("result2"));
+}
+
+#[test]
+fn openai_to_anthropic_tool_definitions() {
+    let body = json!({
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "Search the web",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"}
+                    }
+                }
+            }
+        }]
+    });
+    let provider = anthropic_provider_config();
+    let result = convert::openai_to_anthropic(body, &provider, &[]);
+
+    let tools = result["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["type"].as_str(), Some("tool"));
+    assert_eq!(tools[0]["name"].as_str(), Some("search"));
+    assert_eq!(tools[0]["description"].as_str(), Some("Search the web"));
+    assert_eq!(
+        tools[0]["input_schema"]["properties"]["query"]["type"].as_str(),
+        Some("string")
+    );
+}
+
+#[test]
+fn openai_to_anthropic_max_tokens() {
+    let body = json!({
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "max_tokens": 1000,
+        "max_completion_tokens": 2000
+    });
+    let provider = anthropic_provider_config();
+    let result = convert::openai_to_anthropic(body, &provider, &[]);
+
+    // max_completion_tokens takes priority over max_tokens
+    assert_eq!(result["max_tokens"].as_u64(), Some(2000));
+}
+
+#[test]
+fn openai_to_anthropic_stop_and_parameters() {
+    let body = json!({
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stop": ["END", "STOP"],
+        "temperature": 0.7,
+        "top_p": 0.9
+    });
+    let provider = anthropic_provider_config();
+    let result = convert::openai_to_anthropic(body, &provider, &[]);
+
+    assert_eq!(result["stop_sequences"][0].as_str(), Some("END"));
+    assert_eq!(result["stop_sequences"][1].as_str(), Some("STOP"));
+    assert_eq!(result["temperature"].as_f64(), Some(0.7));
+    assert_eq!(result["top_p"].as_f64(), Some(0.9));
+}
+
+#[test]
+fn openai_to_anthropic_tool_choice_required() {
+    let body = json!({
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "tool_choice": "required"
+    });
+    let provider = anthropic_provider_config();
+    let result = convert::openai_to_anthropic(body, &provider, &[]);
+
+    assert_eq!(result["tool_choice"]["type"].as_str(), Some("any"));
+}
+
+#[test]
+fn openai_to_anthropic_tool_choice_named() {
+    let body = json!({
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "tool_choice": {
+            "type": "function",
+            "function": {"name": "search"}
+        }
+    });
+    let provider = anthropic_provider_config();
+    let result = convert::openai_to_anthropic(body, &provider, &[]);
+
+    assert_eq!(result["tool_choice"]["type"].as_str(), Some("tool"));
+    assert_eq!(result["tool_choice"]["name"].as_str(), Some("search"));
+}
+
+#[test]
+fn openai_to_anthropic_response_format_json_schema() {
+    let body = json!({
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "result",
+                "schema": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}}
+                }
+            }
+        }
+    });
+    let provider = anthropic_provider_config();
+    let result = convert::openai_to_anthropic(body, &provider, &[]);
+
+    assert_eq!(
+        result["output_config"]["format"]["type"].as_str(),
+        Some("json_schema")
+    );
+    assert_eq!(
+        result["output_config"]["format"]["name"].as_str(),
+        Some("result")
+    );
+}
+
+#[test]
+fn openai_to_anthropic_model_routing() {
+    let body = json!({
+        "model": "claude-sonnet-4-7",
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+    let mut provider = anthropic_provider_config();
+    provider.model = "default-model".to_string();
+    let routes = vec![ModelRoute {
+        pattern: "sonnet".to_string(),
+        target: "routed-model".to_string(),
+        reasoning_effort: None,
+    }];
+    let result = convert::openai_to_anthropic(body, &provider, &routes);
+
+    assert_eq!(result["model"].as_str(), Some("routed-model"));
+}
+
+// ---- convert_anthropic_to_openai_response tests ----
+
+#[test]
+fn anthropic_to_openai_response_basic_text() {
+    let body = json!({
+        "id": "msg_abc123",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": "Hello world"}],
+        "model": "claude-sonnet-4-20250514",
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 5}
+    });
+    let result = response::convert_anthropic_to_openai_response(body, "test-model");
+
+    assert!(result["id"].as_str().unwrap().starts_with("chatcmpl-"));
+    assert_eq!(result["object"].as_str(), Some("chat.completion"));
+    assert_eq!(result["model"].as_str(), Some("test-model"));
+    let choice = &result["choices"][0];
+    assert_eq!(choice["message"]["content"].as_str(), Some("Hello world"));
+    assert_eq!(choice["finish_reason"].as_str(), Some("stop"));
+    assert_eq!(result["usage"]["prompt_tokens"].as_u64(), Some(10));
+    assert_eq!(result["usage"]["completion_tokens"].as_u64(), Some(5));
+    assert_eq!(result["usage"]["total_tokens"].as_u64(), Some(15));
+}
+
+#[test]
+fn anthropic_to_openai_response_tool_use() {
+    let body = json!({
+        "id": "msg_abc",
+        "type": "message",
+        "role": "assistant",
+        "content": [{
+            "type": "tool_use",
+            "id": "toolu_abc123",
+            "name": "search",
+            "input": {"query": "Rust"}
+        }],
+        "model": "test",
+        "stop_reason": "tool_use",
+        "usage": {"input_tokens": 10, "output_tokens": 5}
+    });
+    let result = response::convert_anthropic_to_openai_response(body, "test-model");
+
+    let choice = &result["choices"][0];
+    assert_eq!(choice["finish_reason"].as_str(), Some("tool_calls"));
+    assert!(choice["message"]["content"].is_null());
+    let tool_calls = choice["message"]["tool_calls"].as_array().unwrap();
+    assert_eq!(tool_calls.len(), 1);
+    assert_eq!(tool_calls[0]["id"].as_str(), Some("call_abc123"));
+    assert_eq!(tool_calls[0]["function"]["name"].as_str(), Some("search"));
+    let args: serde_json::Value =
+        serde_json::from_str(tool_calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(args["query"].as_str(), Some("Rust"));
+}
+
+#[test]
+fn anthropic_to_openai_response_thinking() {
+    let body = json!({
+        "id": "msg_abc",
+        "type": "message",
+        "role": "assistant",
+        "content": [
+            {"type": "thinking", "thinking": "Let me think...", "signature": ""},
+            {"type": "text", "text": "The answer is 42."}
+        ],
+        "model": "test",
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 20}
+    });
+    let result = response::convert_anthropic_to_openai_response(body, "test-model");
+
+    let message = &result["choices"][0]["message"];
+    assert_eq!(
+        message["reasoning_content"].as_str(),
+        Some("Let me think...")
+    );
+    assert_eq!(message["content"].as_str(), Some("The answer is 42."));
+}
+
+#[test]
+fn anthropic_to_openai_response_stop_reasons() {
+    let test_cases = vec![
+        ("end_turn", "stop"),
+        ("max_tokens", "length"),
+        ("tool_use", "tool_calls"),
+        ("unknown_reason", "stop"),
+    ];
+
+    for (anthropic_sr, expected_openai_fr) in test_cases {
+        let body = json!({
+            "id": "msg_test",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}],
+            "model": "test",
+            "stop_reason": anthropic_sr,
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        });
+        let result = response::convert_anthropic_to_openai_response(body, "test");
+        assert_eq!(
+            result["choices"][0]["finish_reason"].as_str(),
+            Some(expected_openai_fr),
+            "stop_reason '{}' should map to '{}'",
+            anthropic_sr,
+            expected_openai_fr
+        );
+    }
+}
+
+// ---- convert_anthropic_stream_chunk tests ----
+
+#[test]
+fn anthropic_stream_chunk_text_delta() {
+    let mut state = stream::OpenAiStreamOutputState::new();
+    state.started = true;
+    state.stream_id = "chatcmpl-test123".to_string();
+
+    let data = json!({
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "text_delta", "text": "Hello"}
+    });
+    let events = stream::convert_anthropic_stream_chunk("content_block_delta", &data, "test-model", &mut state);
+
+    assert_eq!(events.len(), 1);
+    assert!(events[0].contains("\"content\":\"Hello\""));
+    assert!(events[0].starts_with("data: "));
+}
+
+#[test]
+fn anthropic_stream_chunk_thinking_delta() {
+    let mut state = stream::OpenAiStreamOutputState::new();
+    state.started = true;
+    state.stream_id = "chatcmpl-test".to_string();
+
+    let data = json!({
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {"type": "thinking_delta", "thinking": "reasoning..." }
+    });
+    let events = stream::convert_anthropic_stream_chunk("content_block_delta", &data, "test-model", &mut state);
+
+    assert_eq!(events.len(), 1);
+    assert!(events[0].contains("\"reasoning_content\":\"reasoning...\""));
+}
+
+#[test]
+fn anthropic_stream_chunk_tool_use_start() {
+    let mut state = stream::OpenAiStreamOutputState::new();
+    state.started = true;
+    state.stream_id = "chatcmpl-test".to_string();
+
+    let data = json!({
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {
+            "type": "tool_use",
+            "id": "toolu_abc123",
+            "name": "search",
+            "input": {}
+        }
+    });
+    let events = stream::convert_anthropic_stream_chunk("content_block_start", &data, "test-model", &mut state);
+
+    assert_eq!(events.len(), 1);
+    assert!(events[0].contains("\"call_abc123\""));
+    assert!(events[0].contains("\"search\""));
+    assert_eq!(state.tool_call_counter, 1);
+}
+
+#[test]
+fn anthropic_stream_chunk_message_delta_stop() {
+    let mut state = stream::OpenAiStreamOutputState::new();
+    state.started = true;
+    state.stream_id = "chatcmpl-test".to_string();
+
+    let data = json!({
+        "type": "message_delta",
+        "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+        "usage": {"output_tokens": 42}
+    });
+    let events = stream::convert_anthropic_stream_chunk("message_delta", &data, "test-model", &mut state);
+
+    assert_eq!(events.len(), 1);
+    assert!(events[0].contains("\"finish_reason\":\"stop\""));
+    assert!(events[0].contains("\"completion_tokens\":42"));
+    assert!(state.ended);
+}
+
+#[test]
+fn anthropic_stream_chunk_message_start() {
+    let mut state = stream::OpenAiStreamOutputState::new();
+
+    let data = json!({
+        "type": "message_start",
+        "message": {
+            "id": "msg_abc",
+            "type": "message",
+            "role": "assistant",
+            "model": "test",
+            "usage": {"input_tokens": 10, "output_tokens": 0}
+        }
+    });
+    let events = stream::convert_anthropic_stream_chunk("message_start", &data, "test-model", &mut state);
+
+    assert_eq!(events.len(), 1);
+    assert!(state.started);
+    assert_eq!(state.stream_id, "chatcmpl-msg_abc");
+    assert!(events[0].contains("\"role\":\"assistant\""));
+    assert_eq!(state.input_tokens, 10);
+}
