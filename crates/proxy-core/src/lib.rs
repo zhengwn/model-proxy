@@ -19,7 +19,7 @@ use tower_http::cors::CorsLayer;
 use tracing::info;
 
 use crate::config::Config;
-use crate::server::{event_logging_batch, proxy_chat_completions, proxy_count_tokens, proxy_messages, proxy_models};
+use crate::server::{event_logging_batch, proxy_chat_completions, proxy_count_tokens, proxy_flows, proxy_kiro_login_poll, proxy_kiro_login_start, proxy_kiro_social_exchange, proxy_kiro_social_start, proxy_messages, proxy_models, proxy_responses, proxy_status, proxy_usage};
 
 pub use tokio_util::sync::CancellationToken as ServerCancellationToken;
 
@@ -57,6 +57,7 @@ async fn health() -> Json<serde_json::Value> {
 pub fn start_server(config: Config, token: CancellationToken) -> JoinHandle<()> {
     let port = config.server.port;
     let state = AppState::new(config);
+    state.start_background_scheduler();
 
     start_server_with_state(state, port, token)
 }
@@ -71,6 +72,7 @@ pub fn start_server_shared(
     if let Some(c) = counters {
         state.set_counters(c);
     }
+    state.start_background_scheduler();
     start_server_with_state(state, port, token)
 }
 
@@ -81,6 +83,14 @@ fn start_server_with_state(state: AppState, port: u16, token: CancellationToken)
         .route("/v1/messages/count_tokens", post(proxy_count_tokens))
         .route("/v1/chat/completions", post(proxy_chat_completions))
         .route("/v1/models", get(proxy_models))
+        .route("/v1/responses", post(proxy_responses))
+        .route("/api/status", get(proxy_status))
+        .route("/api/usage", get(proxy_usage))
+        .route("/api/flows", get(proxy_flows))
+        .route("/api/kiro/login/start", post(proxy_kiro_login_start))
+        .route("/api/kiro/login/poll", post(proxy_kiro_login_poll))
+        .route("/api/kiro/social/start", post(proxy_kiro_social_start))
+        .route("/api/kiro/social/exchange", post(proxy_kiro_social_exchange))
         .route("/api/event_logging/batch", post(event_logging_batch))
         .layer(CorsLayer::permissive())
         .with_state(state);

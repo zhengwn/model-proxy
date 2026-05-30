@@ -939,6 +939,21 @@ pub async fn event_logging_batch(body: String) -> Json<Value> {
     Json(json!({"status": "ok"}))
 }
 
+/// Build a reqwest client with optional proxy support.
+fn build_kiro_client(proxy_url: Option<&str>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .tcp_nodelay(true);
+
+    if let Some(proxy_str) = proxy_url {
+        if let Ok(proxy) = reqwest::Proxy::all(proxy_str) {
+            builder = builder.proxy(proxy);
+        }
+    }
+
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// Build headers for Kiro API requests.
 fn build_kiro_headers(token: &str, amz_user_agent: &str, user_agent: &str) -> Vec<(String, String)> {
     vec![
@@ -1153,8 +1168,23 @@ async fn handle_kiro_messages(
         None
     };
 
+    // Rate limiter check
+    if let Some(ref rl) = state.rate_limiter {
+        let mut limiter = rl.lock().await;
+        if let Err(wait) = limiter.check("kiro") {
+            warn!(wait_ms = wait.as_millis(), "Kiro 请求被限流，等待");
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    // Build proxy-aware client if account manager has proxy config
+    let proxy_url = state.kiro_account_manager.as_ref().and_then(|m| {
+        m.try_lock().ok().and_then(|mgr| mgr.current_proxy_url().map(|s| s.to_string()))
+    });
+    let kiro_client = build_kiro_client(proxy_url.as_deref());
+
     let upstream_resp = kiro_request_with_retry(
-        &state.client,
+        &kiro_client,
         &url,
         &payload_bytes,
         &request_headers,
@@ -1465,9 +1495,24 @@ async fn handle_kiro_chat_completions(
         None
     };
 
+    // Rate limiter check
+    if let Some(ref rl) = state.rate_limiter {
+        let mut limiter = rl.lock().await;
+        if let Err(wait) = limiter.check("kiro") {
+            warn!(wait_ms = wait.as_millis(), "Kiro 请求被限流，等待");
+            tokio::time::sleep(wait).await;
+        }
+    }
+
     let upstream_start = Instant::now();
+    // Build proxy-aware client if account manager has proxy config
+    let proxy_url = state.kiro_account_manager.as_ref().and_then(|m| {
+        m.try_lock().ok().and_then(|mgr| mgr.current_proxy_url().map(|s| s.to_string()))
+    });
+    let kiro_client = build_kiro_client(proxy_url.as_deref());
+
     let upstream_resp = kiro_request_with_retry(
-        &state.client,
+        &kiro_client,
         &url,
         &payload_bytes,
         &request_headers,
@@ -1893,5 +1938,355 @@ pub async fn proxy_count_tokens(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(response.to_string()))
+        .map_err(|e| AppError::Request(format!("构建响应失败: {}", e)))?)
+}
+
+/// Handle `POST /v1/responses` — OpenAI Responses API (used by Codex CLI).
+/// Converts Responses API format to Kiro format via Anthropic intermediate.
+pub async fn proxy_responses(
+    State(state): State<super::state::AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Response> {
+    use crate::convert::kiro::responses::responses_to_kiro;
+    use crate::convert::kiro::stream::handle_stream_anthropic_output as kiro_handle_stream;
+    use std::collections::HashMap;
+
+    check_auth(&headers, &state.config)?;
+
+    let provider = state.current_provider();
+    let model_routes = state.current_model_routes();
+    let global_routes = model_routes.as_slice();
+
+    if provider.format != crate::config::ProviderFormat::Kiro {
+        return Err(AppError::Request(
+            "/v1/responses 仅支持 Kiro provider".to_string(),
+        ));
+    }
+
+    let kiro_config = provider.kiro_config.as_ref().ok_or_else(|| {
+        AppError::Request("Kiro provider 缺少 kiro_config 配置".to_string())
+    })?;
+
+    let (kiro_payload, _tool_name_map) = responses_to_kiro(&body, &provider, global_routes)?;
+
+    let (token, amz_user_agent, user_agent_str) = if let Some(ref account_mgr) = state.kiro_account_manager {
+        let mut mgr = account_mgr.lock().await;
+        let (_id, auth_arc) = mgr.get_available_account(&[])
+            .ok_or_else(|| AppError::Request("所有 Kiro 账户不可用".to_string()))?;
+        let mut auth = auth_arc.lock().await;
+        let token = auth.get_valid_token().await?;
+        (token, auth.amz_user_agent(), auth.user_agent())
+    } else if let Some(ref auth_arc) = state.kiro_auth {
+        let mut auth = auth_arc.lock().await;
+        let token = auth.get_valid_token().await?;
+        (token, auth.amz_user_agent(), auth.user_agent())
+    } else {
+        let mut auth = KiroAuthManager::new(kiro_config, state.client.clone());
+        let token = auth.get_valid_token().await?;
+        (token, auth.amz_user_agent(), auth.user_agent())
+    };
+
+    let region = kiro_config.api_region.as_deref().unwrap_or(&kiro_config.region);
+    let url = format!("https://runtime.{}.kiro.dev/generateAssistantResponse", region);
+    let payload_bytes = serde_json::to_vec(&kiro_payload).map_err(|e| AppError::Json(e))?;
+    let request_headers = build_kiro_headers(&token, &amz_user_agent, &user_agent_str);
+
+    let _permit = if let Some(ref sem) = state.concurrency_semaphore {
+        match sem.try_acquire() {
+            Ok(permit) => Some(permit),
+            Err(_) => return Err(AppError::TooManyRequests),
+        }
+    } else {
+        None
+    };
+
+    let is_stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let timeout = if !is_stream {
+        Some(Duration::from_secs(NON_STREAM_REQUEST_TIMEOUT_SECS))
+    } else {
+        None
+    };
+
+    let proxy_url = state.kiro_account_manager.as_ref().and_then(|m| {
+        m.try_lock().ok().and_then(|mgr| mgr.current_proxy_url().map(|s| s.to_string()))
+    });
+    let kiro_client = build_kiro_client(proxy_url.as_deref());
+
+    let upstream_resp = kiro_request_with_retry(
+        &kiro_client,
+        &url,
+        &payload_bytes,
+        &request_headers,
+        state.kiro_auth.as_ref(),
+        "responses",
+        timeout,
+    )
+    .await?;
+
+    if !upstream_resp.status().is_success() {
+        let status = upstream_resp.status();
+        let text = upstream_resp.text().await.unwrap_or_default();
+        return Ok((
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            Json(json!({"error": {"message": text, "type": "upstream_error"}})),
+        ).into_response());
+    }
+
+    let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("kiro");
+
+    if is_stream {
+        kiro_handle_stream(
+            upstream_resp,
+            model,
+            HashMap::new(),
+            "responses".to_string(),
+            Instant::now(),
+            Instant::now(),
+            0,
+            None,
+            kiro_config.thinking_mode.as_deref(),
+        )
+        .await
+    } else {
+        let tool_map = HashMap::new();
+        handle_kiro_non_stream(
+            upstream_resp,
+            model,
+            &tool_map,
+            "responses",
+            Instant::now(),
+            Instant::now(),
+            0,
+        )
+        .await
+    }
+}
+
+/// Handle `GET /api/usage` — query Kiro usage/balance information.
+pub async fn proxy_usage(
+    State(state): State<super::state::AppState>,
+) -> Result<Response> {
+    let provider = state.current_provider();
+    if provider.format != crate::config::ProviderFormat::Kiro {
+        return Err(AppError::Request("Usage 查询仅支持 Kiro provider".to_string()));
+    }
+
+    let kiro_config = provider.kiro_config.as_ref().ok_or_else(|| {
+        AppError::Request("Kiro provider 缺少 kiro_config 配置".to_string())
+    })?;
+
+    // Get auth token
+    let token = if let Some(ref auth_arc) = state.kiro_auth {
+        let mut auth = auth_arc.lock().await;
+        auth.get_valid_token().await.unwrap_or_default()
+    } else {
+        return Err(AppError::Request("Kiro auth 未初始化".to_string()));
+    };
+
+    let region = kiro_config.api_region.as_deref().unwrap_or(&kiro_config.region);
+    let url = format!("https://q.{}.amazonaws.com/getUsageLimits", region);
+
+    let resp = state.client
+        .post(&url)
+        .header("Content-Type", "application/x-amz-json-1.0")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("x-amz-target", "AmazonCodeWhispererStreamingService.GetUsageLimits")
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            let body = r.text().await.unwrap_or_default();
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .map_err(|e| AppError::Request(format!("构建响应失败: {}", e)))?)
+        }
+        Ok(r) => {
+            let status = r.status().as_u16();
+            let body = r.text().await.unwrap_or_default();
+            Ok((
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                Json(json!({"error": {"message": body, "type": "upstream_error"}})),
+            ).into_response())
+        }
+        Err(e) => Err(AppError::Http(e)),
+    }
+}
+
+/// Handle `GET /api/flows` — query flow monitor data.
+pub async fn proxy_flows(
+    State(state): State<super::state::AppState>,
+) -> Result<Response> {
+    if let Some(ref monitor) = state.flow_monitor {
+        let monitor = monitor.lock().await;
+        let stats = monitor.get_stats();
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&stats).unwrap_or_default()))
+            .map_err(|e| AppError::Request(format!("构建响应失败: {}", e)))?)
+    } else {
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"error":"flow monitor not enabled"}"#.to_string()))
+            .map_err(|e| AppError::Request(format!("构建响应失败: {}", e)))?)
+    }
+}
+
+/// Handle `GET /api/status` — service status.
+pub async fn proxy_status(
+    State(state): State<super::state::AppState>,
+) -> Result<Response> {
+    let provider = state.current_provider();
+    let kiro_auth_ok = state.kiro_auth.is_some();
+
+    let status = json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "provider": provider.name,
+        "format": format!("{:?}", provider.format),
+        "kiro_auth": kiro_auth_ok,
+        "account_manager": state.kiro_account_manager.is_some(),
+        "flow_monitor": state.flow_monitor.is_some(),
+    });
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(status.to_string()))
+        .map_err(|e| AppError::Request(format!("构建响应失败: {}", e)))?)
+}
+
+/// Handle `POST /api/kiro/login/start` — start OIDC Device Authorization Flow.
+pub async fn proxy_kiro_login_start(
+    State(state): State<super::state::AppState>,
+) -> Result<Response> {
+    use crate::convert::kiro::auth_flow::start_device_flow;
+
+    let provider = state.current_provider();
+    let kiro_config = provider.kiro_config.as_ref().ok_or_else(|| {
+        AppError::Request("Kiro provider 缺少 kiro_config 配置".to_string())
+    })?;
+
+    let region = &kiro_config.region;
+    let result = start_device_flow(&state.client, region).await?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_string(&json!({
+            "user_code": result.user_code,
+            "verification_uri": result.verification_uri,
+            "verification_uri_complete": result.verification_uri_complete,
+            "expires_in": result.expires_in,
+            "interval": result.interval.unwrap_or(5),
+        })).unwrap_or_default()))
+        .map_err(|e| AppError::Request(format!("构建响应失败: {}", e)))?)
+}
+
+/// Handle `POST /api/kiro/login/poll` — poll OIDC device flow for token.
+pub async fn proxy_kiro_login_poll(
+    State(state): State<super::state::AppState>,
+    Json(body): Json<Value>,
+) -> Result<Response> {
+    use crate::convert::kiro::auth_flow::poll_device_token;
+
+    let provider = state.current_provider();
+    let kiro_config = provider.kiro_config.as_ref().ok_or_else(|| {
+        AppError::Request("Kiro provider 缺少 kiro_config 配置".to_string())
+    })?;
+
+    let client_id = body.get("client_id").and_then(|v| v.as_str()).ok_or_else(|| {
+        AppError::Request("缺少 client_id".to_string())
+    })?;
+    let device_code = body.get("device_code").and_then(|v| v.as_str()).ok_or_else(|| {
+        AppError::Request("缺少 device_code".to_string())
+    })?;
+
+    let status = poll_device_token(&state.client, &kiro_config.region, client_id, device_code).await;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_string(&status).unwrap_or_default()))
+        .map_err(|e| AppError::Request(format!("构建响应失败: {}", e)))?)
+}
+
+/// Handle `POST /api/kiro/social/start` — start Social OAuth flow.
+pub async fn proxy_kiro_social_start(
+    Json(body): Json<Value>,
+) -> Result<Response> {
+    use crate::convert::kiro::auth_flow::{start_social_auth, OAuthProvider};
+
+    let provider_str = body.get("provider").and_then(|v| v.as_str()).unwrap_or("google");
+    let redirect_uri = body.get("redirect_uri").and_then(|v| v.as_str())
+        .unwrap_or("http://localhost:19823/callback");
+    let state_param = body.get("state").and_then(|v| v.as_str()).unwrap_or("kiro_login");
+
+    let oauth_provider = match provider_str {
+        "google" => OAuthProvider::Google,
+        "github" => OAuthProvider::GitHub,
+        _ => return Err(AppError::Request(format!("不支持的 OAuth provider: {}", provider_str))),
+    };
+
+    match start_social_auth(oauth_provider, redirect_uri, state_param) {
+        Ok(url) => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"auth_url": url}).to_string()))
+            .map_err(|e| AppError::Request(format!("构建响应失败: {}", e)))?),
+        Err(e) => Err(e),
+    }
+}
+
+/// Handle `POST /api/kiro/social/exchange` — exchange OAuth code for Kiro token.
+pub async fn proxy_kiro_social_exchange(
+    State(state): State<super::state::AppState>,
+    Json(body): Json<Value>,
+) -> Result<Response> {
+    use crate::convert::kiro::auth_flow::{exchange_social_code, exchange_for_kiro_token, OAuthProvider};
+
+    let provider_str = body.get("provider").and_then(|v| v.as_str()).unwrap_or("google");
+    let code = body.get("code").and_then(|v| v.as_str()).ok_or_else(|| {
+        AppError::Request("缺少 code".to_string())
+    })?;
+
+    let oauth_provider = match provider_str {
+        "google" => OAuthProvider::Google,
+        "github" => OAuthProvider::GitHub,
+        _ => return Err(AppError::Request(format!("不支持的 OAuth provider: {}", provider_str))),
+    };
+
+    let redirect_uri = body.get("redirect_uri").and_then(|v| v.as_str())
+        .unwrap_or("http://localhost:19823/callback");
+
+    // Exchange OAuth code for social token
+    let social_token = exchange_social_code(&state.client, oauth_provider, code, redirect_uri).await?;
+    let social_access = social_token.access_token.ok_or_else(|| {
+        AppError::Request("OAuth token 交换失败: 无 access_token".to_string())
+    })?;
+
+    // Exchange social token for Kiro token
+    let provider = state.current_provider();
+    let kiro_config = provider.kiro_config.as_ref().ok_or_else(|| {
+        AppError::Request("Kiro provider 缺少 kiro_config 配置".to_string())
+    })?;
+
+    let (access_token, refresh_token, expires_in) =
+        exchange_for_kiro_token(&state.client, &social_access, oauth_provider, &kiro_config.region).await?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(json!({
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "expires_in": expires_in,
+        }).to_string()))
         .map_err(|e| AppError::Request(format!("构建响应失败: {}", e)))?)
 }

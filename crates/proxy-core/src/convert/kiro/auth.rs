@@ -53,15 +53,8 @@ impl KiroCredential {
     pub fn from_config(config: &KiroConfig) -> Self {
         let region = config.region.clone();
         let api_region = config.api_region.clone().unwrap_or_else(|| region.clone());
-        // Generate a stable machine ID from refresh token using a proper hash
-        let machine_id = {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut hasher = DefaultHasher::new();
-            config.refresh_token.as_deref().unwrap_or("default").hash(&mut hasher);
-            config.region.hash(&mut hasher);
-            format!("{:016x}", hasher.finish())
-        };
+        // Generate a stable machine ID using system fingerprint + token
+        let machine_id = generate_machine_id(config.refresh_token.as_deref(), &region);
         Self {
             auth_method: AuthMethod::from_str(&config.auth_method),
             access_token: None,
@@ -174,6 +167,212 @@ fn load_persisted_token(region: &str) -> Option<TokenRecord> {
         }
     }
     Some(record)
+}
+
+// ---- Machine ID & System Fingerprint ----
+
+/// Generate a per-credential machine ID using system fingerprint + token.
+/// Priority: token hash + region > system hardware ID > random fallback.
+fn generate_machine_id(refresh_token: Option<&str>, region: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+
+    // Primary: refresh token + region
+    if let Some(token) = refresh_token {
+        token.hash(&mut hasher);
+        region.hash(&mut hasher);
+    } else {
+        // Fallback: system hardware ID
+        let hw_id = get_system_fingerprint();
+        hw_id.hash(&mut hasher);
+    }
+
+    format!("{:016x}", hasher.finish())
+}
+
+/// Get a system-level hardware fingerprint for machine identification.
+/// macOS: IOPlatformUUID, Linux: /etc/machine-id, Windows: wmic csproduct UUID
+fn get_system_fingerprint() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        // Try IOPlatformUUID
+        if let Ok(output) = std::process::Command::new("ioreg")
+            .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(line) = stdout.lines().find(|l| l.contains("IOPlatformUUID")) {
+                if let Some(uuid) = line.split('"').nth(3) {
+                    return uuid.to_string();
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(id) = std::fs::read_to_string("/etc/machine-id") {
+            return id.trim().to_string();
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(output) = std::process::Command::new("wmic")
+            .args(["csproduct", "get", "UUID"])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(uuid) = stdout.lines().nth(1) {
+                return uuid.trim().to_string();
+            }
+        }
+    }
+
+    // Fallback: username
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// Try to auto-discover Profile ARN from Kiro IDE log files.
+/// Scans ~/Library/Application Support/Kiro/logs/ (macOS) or equivalent.
+pub fn discover_profile_arn() -> Option<String> {
+    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok()?;
+
+    // macOS Kiro log path
+    #[cfg(target_os = "macos")]
+    let log_dir = format!("{}/Library/Application Support/Kiro/logs", home);
+    #[cfg(target_os = "linux")]
+    let log_dir = format!("{}/.config/kiro/logs", home);
+    #[cfg(target_os = "windows")]
+    let log_dir = format!("{}\\AppData\\Roaming\\Kiro\\logs", home);
+
+    let entries = std::fs::read_dir(&log_dir).ok()?;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map(|e| e == "log").unwrap_or(false) {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                // Look for profileArn in log content
+                for line in content.lines() {
+                    if line.contains("profileArn") || line.contains("profile_arn") {
+                        // Extract ARN pattern
+                        if let Some(start) = line.find("arn:aws:") {
+                            let arn: String = line[start..]
+                                .chars()
+                                .take_while(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
+                                .collect();
+                            if arn.starts_with("arn:aws:codewhisperer:") {
+                                return Some(arn);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Try to load credentials from kiro-cli's SQLite database.
+/// Returns (refresh_token, region) if found.
+pub fn load_from_sqlite() -> Option<(String, String)> {
+    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok()?;
+
+    // Platform-specific SQLite path
+    #[cfg(target_os = "macos")]
+    let db_path = format!("{}/.local/share/kiro-cli/data.sqlite3", home);
+    #[cfg(target_os = "linux")]
+    let db_path = format!("{}/.local/share/kiro-cli/data.sqlite3", home);
+    #[cfg(target_os = "windows")]
+    let db_path = format!("{}\\AppData\\Local\\kiro-cli\\data.sqlite3", home);
+
+    // Try to read the SQLite file
+    let data = std::fs::read(&db_path).ok()?;
+
+    // Simple SQLite table scan for auth_kv entries
+    // SQLite format: look for 'refreshToken' in the raw data
+    let data_str = String::from_utf8_lossy(&data);
+
+    // Look for social token key
+    for key_prefix in &["kirocli:social:token", "kirocli:odic:token", "codewhisperer:odic:token"] {
+        if let Some(pos) = data_str.find(key_prefix) {
+            // Try to find a JSON object nearby containing refreshToken
+            let nearby = &data_str[pos..std::cmp::min(pos + 2000, data_str.len())];
+            if let Some(rt_start) = nearby.find("refreshToken") {
+                let json_area = &nearby[rt_start..];
+                // Simple extraction: find "refreshToken":"value"
+                if let Some(q1) = json_area.find('"') {
+                    let after_key = &json_area[q1 + 1..]; // skip first quote of key
+                    if let Some(q2) = after_key.find('"') {
+                        let after_colon = &after_key[q2 + 1..]; // skip closing quote of key
+                        if let Some(q3) = after_colon.find('"') {
+                            let value_start = q3 + 1;
+                            if let Some(q4) = after_colon[value_start..].find('"') {
+                                let token = &after_colon[value_start..value_start + q4];
+                                if !token.is_empty() {
+                                    tracing::info!(
+                                        key = key_prefix,
+                                        "从 kiro-cli SQLite 数据库加载 token"
+                                    );
+                                    return Some((token.to_string(), "us-east-1".to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Scan ~/.aws/sso/cache/ for Kiro credential JSON files.
+pub fn scan_sso_cache() -> Vec<(String, String)> {
+    let home = match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        Ok(h) => h,
+        Err(_) => return vec![],
+    };
+
+    let cache_dir = format!("{}/.aws/sso/cache", home);
+    let entries = match std::fs::read_dir(&cache_dir) {
+        Ok(e) => e,
+        Err(_) => return vec![],
+    };
+
+    let mut results = Vec::new();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map(|e| e == "json").unwrap_or(false) {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                // Look for refreshToken field
+                if content.contains("refreshToken") {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                        if let Some(token) = json.get("refreshToken").and_then(|v| v.as_str()) {
+                            let region = json.get("region")
+                                .or_else(|| json.get("ssoRegion"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("us-east-1")
+                                .to_string();
+                            results.push((token.to_string(), region));
+                            tracing::info!(
+                                path = %path.display(),
+                                "从 SSO 缓存发现 Kiro 凭证"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    results
 }
 
 // ---- Auth manager ----
@@ -462,6 +661,11 @@ impl KiroAuthManager {
             .iter()
             .find(|c| !c.disabled)
             .and_then(|c| c.profile_arn.as_deref())
+    }
+
+    /// Iterate over all credentials.
+    pub fn credentials_iter(&self) -> impl Iterator<Item = &KiroCredential> {
+        self.credentials.iter()
     }
 }
 

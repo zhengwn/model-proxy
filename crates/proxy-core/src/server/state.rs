@@ -108,6 +108,10 @@ pub struct AppState {
     pub kiro_auth: Option<Arc<tokio::sync::Mutex<crate::convert::kiro::auth::KiroAuthManager>>>,
     /// Multi-account manager for Kiro failover (when multiple Kiro configs exist).
     pub kiro_account_manager: Option<Arc<tokio::sync::Mutex<crate::convert::kiro::account::AccountManager>>>,
+    /// Flow monitor for request/response tracking.
+    pub flow_monitor: Option<Arc<tokio::sync::Mutex<crate::convert::kiro::flow_monitor::FlowMonitor>>>,
+    /// Rate limiter for Kiro API requests.
+    pub rate_limiter: Option<Arc<tokio::sync::Mutex<crate::convert::kiro::rate_limiter::RateLimiter>>>,
     /// Cached /v1/models response (Instant = last update time, Value = JSON response).
     pub model_cache: Option<Arc<tokio::sync::Mutex<(Instant, serde_json::Value)>>>,
 }
@@ -167,6 +171,12 @@ impl AppState {
             concurrency_semaphore,
             kiro_auth,
             kiro_account_manager: None,
+            flow_monitor: Some(Arc::new(tokio::sync::Mutex::new(
+                crate::convert::kiro::flow_monitor::FlowMonitor::new(1000),
+            ))),
+            rate_limiter: Some(Arc::new(tokio::sync::Mutex::new(
+                crate::convert::kiro::rate_limiter::RateLimiter::new(0, 0, 0),
+            ))),
             model_cache: None,
         }
     }
@@ -216,6 +226,12 @@ impl AppState {
             concurrency_semaphore,
             kiro_auth,
             kiro_account_manager: None,
+            flow_monitor: Some(Arc::new(tokio::sync::Mutex::new(
+                crate::convert::kiro::flow_monitor::FlowMonitor::new(1000),
+            ))),
+            rate_limiter: Some(Arc::new(tokio::sync::Mutex::new(
+                crate::convert::kiro::rate_limiter::RateLimiter::new(0, 0, 0),
+            ))),
             model_cache: None,
         }
     }
@@ -259,5 +275,34 @@ impl AppState {
 
         self.active_provider.store(Arc::new(provider.clone()));
         Ok(())
+    }
+
+    /// Start background scheduler for token pre-refresh and health checks.
+    /// Pre-refreshes tokens 15 minutes before expiry.
+    /// Runs health checks every 10 minutes.
+    pub fn start_background_scheduler(&self) {
+        if let Some(ref auth_arc) = self.kiro_auth {
+            let auth = auth_arc.clone();
+            let interval = Duration::from_secs(600); // 10 minutes
+            tokio::spawn(async move {
+                let mut timer = tokio::time::interval(interval);
+                loop {
+                    timer.tick().await;
+                    // Pre-refresh: check if token needs refresh
+                    let needs_refresh = {
+                        let auth_guard = auth.lock().await;
+                        let count = auth_guard.credentials_iter().filter(|c| c.is_expiring_soon()).count();
+                        count > 0
+                    };
+                    if needs_refresh {
+                        info!("后台调度器: 预刷新 Kiro token");
+                        let mut auth_guard = auth.lock().await;
+                        if let Err(e) = auth_guard.get_valid_token().await {
+                            tracing::warn!(error = %e, "后台 token 预刷新失败");
+                        }
+                    }
+                }
+            });
+        }
     }
 }

@@ -110,11 +110,19 @@ pub fn anthropic_to_kiro(
         }
     }
 
+    // 6b. Convert Anthropic cache_control to Kiro cachePoint
+    let mut body_for_cache = body.clone();
+    super::prompt_cache::convert_cache_control(&mut body_for_cache);
+
     // 7. Process messages
-    let messages = body.get("messages").and_then(|v| v.as_array());
+    let messages = body_for_cache.get("messages").or_else(|| body.get("messages")).and_then(|v| v.as_array());
     let has_tools = kiro_tools.as_array().map(|a| !a.is_empty()).unwrap_or(false);
-    let (history, current_content, current_images, current_tool_results) =
+    let (mut history, current_content, current_images, current_tool_results) =
         process_messages(messages, &full_system_text, thinking_ref, &kiro_model, has_tools);
+
+    // 7b. Apply History Manager (auto-truncate long histories)
+    let history_mgr = super::history::HistoryManager::new(super::history::HistoryConfig::default());
+    history_mgr.process_history(&mut history);
 
     // 8. Build currentMessage
     let mut user_input_message = json!({

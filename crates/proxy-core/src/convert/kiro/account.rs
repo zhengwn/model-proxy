@@ -125,6 +125,8 @@ struct ManagedAccount {
     id: String,
     auth: Arc<Mutex<KiroAuthManager>>,
     circuit: AccountCircuitBreaker,
+    /// Optional per-account proxy URL (HTTP/SOCKS5)
+    proxy_url: Option<String>,
 }
 
 /// Multi-account manager with circuit breaker failover.
@@ -146,6 +148,7 @@ impl AccountManager {
                     id: id.clone(),
                     auth: Arc::new(Mutex::new(auth)),
                     circuit: AccountCircuitBreaker::new(),
+                    proxy_url: config.proxy_url.clone(),
                 }
             })
             .collect();
@@ -250,6 +253,13 @@ impl AccountManager {
     /// Check if we only have a single account (skip circuit breaker).
     pub fn is_single_account(&self) -> bool {
         self.accounts.len() == 1
+    }
+
+    /// Get the proxy URL for the current account.
+    pub fn current_proxy_url(&self) -> Option<&str> {
+        self.accounts
+            .get(self.current_index)
+            .and_then(|a| a.proxy_url.as_deref())
     }
 
     /// Get the number of accounts.
