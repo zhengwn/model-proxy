@@ -98,31 +98,69 @@ fn emit_log_entry(
     collector.emit(entry);
 }
 
-fn check_auth(headers: &HeaderMap, config: &Config) -> Result<()> {
-    if let Some(expected_key) = &config.server.api_key {
-        let provided = headers
-            .get("x-api-key")
-            .or_else(|| headers.get("authorization"))
-            .and_then(|v| v.to_str().ok());
+/// Multi-tenant auth result.
+pub enum AuthResult {
+    /// Global API key matched, or no API key configured
+    GlobalOk,
+    /// Multi-tenant: extracted per-request refresh token
+    TenantOk { refresh_token: String },
+    /// Authentication failed
+    Unauthorized,
+}
 
-        let provided_clean = provided.map(|s| s.strip_prefix("Bearer ").unwrap_or(s).trim());
+/// Check authentication, supporting both global API key and multi-tenant
+/// `API_KEY:REFRESH_TOKEN` format.
+pub fn check_auth_tenant(headers: &HeaderMap, config: &Config) -> AuthResult {
+    let Some(expected_key) = &config.server.api_key else {
+        return AuthResult::GlobalOk;
+    };
 
-        let is_valid = match provided_clean {
-            Some(key) => {
-                // Use constant-time comparison to prevent timing attacks
-                let key_bytes = key.as_bytes();
-                let expected_bytes = expected_key.as_bytes();
-                key_bytes.len() == expected_bytes.len() && key_bytes.ct_eq(expected_bytes).into()
+    let provided = headers
+        .get("x-api-key")
+        .or_else(|| headers.get("authorization"))
+        .and_then(|v| v.to_str().ok());
+
+    let provided_clean = provided.map(|s| s.strip_prefix("Bearer ").unwrap_or(s).trim());
+
+    match provided_clean {
+        Some(key) => {
+            // Check for multi-tenant format: API_KEY:REFRESH_TOKEN
+            if let Some((api_key_part, refresh_token)) = key.split_once(':') {
+                if !refresh_token.is_empty() {
+                    let key_bytes = api_key_part.as_bytes();
+                    let expected_bytes = expected_key.as_bytes();
+                    if key_bytes.len() == expected_bytes.len()
+                        && key_bytes.ct_eq(expected_bytes).into()
+                    {
+                        return AuthResult::TenantOk {
+                            refresh_token: refresh_token.to_string(),
+                        };
+                    }
+                }
             }
-            None => false,
-        };
 
-        if !is_valid {
+            // Standard single-key check
+            let key_bytes = key.as_bytes();
+            let expected_bytes = expected_key.as_bytes();
+            if key_bytes.len() == expected_bytes.len() && key_bytes.ct_eq(expected_bytes).into() {
+                AuthResult::GlobalOk
+            } else {
+                warn!("API key 验证失败");
+                AuthResult::Unauthorized
+            }
+        }
+        None => {
             warn!("API key 验证失败");
-            return Err(AppError::Unauthorized);
+            AuthResult::Unauthorized
         }
     }
-    Ok(())
+}
+
+fn check_auth(headers: &HeaderMap, config: &Config) -> Result<()> {
+    match check_auth_tenant(headers, config) {
+        AuthResult::GlobalOk | AuthResult::TenantOk { .. } => Ok(()),
+        AuthResult::Unauthorized => Err(AppError::Unauthorized),
+    }
 }
 
 pub async fn proxy_messages(
@@ -182,6 +220,11 @@ pub async fn proxy_messages(
 
     // Kiro provider uses a completely different request/response flow
     if provider.format == crate::config::ProviderFormat::Kiro {
+        // Extract tenant refresh token if multi-tenant auth
+        let tenant_token = match check_auth_tenant(&headers, &state.config) {
+            AuthResult::TenantOk { refresh_token } => Some(refresh_token),
+            _ => None,
+        };
         return handle_kiro_messages(
             state,
             body_json,
@@ -191,6 +234,7 @@ pub async fn proxy_messages(
             request_id,
             request_guard,
             request_start,
+            tenant_token,
         )
         .await;
     }
@@ -540,12 +584,17 @@ pub async fn proxy_chat_completions(
 
     // Kiro provider: convert OpenAI → Kiro → Anthropic → OpenAI
     if provider.format == crate::config::ProviderFormat::Kiro {
+        let tenant_token = match check_auth_tenant(&headers, &state.config) {
+            AuthResult::TenantOk { refresh_token } => Some(refresh_token),
+            _ => None,
+        };
         return handle_kiro_chat_completions(
             state,
             body_json,
             requested_model,
             request_id.clone(),
             request_start,
+            tenant_token,
         )
         .await;
     }
@@ -1075,6 +1124,7 @@ async fn handle_kiro_messages(
     request_id: String,
     mut request_guard: RequestCompletionGuard,
     request_start: Instant,
+    tenant_refresh_token: Option<String>,
 ) -> Result<Response> {
     use crate::convert::kiro::request::anthropic_to_kiro;
     use crate::convert::kiro::stream::handle_stream_anthropic_output;
@@ -1112,21 +1162,29 @@ async fn handle_kiro_messages(
     })?;
 
     // Use multi-account manager if available, otherwise single auth manager
-    let (token, amz_user_agent, user_agent_str) = if let Some(ref account_mgr) = state.kiro_account_manager {
+    let (token, amz_user_agent, user_agent_str, is_account_managed) = if let Some(ref tenant_token) = tenant_refresh_token {
+        // Multi-tenant: create a temporary auth manager with the per-request refresh token
+        let mut tenant_cfg = kiro_config.clone();
+        tenant_cfg.auth_method = "social".to_string();
+        tenant_cfg.refresh_token = Some(tenant_token.clone());
+        let mut auth = KiroAuthManager::new(&tenant_cfg, state.client.clone());
+        let token = auth.get_valid_token().await?;
+        (token, auth.amz_user_agent(), auth.user_agent(), false)
+    } else if let Some(ref account_mgr) = state.kiro_account_manager {
         let mut mgr = account_mgr.lock().await;
         let (_id, auth_arc) = mgr.get_available_account(&[])
             .ok_or_else(|| AppError::Request("所有 Kiro 账户不可用".to_string()))?;
         let mut auth = auth_arc.lock().await;
         let token = auth.get_valid_token().await?;
-        (token, auth.amz_user_agent(), auth.user_agent())
+        (token, auth.amz_user_agent(), auth.user_agent(), true)
     } else if let Some(ref auth_arc) = state.kiro_auth {
         let mut auth = auth_arc.lock().await;
         let token = auth.get_valid_token().await?;
-        (token, auth.amz_user_agent(), auth.user_agent())
+        (token, auth.amz_user_agent(), auth.user_agent(), false)
     } else {
         let mut auth = KiroAuthManager::new(kiro_config, state.client.clone());
         let token = auth.get_valid_token().await?;
-        (token, auth.amz_user_agent(), auth.user_agent())
+        (token, auth.amz_user_agent(), auth.user_agent(), false)
     };
 
     // Build Kiro HTTP request
@@ -1196,6 +1254,21 @@ async fn handle_kiro_messages(
 
     let status = upstream_resp.status();
     let upstream_headers_ms = elapsed_ms(upstream_start);
+
+    // Record success/failure for circuit breaker (account-managed mode)
+    if is_account_managed {
+        if status.is_success() {
+            if let Some(ref mgr) = state.kiro_account_manager {
+                mgr.lock().await.record_success();
+            }
+        } else if crate::convert::kiro::account::classify_error(status.as_u16(), "")
+            == crate::convert::kiro::account::ErrorClass::Recoverable
+        {
+            if let Some(ref mgr) = state.kiro_account_manager {
+                mgr.lock().await.record_failure();
+            }
+        }
+    }
 
     if !status.is_success() {
         let text = upstream_resp.text().await.unwrap_or_default();
@@ -1406,6 +1479,7 @@ async fn handle_kiro_chat_completions(
     requested_model: String,
     request_id: String,
     request_start: Instant,
+    tenant_refresh_token: Option<String>,
 ) -> Result<Response> {
     use crate::convert::anthropic_openai::request::openai_to_anthropic;
     use crate::convert::kiro::request::anthropic_to_kiro;
@@ -1444,21 +1518,28 @@ async fn handle_kiro_chat_completions(
         AppError::Request("Kiro provider 缺少 kiro_config 配置".to_string())
     })?;
 
-    let (token, amz_user_agent, user_agent_str) = if let Some(ref account_mgr) = state.kiro_account_manager {
+    let (token, amz_user_agent, user_agent_str, is_account_managed) = if let Some(ref tenant_token) = tenant_refresh_token {
+        let mut tenant_cfg = kiro_config.clone();
+        tenant_cfg.auth_method = "social".to_string();
+        tenant_cfg.refresh_token = Some(tenant_token.clone());
+        let mut auth = KiroAuthManager::new(&tenant_cfg, state.client.clone());
+        let token = auth.get_valid_token().await?;
+        (token, auth.amz_user_agent(), auth.user_agent(), false)
+    } else if let Some(ref account_mgr) = state.kiro_account_manager {
         let mut mgr = account_mgr.lock().await;
         let (_id, auth_arc) = mgr.get_available_account(&[])
             .ok_or_else(|| AppError::Request("所有 Kiro 账户不可用".to_string()))?;
         let mut auth = auth_arc.lock().await;
         let token = auth.get_valid_token().await?;
-        (token, auth.amz_user_agent(), auth.user_agent())
+        (token, auth.amz_user_agent(), auth.user_agent(), true)
     } else if let Some(ref auth_arc) = state.kiro_auth {
         let mut auth = auth_arc.lock().await;
         let token = auth.get_valid_token().await?;
-        (token, auth.amz_user_agent(), auth.user_agent())
+        (token, auth.amz_user_agent(), auth.user_agent(), false)
     } else {
         let mut auth = KiroAuthManager::new(kiro_config, state.client.clone());
         let token = auth.get_valid_token().await?;
-        (token, auth.amz_user_agent(), auth.user_agent())
+        (token, auth.amz_user_agent(), auth.user_agent(), false)
     };
 
     // Step 4: Send to Kiro API
@@ -1524,6 +1605,21 @@ async fn handle_kiro_chat_completions(
 
     let status = upstream_resp.status();
     let upstream_headers_ms = elapsed_ms(upstream_start);
+
+    // Record success/failure for circuit breaker (account-managed mode)
+    if is_account_managed {
+        if status.is_success() {
+            if let Some(ref mgr) = state.kiro_account_manager {
+                mgr.lock().await.record_success();
+            }
+        } else if crate::convert::kiro::account::classify_error(status.as_u16(), "")
+            == crate::convert::kiro::account::ErrorClass::Recoverable
+        {
+            if let Some(ref mgr) = state.kiro_account_manager {
+                mgr.lock().await.record_failure();
+            }
+        }
+    }
 
     if !status.is_success() {
         let text = upstream_resp.text().await.unwrap_or_default();
@@ -1954,6 +2050,12 @@ pub async fn proxy_responses(
 
     check_auth(&headers, &state.config)?;
 
+    // Extract tenant refresh token if multi-tenant auth
+    let tenant_refresh_token = match check_auth_tenant(&headers, &state.config) {
+        AuthResult::TenantOk { refresh_token } => Some(refresh_token),
+        _ => None,
+    };
+
     let provider = state.current_provider();
     let model_routes = state.current_model_routes();
     let global_routes = model_routes.as_slice();
@@ -1970,21 +2072,28 @@ pub async fn proxy_responses(
 
     let (kiro_payload, _tool_name_map) = responses_to_kiro(&body, &provider, global_routes)?;
 
-    let (token, amz_user_agent, user_agent_str) = if let Some(ref account_mgr) = state.kiro_account_manager {
+    let (token, amz_user_agent, user_agent_str, is_account_managed) = if let Some(ref tenant_token) = tenant_refresh_token {
+        let mut tenant_cfg = kiro_config.clone();
+        tenant_cfg.auth_method = "social".to_string();
+        tenant_cfg.refresh_token = Some(tenant_token.clone());
+        let mut auth = KiroAuthManager::new(&tenant_cfg, state.client.clone());
+        let token = auth.get_valid_token().await?;
+        (token, auth.amz_user_agent(), auth.user_agent(), false)
+    } else if let Some(ref account_mgr) = state.kiro_account_manager {
         let mut mgr = account_mgr.lock().await;
         let (_id, auth_arc) = mgr.get_available_account(&[])
             .ok_or_else(|| AppError::Request("所有 Kiro 账户不可用".to_string()))?;
         let mut auth = auth_arc.lock().await;
         let token = auth.get_valid_token().await?;
-        (token, auth.amz_user_agent(), auth.user_agent())
+        (token, auth.amz_user_agent(), auth.user_agent(), true)
     } else if let Some(ref auth_arc) = state.kiro_auth {
         let mut auth = auth_arc.lock().await;
         let token = auth.get_valid_token().await?;
-        (token, auth.amz_user_agent(), auth.user_agent())
+        (token, auth.amz_user_agent(), auth.user_agent(), false)
     } else {
         let mut auth = KiroAuthManager::new(kiro_config, state.client.clone());
         let token = auth.get_valid_token().await?;
-        (token, auth.amz_user_agent(), auth.user_agent())
+        (token, auth.amz_user_agent(), auth.user_agent(), false)
     };
 
     let region = kiro_config.api_region.as_deref().unwrap_or(&kiro_config.region);
@@ -2023,6 +2132,21 @@ pub async fn proxy_responses(
         timeout,
     )
     .await?;
+
+    // Record success/failure for circuit breaker (account-managed mode)
+    if is_account_managed {
+        if upstream_resp.status().is_success() {
+            if let Some(ref mgr) = state.kiro_account_manager {
+                mgr.lock().await.record_success();
+            }
+        } else if crate::convert::kiro::account::classify_error(upstream_resp.status().as_u16(), "")
+            == crate::convert::kiro::account::ErrorClass::Recoverable
+        {
+            if let Some(ref mgr) = state.kiro_account_manager {
+                mgr.lock().await.record_failure();
+            }
+        }
+    }
 
     if !upstream_resp.status().is_success() {
         let status = upstream_resp.status();

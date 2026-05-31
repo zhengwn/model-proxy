@@ -736,6 +736,8 @@ mod tests {
             proxy_url: None,
             thinking_mode: None,
             web_search_enabled: None,
+            accounts: None,
+            load_balancing_mode: None,
         };
         let cred = KiroCredential::from_config(&config);
         assert_eq!(cred.auth_method, AuthMethod::Social);

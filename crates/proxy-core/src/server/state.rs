@@ -8,7 +8,7 @@ use std::{
 use tokio::sync::Semaphore;
 use tracing::info;
 
-use crate::config::{Config, ConfigError, ModelRoute, ProviderConfig};
+use crate::config::{Config, ConfigError, KiroConfig, ModelRoute, ProviderConfig, ProviderFormat};
 use crate::logging::LogCollector;
 use crate::provider_registry::ProviderRegistry;
 use crate::RequestCounters;
@@ -116,6 +116,109 @@ pub struct AppState {
     pub model_cache: Option<Arc<tokio::sync::Mutex<(Instant, serde_json::Value)>>>,
 }
 
+/// Collect Kiro accounts from config and initialize auth managers.
+///
+/// If a Kiro provider has `accounts` with multiple entries, creates an AccountManager.
+/// Otherwise creates a single KiroAuthManager for backward compatibility.
+fn init_kiro_auth(
+    config: &Config,
+    client: &Client,
+) -> (
+    Option<Arc<tokio::sync::Mutex<crate::convert::kiro::auth::KiroAuthManager>>>,
+    Option<Arc<tokio::sync::Mutex<crate::convert::kiro::account::AccountManager>>>,
+) {
+    use crate::convert::kiro::account::{AccountManager, LoadBalancingMode};
+    use crate::convert::kiro::auth::KiroAuthManager;
+
+    // Find the first Kiro provider
+    let kiro_provider = match config.providers.iter().find(|p| p.format == ProviderFormat::Kiro) {
+        Some(p) => p,
+        None => return (None, None),
+    };
+
+    let kiro_config = match kiro_provider.kiro_config.as_ref() {
+        Some(c) => c,
+        None => return (None, None),
+    };
+
+    // Collect all account entries
+    let accounts: Vec<(String, KiroConfig)> =
+        collect_kiro_accounts(kiro_config, &kiro_provider.name);
+
+    if accounts.len() > 1 {
+        let mode = kiro_config
+            .load_balancing_mode
+            .as_deref()
+            .map(LoadBalancingMode::from_str)
+            .unwrap_or(LoadBalancingMode::Priority);
+        let mode_str = mode.as_str().to_string();
+        let mgr = AccountManager::new_with_mode(&accounts, client.clone(), mode);
+        info!(
+            account_count = accounts.len(),
+            mode = mode_str.as_str(),
+            "初始化 Kiro 多账户管理器"
+        );
+        (None, Some(Arc::new(tokio::sync::Mutex::new(mgr))))
+    } else if accounts.len() == 1 {
+        let auth = KiroAuthManager::new(&accounts[0].1, client.clone());
+        (Some(Arc::new(tokio::sync::Mutex::new(auth))), None)
+    } else {
+        // No accounts, create from flat fields (backward compat)
+        let auth = KiroAuthManager::new(kiro_config, client.clone());
+        (Some(Arc::new(tokio::sync::Mutex::new(auth))), None)
+    }
+}
+
+/// Collect all Kiro account entries from config.
+///
+/// If `accounts` is populated, expands each entry into a full KiroConfig.
+/// Otherwise, falls back to the flat top-level fields (single account).
+fn collect_kiro_accounts(kiro_config: &KiroConfig, provider_name: &str) -> Vec<(String, KiroConfig)> {
+    if let Some(ref accounts) = kiro_config.accounts {
+        if accounts.is_empty() {
+            return vec![];
+        }
+        return accounts
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                let id = format!("{}:{}", provider_name, i);
+                let cfg = KiroConfig {
+                    auth_method: entry
+                        .auth_method
+                        .clone()
+                        .unwrap_or_else(|| kiro_config.auth_method.clone()),
+                    refresh_token: entry.refresh_token.clone(),
+                    client_id: entry.client_id.clone().or_else(|| kiro_config.client_id.clone()),
+                    client_secret: entry
+                        .client_secret
+                        .clone()
+                        .or_else(|| kiro_config.client_secret.clone()),
+                    profile_arn: entry.profile_arn.clone().or_else(|| kiro_config.profile_arn.clone()),
+                    region: entry
+                        .region
+                        .clone()
+                        .unwrap_or_else(|| kiro_config.region.clone()),
+                    api_region: entry
+                        .api_region
+                        .clone()
+                        .or_else(|| kiro_config.api_region.clone()),
+                    model_aliases: kiro_config.model_aliases.clone(),
+                    hidden_models: kiro_config.hidden_models.clone(),
+                    kiro_version: kiro_config.kiro_version.clone(),
+                    proxy_url: entry.proxy_url.clone().or_else(|| kiro_config.proxy_url.clone()),
+                    thinking_mode: kiro_config.thinking_mode.clone(),
+                    web_search_enabled: kiro_config.web_search_enabled,
+                    accounts: None,
+                    load_balancing_mode: None,
+                };
+                (id, cfg)
+            })
+            .collect();
+    }
+    vec![]
+}
+
 impl AppState {
     /// Create a new AppState from a Config (standalone mode, e.g. CLI).
     pub fn new(config: Config) -> Self {
@@ -152,13 +255,9 @@ impl AppState {
             None
         };
 
-        // Initialize Kiro auth manager if any provider uses Kiro format
-        let kiro_auth = config.providers.iter().find(|p| p.format == crate::config::ProviderFormat::Kiro)
-            .and_then(|p| p.kiro_config.as_ref())
-            .map(|kiro_config| {
-                let auth = crate::convert::kiro::auth::KiroAuthManager::new(kiro_config, client.clone());
-                Arc::new(tokio::sync::Mutex::new(auth))
-            });
+        // Initialize Kiro auth: multi-account manager or single auth manager
+        let (kiro_auth, kiro_account_manager) =
+            init_kiro_auth(&config, &client);
 
         Self {
             config: Arc::new(config),
@@ -170,7 +269,7 @@ impl AppState {
             counters: None,
             concurrency_semaphore,
             kiro_auth,
-            kiro_account_manager: None,
+            kiro_account_manager,
             flow_monitor: Some(Arc::new(tokio::sync::Mutex::new(
                 crate::convert::kiro::flow_monitor::FlowMonitor::new(1000),
             ))),
@@ -207,13 +306,9 @@ impl AppState {
             None
         };
 
-        // Initialize Kiro auth manager if any provider uses Kiro format
-        let kiro_auth = config.providers.iter().find(|p| p.format == crate::config::ProviderFormat::Kiro)
-            .and_then(|p| p.kiro_config.as_ref())
-            .map(|kiro_config| {
-                let auth = crate::convert::kiro::auth::KiroAuthManager::new(kiro_config, client.clone());
-                Arc::new(tokio::sync::Mutex::new(auth))
-            });
+        // Initialize Kiro auth: multi-account manager or single auth manager
+        let (kiro_auth, kiro_account_manager) =
+            init_kiro_auth(&config, &client);
 
         Self {
             config: Arc::new(config),
@@ -225,7 +320,7 @@ impl AppState {
             counters: None,
             concurrency_semaphore,
             kiro_auth,
-            kiro_account_manager: None,
+            kiro_account_manager,
             flow_monitor: Some(Arc::new(tokio::sync::Mutex::new(
                 crate::convert::kiro::flow_monitor::FlowMonitor::new(1000),
             ))),

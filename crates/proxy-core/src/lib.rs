@@ -77,6 +77,9 @@ pub fn start_server_shared(
 }
 
 fn start_server_with_state(state: AppState, port: u16, token: CancellationToken) -> JoinHandle<()> {
+    // Build admin routes (has its own auth middleware)
+    let admin_routes = server::admin::admin_router(state.clone());
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/messages", post(proxy_messages))
@@ -92,6 +95,7 @@ fn start_server_with_state(state: AppState, port: u16, token: CancellationToken)
         .route("/api/kiro/social/start", post(proxy_kiro_social_start))
         .route("/api/kiro/social/exchange", post(proxy_kiro_social_exchange))
         .route("/api/event_logging/batch", post(event_logging_batch))
+        .merge(admin_routes)
         .layer(CorsLayer::permissive())
         .with_state(state);
 

@@ -95,6 +95,9 @@ pub struct ServerConfig {
     pub port: u16,
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Admin API 认证密钥（独立于 client API key）
+    #[serde(default)]
+    pub admin_api_key: Option<String>,
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
     /// 每个 Provider 的最大并发请求数，0 表示不限制
@@ -107,6 +110,7 @@ impl Default for ServerConfig {
         Self {
             port: 4000,
             api_key: None,
+            admin_api_key: None,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_concurrent_requests: 0,
         }
@@ -199,6 +203,41 @@ fn default_kiro_region() -> String {
     "us-east-1".to_string()
 }
 
+/// 多账户凭据池中的单个账户配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KiroAccountEntry {
+    /// 认证方式: "social" | "idc" | "api_key"（默认继承 kiro_config.auth_method）
+    #[serde(default)]
+    pub auth_method: Option<String>,
+    /// 刷新 token
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    /// OIDC 客户端 ID
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// OIDC 客户端密钥
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// AWS profile ARN
+    #[serde(default)]
+    pub profile_arn: Option<String>,
+    /// 区域（默认继承 kiro_config.region）
+    #[serde(default)]
+    pub region: Option<String>,
+    /// API 区域（默认同 region）
+    #[serde(default)]
+    pub api_region: Option<String>,
+    /// HTTP/SOCKS5 代理地址
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    /// 优先级（0 = 最高，默认 0）
+    #[serde(default)]
+    pub priority: Option<u32>,
+    /// 是否禁用（默认 false）
+    #[serde(default)]
+    pub disabled: Option<bool>,
+}
+
 /// Kiro (Amazon Q Developer) 专用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KiroConfig {
@@ -240,6 +279,12 @@ pub struct KiroConfig {
     /// 是否启用 Web Search MCP 工具注入
     #[serde(default)]
     pub web_search_enabled: Option<bool>,
+    /// 多账户凭据池配置（当 accounts 非空时启用多账户模式）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounts: Option<Vec<KiroAccountEntry>>,
+    /// 负载均衡模式: "priority"（按优先级）| "balanced"（轮询），默认 "priority"
+    #[serde(default)]
+    pub load_balancing_mode: Option<String>,
 }
 
 impl ProviderConfig {

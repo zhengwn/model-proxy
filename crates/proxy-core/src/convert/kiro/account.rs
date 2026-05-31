@@ -127,6 +127,52 @@ struct ManagedAccount {
     circuit: AccountCircuitBreaker,
     /// Optional per-account proxy URL (HTTP/SOCKS5)
     proxy_url: Option<String>,
+    /// Priority (lower = higher priority)
+    priority: u32,
+    /// Whether this account is manually disabled
+    disabled: bool,
+}
+
+/// Load balancing mode for account selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadBalancingMode {
+    /// Sticky to current account, fall back on failure
+    Priority,
+    /// Round-robin across available accounts
+    Balanced,
+}
+
+impl LoadBalancingMode {
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "balanced" => Self::Balanced,
+            _ => Self::Priority,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Priority => "priority",
+            Self::Balanced => "balanced",
+        }
+    }
+}
+
+/// Snapshot of a single account's status for the Admin API.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AccountSnapshot {
+    pub id: String,
+    pub priority: u32,
+    pub disabled: bool,
+    pub failure_count: u32,
+    pub is_current: bool,
+    pub is_available: bool,
+    pub auth_method: String,
+    pub total_requests: u64,
+    pub successful_requests: u64,
+    pub failed_requests: u64,
+    pub proxy_url: Option<String>,
+    pub region: String,
 }
 
 /// Multi-account manager with circuit breaker failover.
@@ -135,12 +181,25 @@ pub struct AccountManager {
     current_index: usize,
     /// Probability of retrying a broken account (0.0 - 1.0)
     probabilistic_retry_chance: f64,
+    /// Load balancing mode
+    load_balancing_mode: LoadBalancingMode,
+    /// Round-robin counter for balanced mode
+    round_robin_index: usize,
 }
 
 impl AccountManager {
     /// Create a new account manager from multiple Kiro configs.
     pub fn new(configs: &[(String, KiroConfig)], client: reqwest::Client) -> Self {
-        let accounts: Vec<ManagedAccount> = configs
+        Self::new_with_mode(configs, client, LoadBalancingMode::Priority)
+    }
+
+    /// Create with explicit load balancing mode.
+    pub fn new_with_mode(
+        configs: &[(String, KiroConfig)],
+        client: reqwest::Client,
+        mode: LoadBalancingMode,
+    ) -> Self {
+        let mut accounts: Vec<ManagedAccount> = configs
             .iter()
             .map(|(id, config)| {
                 let auth = KiroAuthManager::new(config, client.clone());
@@ -149,12 +208,18 @@ impl AccountManager {
                     auth: Arc::new(Mutex::new(auth)),
                     circuit: AccountCircuitBreaker::new(),
                     proxy_url: config.proxy_url.clone(),
+                    priority: 0,
+                    disabled: false,
                 }
             })
             .collect();
 
+        // Sort by priority (lower = higher priority)
+        accounts.sort_by_key(|a| a.priority);
+
         info!(
             account_count = accounts.len(),
+            mode = mode.as_str(),
             "初始化 Kiro 多账户管理器"
         );
 
@@ -162,6 +227,8 @@ impl AccountManager {
             accounts,
             current_index: 0,
             probabilistic_retry_chance: 0.1,
+            load_balancing_mode: mode,
+            round_robin_index: 0,
         }
     }
 
@@ -170,7 +237,7 @@ impl AccountManager {
     pub fn current_account(&self) -> Option<(&str, &Arc<Mutex<KiroAuthManager>>)> {
         self.accounts
             .get(self.current_index)
-            .filter(|a| a.circuit.is_available())
+            .filter(|a| !a.disabled && a.circuit.is_available())
             .map(|a| (a.id.as_str(), &a.auth))
     }
 
@@ -180,53 +247,113 @@ impl AccountManager {
         &mut self,
         exclude: &[String],
     ) -> Option<(&str, &Arc<Mutex<KiroAuthManager>>)> {
+        match self.load_balancing_mode {
+            LoadBalancingMode::Priority => self.get_available_priority(exclude),
+            LoadBalancingMode::Balanced => self.get_available_balanced(exclude),
+        }
+    }
+
+    fn get_available_priority(
+        &mut self,
+        exclude: &[String],
+    ) -> Option<(&str, &Arc<Mutex<KiroAuthManager>>)> {
         // Try current account first (sticky)
         if self.current_index < self.accounts.len() {
             let current = &self.accounts[self.current_index];
-            if current.circuit.is_available() && !exclude.contains(&current.id) {
+            if !current.disabled && current.circuit.is_available() && !exclude.contains(&current.id) {
                 return Some((current.id.as_str(), &current.auth));
             }
         }
 
-        // Find next available account
+        // Find next available account index (sorted by priority)
+        let mut found_idx = None;
         for (i, account) in self.accounts.iter().enumerate() {
             if i == self.current_index {
                 continue;
             }
-            if exclude.contains(&account.id) {
+            if account.disabled || exclude.contains(&account.id) {
                 continue;
             }
 
-            // Check availability, with probabilistic retry for broken accounts
             if account.circuit.is_available() {
-                self.current_index = i;
-                return Some((account.id.as_str(), &account.auth));
+                found_idx = Some(i);
+                break;
             }
 
             // Probabilistic retry for broken accounts
             if account.circuit.state == CircuitState::Broken {
-                let elapsed = account
-                    .circuit
-                    .last_failure
-                    .map(|t| t.elapsed().as_secs_f64())
-                    .unwrap_or(0.0);
-                let timeout = account.circuit.recovery_timeout().as_secs_f64();
-                let recovery_progress = elapsed / timeout;
-
-                // Higher chance as we get closer to recovery
-                if recovery_progress > 0.5 && rand_chance() < self.probabilistic_retry_chance {
-                    info!(
-                        account_id = account.id.as_str(),
-                        recovery_progress,
-                        "概率重试 broken 账户"
-                    );
-                    self.current_index = i;
-                    return Some((account.id.as_str(), &account.auth));
+                if self.should_probabilistic_retry(i) {
+                    found_idx = Some(i);
+                    break;
                 }
             }
         }
 
-        None
+        if let Some(idx) = found_idx {
+            self.current_index = idx;
+            let account = &self.accounts[idx];
+            Some((account.id.as_str(), &account.auth))
+        } else {
+            None
+        }
+    }
+
+    fn get_available_balanced(
+        &mut self,
+        exclude: &[String],
+    ) -> Option<(&str, &Arc<Mutex<KiroAuthManager>>)> {
+        let count = self.accounts.len();
+        let mut found_idx = None;
+        for _ in 0..count {
+            let idx = self.round_robin_index % count;
+            self.round_robin_index = (self.round_robin_index + 1) % count;
+            let account = &self.accounts[idx];
+            if account.disabled || exclude.contains(&account.id) {
+                continue;
+            }
+            if account.circuit.is_available() {
+                found_idx = Some(idx);
+                break;
+            }
+            // Probabilistic retry for broken accounts
+            if account.circuit.state == CircuitState::Broken {
+                if self.should_probabilistic_retry(idx) {
+                    found_idx = Some(idx);
+                    break;
+                }
+            }
+        }
+
+        if let Some(idx) = found_idx {
+            self.current_index = idx;
+            let account = &self.accounts[idx];
+            Some((account.id.as_str(), &account.auth))
+        } else {
+            None
+        }
+    }
+
+    /// Check if a broken account should be probabilistically retried.
+    fn should_probabilistic_retry(&self, idx: usize) -> bool {
+        let account = &self.accounts[idx];
+        let elapsed = account
+            .circuit
+            .last_failure
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+        let timeout = account.circuit.recovery_timeout().as_secs_f64();
+        let recovery_progress = elapsed / timeout;
+
+        if recovery_progress > 0.5 && rand_chance() < self.probabilistic_retry_chance {
+            info!(
+                account_id = account.id.as_str(),
+                recovery_progress,
+                "概率重试 broken 账户"
+            );
+            true
+        } else {
+            false
+        }
     }
 
     /// Record a successful request for the current account.
@@ -252,7 +379,7 @@ impl AccountManager {
 
     /// Check if we only have a single account (skip circuit breaker).
     pub fn is_single_account(&self) -> bool {
-        self.accounts.len() == 1
+        self.accounts.iter().filter(|a| !a.disabled).count() <= 1
     }
 
     /// Get the proxy URL for the current account.
@@ -265,6 +392,149 @@ impl AccountManager {
     /// Get the number of accounts.
     pub fn account_count(&self) -> usize {
         self.accounts.len()
+    }
+
+    // ---- Admin API CRUD methods ----
+
+    /// Get a snapshot of all accounts for the Admin API.
+    pub fn snapshot(&self) -> Vec<AccountSnapshot> {
+        self.accounts
+            .iter()
+            .enumerate()
+            .map(|(i, a)| AccountSnapshot {
+                id: a.id.clone(),
+                priority: a.priority,
+                disabled: a.disabled,
+                failure_count: a.circuit.failures,
+                is_current: i == self.current_index,
+                is_available: !a.disabled && a.circuit.is_available(),
+                auth_method: "unknown".to_string(),
+                total_requests: a.circuit.total_requests,
+                successful_requests: a.circuit.successful_requests,
+                failed_requests: a.circuit.failed_requests,
+                proxy_url: a.proxy_url.clone(),
+                region: String::new(),
+            })
+            .collect()
+    }
+
+    /// Add a new account. Returns the account ID.
+    pub fn add_account(
+        &mut self,
+        id: String,
+        config: &KiroConfig,
+        client: reqwest::Client,
+        priority: u32,
+    ) -> String {
+        let auth = KiroAuthManager::new(config, client);
+        let account_id = id.clone();
+        self.accounts.push(ManagedAccount {
+            id,
+            auth: Arc::new(Mutex::new(auth)),
+            circuit: AccountCircuitBreaker::new(),
+            proxy_url: config.proxy_url.clone(),
+            priority,
+            disabled: false,
+        });
+        // Re-sort by priority
+        self.accounts.sort_by_key(|a| a.priority);
+        // Update current_index to track the same account
+        self.current_index = self
+            .accounts
+            .iter()
+            .position(|a| a.id == self.accounts.get(self.current_index).map(|a| a.id.as_str()).unwrap_or(""))
+            .unwrap_or(0);
+        info!(account_id = account_id.as_str(), priority, "添加 Kiro 账户");
+        account_id
+    }
+
+    /// Remove an account by ID. Returns true if found and removed.
+    pub fn remove_account(&mut self, id: &str) -> bool {
+        if let Some(pos) = self.accounts.iter().position(|a| a.id == id) {
+            self.accounts.remove(pos);
+            if self.current_index >= self.accounts.len() && !self.accounts.is_empty() {
+                self.current_index = self.accounts.len() - 1;
+            }
+            info!(account_id = id, "删除 Kiro 账户");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set disabled state for an account. Returns true if found.
+    pub fn set_disabled(&mut self, id: &str, disabled: bool) -> bool {
+        if let Some(account) = self.accounts.iter_mut().find(|a| a.id == id) {
+            account.disabled = disabled;
+            info!(account_id = id, disabled, "设置 Kiro 账户状态");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set priority for an account and re-sort. Returns true if found.
+    pub fn set_priority(&mut self, id: &str, priority: u32) -> bool {
+        if let Some(account) = self.accounts.iter_mut().find(|a| a.id == id) {
+            let old_priority = account.priority;
+            account.priority = priority;
+            // Re-sort by priority
+            let current_id = self
+                .accounts
+                .get(self.current_index)
+                .map(|a| a.id.clone());
+            self.accounts.sort_by_key(|a| a.priority);
+            // Restore current_index
+            if let Some(cid) = current_id {
+                self.current_index = self
+                    .accounts
+                    .iter()
+                    .position(|a| a.id == cid)
+                    .unwrap_or(0);
+            }
+            info!(
+                account_id = id,
+                old_priority, priority, "设置 Kiro 账户优先级"
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Reset failure count and re-enable an account. Returns true if found.
+    pub fn reset_failures(&mut self, id: &str) -> bool {
+        if let Some(account) = self.accounts.iter_mut().find(|a| a.id == id) {
+            account.circuit.failures = 0;
+            account.circuit.state = CircuitState::Active;
+            account.circuit.last_failure = None;
+            info!(account_id = id, "重置 Kiro 账户失败计数");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Force refresh token for a specific account. Returns Ok(token) or Err.
+    pub async fn force_refresh_account(&self, id: &str) -> Result<String, String> {
+        if let Some(account) = self.accounts.iter().find(|a| a.id == id) {
+            let mut auth = account.auth.lock().await;
+            auth.force_refresh()
+                .await
+                .map_err(|e| format!("Token refresh failed: {}", e))
+        } else {
+            Err(format!("Account '{}' not found", id))
+        }
+    }
+
+    /// Get the current load balancing mode.
+    pub fn load_balancing_mode(&self) -> &LoadBalancingMode {
+        &self.load_balancing_mode
+    }
+
+    /// Set the load balancing mode.
+    pub fn set_load_balancing_mode(&mut self, mode: LoadBalancingMode) {
+        self.load_balancing_mode = mode;
     }
 }
 
@@ -326,5 +596,18 @@ mod tests {
     fn error_class_recoverable_variants() {
         assert_eq!(classify_error(402, "quota"), ErrorClass::Recoverable);
         assert_eq!(classify_error(429, "rate limit"), ErrorClass::Recoverable);
+    }
+
+    #[test]
+    fn load_balancing_mode_from_str() {
+        assert_eq!(LoadBalancingMode::from_str("balanced"), LoadBalancingMode::Balanced);
+        assert_eq!(LoadBalancingMode::from_str("priority"), LoadBalancingMode::Priority);
+        assert_eq!(LoadBalancingMode::from_str("unknown"), LoadBalancingMode::Priority);
+    }
+
+    #[test]
+    fn load_balancing_mode_as_str() {
+        assert_eq!(LoadBalancingMode::Priority.as_str(), "priority");
+        assert_eq!(LoadBalancingMode::Balanced.as_str(), "balanced");
     }
 }

@@ -555,6 +555,11 @@ fn convert_history_messages(messages: &[Value]) -> Vec<Value> {
                                     buffered_user_images.push(img);
                                 }
                             }
+                            Some("image_url") => {
+                                if let Some(img) = convert_openai_image_block(block) {
+                                    buffered_user_images.push(img);
+                                }
+                            }
                             Some("tool_result") => {
                                 if let Some(tr) = convert_tool_result(block) {
                                     buffered_user_tool_results.push(tr);
@@ -719,6 +724,11 @@ fn extract_current_message(msg: &Value) -> (String, Vec<Value>, Vec<Value>) {
                             images.push(img);
                         }
                     }
+                    Some("image_url") => {
+                        if let Some(img) = convert_openai_image_block(block) {
+                            images.push(img);
+                        }
+                    }
                     Some("tool_result") => {
                         if let Some(tr) = convert_tool_result(block) {
                             tool_results.push(tr);
@@ -763,6 +773,33 @@ fn convert_image_block(block: &Value) -> Option<Value> {
         (format, data)
     };
 
+    Some(json!({
+        "format": format,
+        "source": {"bytes": data}
+    }))
+}
+
+/// Convert an OpenAI-format `image_url` block to Kiro image format.
+/// Only supports data URLs (e.g., `data:image/jpeg;base64,...`).
+fn convert_openai_image_block(block: &Value) -> Option<Value> {
+    let url = block.get("image_url")?.get("url")?.as_str()?;
+    if !url.starts_with("data:") {
+        warn!("Kiro 不支持远程 URL 图片，跳过");
+        return None;
+    }
+    let (header, data) = url.split_once(',').unwrap_or(("", ""));
+    let format = if header.contains("jpeg") || header.contains("jpg") {
+        "jpeg"
+    } else if header.contains("png") {
+        "png"
+    } else if header.contains("gif") {
+        "gif"
+    } else if header.contains("webp") {
+        "webp"
+    } else {
+        warn!(header, "不支持的图片格式，跳过");
+        return None;
+    };
     Some(json!({
         "format": format,
         "source": {"bytes": data}

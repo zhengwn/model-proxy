@@ -1,3 +1,4 @@
+pub(crate) mod admin;
 mod fallback;
 mod handlers;
 pub(crate) mod state;

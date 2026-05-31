@@ -87,6 +87,7 @@ fn make_config(port: u16, provider_url: &str) -> Config {
             format: ProviderFormat::Openai,
             quirks: ProviderQuirks::default(),
             model_routes: Vec::new(),
+            kiro_config: None,
         }],
         model_routes: Vec::new(),
         logging: LogConfig::default(),
@@ -497,6 +498,7 @@ async fn fallback_tries_next_provider_on_error() {
                 format: ProviderFormat::Openai,
                 quirks: ProviderQuirks::default(),
                 model_routes: Vec::new(),
+                kiro_config: None,
             },
             ProviderConfig {
                 name: "backup".to_string(),
@@ -506,6 +508,7 @@ async fn fallback_tries_next_provider_on_error() {
                 format: ProviderFormat::Openai,
                 quirks: ProviderQuirks::default(),
                 model_routes: Vec::new(),
+                kiro_config: None,
             },
         ],
         model_routes: vec![ModelRoute {
