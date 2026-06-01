@@ -63,6 +63,7 @@ struct CredentialSnapshotResponse {
     failed_requests: u64,
     proxy_url: Option<String>,
     region: String,
+    health_score: u32,
 }
 
 #[derive(Serialize)]
@@ -233,6 +234,7 @@ pub async fn admin_list_credentials(
             failed_requests: s.failed_requests,
             proxy_url: s.proxy_url,
             region: s.region,
+            health_score: s.health_score,
         })
         .collect();
 
@@ -277,6 +279,12 @@ pub async fn admin_add_credential(
         accounts: None,
         load_balancing_mode: None,
         agentic_prompt_injection: None,
+        first_token_timeout: None,
+        streaming_read_timeout: None,
+        first_token_max_retries: None,
+        quota_cooldown_secs: None,
+        health_score_decay: None,
+        health_score_recovery: None,
     };
 
     let id = {

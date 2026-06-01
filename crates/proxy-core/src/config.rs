@@ -288,6 +288,24 @@ pub struct KiroConfig {
     /// 是否注入 Agentic System Prompt（文件操作限制 + 时间戳），默认 false
     #[serde(default)]
     pub agentic_prompt_injection: Option<bool>,
+    /// 首 token 超时（秒），默认 15
+    #[serde(default)]
+    pub first_token_timeout: Option<u64>,
+    /// 流式读取超时（秒），默认 300
+    #[serde(default)]
+    pub streaming_read_timeout: Option<u64>,
+    /// 首 token 最大重试次数，默认 3
+    #[serde(default)]
+    pub first_token_max_retries: Option<u32>,
+    /// 429 配额冷却时间（秒），默认 300
+    #[serde(default)]
+    pub quota_cooldown_secs: Option<u64>,
+    /// 健康分数每次失败衰减值，默认 20
+    #[serde(default)]
+    pub health_score_decay: Option<u32>,
+    /// 健康分数每次成功恢复值，默认 10
+    #[serde(default)]
+    pub health_score_recovery: Option<u32>,
 }
 
 impl ProviderConfig {

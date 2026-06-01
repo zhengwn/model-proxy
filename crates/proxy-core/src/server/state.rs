@@ -220,6 +220,12 @@ fn collect_kiro_accounts(kiro_config: &KiroConfig, provider_name: &str) -> Vec<(
                     accounts: None,
                     load_balancing_mode: None,
                     agentic_prompt_injection: kiro_config.agentic_prompt_injection,
+                    first_token_timeout: kiro_config.first_token_timeout,
+                    streaming_read_timeout: kiro_config.streaming_read_timeout,
+                    first_token_max_retries: kiro_config.first_token_max_retries,
+                    quota_cooldown_secs: kiro_config.quota_cooldown_secs,
+                    health_score_decay: kiro_config.health_score_decay,
+                    health_score_recovery: kiro_config.health_score_recovery,
                 };
                 (id, cfg)
             })

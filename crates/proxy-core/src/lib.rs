@@ -21,6 +21,7 @@ use tracing::info;
 use crate::config::Config;
 use crate::server::{event_logging_batch, proxy_chat_completions, proxy_count_tokens, proxy_flows, proxy_kiro_login_poll, proxy_kiro_login_start, proxy_kiro_social_exchange, proxy_kiro_social_start, proxy_messages, proxy_models, proxy_responses, proxy_status, proxy_usage};
 use crate::server::ip_filter::ip_filter_middleware;
+use crate::server::request_id::request_id_middleware;
 use crate::server::site_guard::site_guard_middleware;
 use axum::middleware;
 
@@ -116,6 +117,8 @@ fn start_server_with_state(state: AppState, port: u16, token: CancellationToken)
         .route("/api/kiro/social/exchange", post(proxy_kiro_social_exchange))
         .route("/api/event_logging/batch", post(event_logging_batch))
         .merge(admin_routes)
+        // Request ID middleware (generates or forwards X-Request-ID)
+        .layer(middleware::from_fn(request_id_middleware))
         // IP filter middleware (rejects banned IPs, records request counts)
         .layer(middleware::from_fn_with_state(
             state.ip_filter.clone(),

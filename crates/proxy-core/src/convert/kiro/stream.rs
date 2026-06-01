@@ -478,6 +478,8 @@ pub async fn handle_stream_anthropic_output(
     upstream_headers_ms: u128,
     log_ctx: Option<StreamLogContext>,
     thinking_mode: Option<&str>,
+    first_token_timeout: Duration,
+    streaming_read_timeout: Duration,
 ) -> Result<Response> {
     info!(
         request_id = request_id.as_str(),
@@ -495,16 +497,18 @@ pub async fn handle_stream_anthropic_output(
     let last_data_sent = Arc::new(AtomicU64::new(0));
 
     // Spawn keep-alive task
+    let keepalive_interval = streaming_read_timeout / 12;
+    let keepalive_timeout = streaming_read_timeout;
     let last_ds = last_data_sent.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(KEEP_ALIVE_INTERVAL);
+        let mut interval = tokio::time::interval(keepalive_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
             let elapsed_since_last = Duration::from_secs(
                 stream_base.elapsed().as_secs() - last_ds.load(Ordering::Relaxed),
             );
-            if elapsed_since_last >= KEEP_ALIVE_TIMEOUT {
+            if elapsed_since_last >= keepalive_timeout {
                 debug!("SSE keep-alive: stream timed out after {:?} of inactivity", elapsed_since_last);
                 break;
             }
@@ -561,9 +565,9 @@ pub async fn handle_stream_anthropic_output(
 
         loop {
             let timeout_duration = if first_chunk {
-                Duration::from_secs(15) // first-token timeout
+                first_token_timeout
             } else {
-                KEEP_ALIVE_TIMEOUT // overall stream stall timeout
+                streaming_read_timeout
             };
             let keepalive_timer = tokio::time::sleep(timeout_duration);
             tokio::pin!(keepalive_timer);
@@ -770,6 +774,7 @@ struct OpenAiStreamState {
     output_tokens: usize,
     input_tokens: u64,
     last_content: String,
+    thinking_parser: Option<ThinkingParser>,
 }
 
 impl OpenAiStreamState {
@@ -786,6 +791,7 @@ impl OpenAiStreamState {
             output_tokens: 0,
             input_tokens: 0,
             last_content: String::new(),
+            thinking_parser: None,
         }
     }
 
@@ -847,7 +853,7 @@ fn process_event_openai(
                 return events;
             }
 
-            // First chunk with role
+            // Ensure role is emitted first
             if !state.has_role_emitted {
                 state.has_role_emitted = true;
                 state.started = true;
@@ -860,14 +866,43 @@ fn process_event_openai(
                 })));
             }
 
-            events.push(openai_sse_chunk(&json!({
-                "id": state.stream_id,
-                "object": "chat.completion.chunk",
-                "created": now_epoch_secs(),
-                "model": model,
-                "choices": [{"index": 0, "delta": {"content": new_text}, "finish_reason": null}]
-            })));
-            state.output_tokens += estimate_tokens(&new_text);
+            // Use ThinkingParser if configured, otherwise emit directly
+            if let Some(ref mut parser) = state.thinking_parser {
+                let outputs = parser.feed(new_text);
+                for output in outputs {
+                    match output {
+                        ThinkingOutput::ThinkingDelta(thinking_text) => {
+                            events.push(openai_sse_chunk(&json!({
+                                "id": state.stream_id,
+                                "object": "chat.completion.chunk",
+                                "created": now_epoch_secs(),
+                                "model": model,
+                                "choices": [{"index": 0, "delta": {"reasoning_content": thinking_text}, "finish_reason": null}]
+                            })));
+                        }
+                        ThinkingOutput::ContentDelta(text) => {
+                            events.push(openai_sse_chunk(&json!({
+                                "id": state.stream_id,
+                                "object": "chat.completion.chunk",
+                                "created": now_epoch_secs(),
+                                "model": model,
+                                "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}]
+                            })));
+                            state.output_tokens += estimate_tokens(&text);
+                        }
+                        ThinkingOutput::None => {}
+                    }
+                }
+            } else {
+                events.push(openai_sse_chunk(&json!({
+                    "id": state.stream_id,
+                    "object": "chat.completion.chunk",
+                    "created": now_epoch_secs(),
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"content": new_text}, "finish_reason": null}]
+                })));
+                state.output_tokens += estimate_tokens(&new_text);
+            }
         }
 
         Event::ReasoningContent { text } => {
@@ -1004,6 +1039,8 @@ pub async fn handle_stream_openai_output(
     upstream_headers_ms: u128,
     log_ctx: Option<StreamLogContext>,
     thinking_mode: Option<&str>,
+    first_token_timeout: Duration,
+    streaming_read_timeout: Duration,
 ) -> Result<Response> {
     info!(
         request_id = request_id.as_str(),
@@ -1012,6 +1049,7 @@ pub async fn handle_stream_openai_output(
 
     let byte_stream = upstream_resp.bytes_stream();
     let model = model.to_string();
+    let thinking_mode_owned: Option<String> = thinking_mode.map(|s| s.to_string());
 
     // Create channel outside spawn so rx is available for the response body
     let (tx, rx) = mpsc::channel::<std::result::Result<Bytes, AppError>>(128);
@@ -1020,16 +1058,18 @@ pub async fn handle_stream_openai_output(
     let last_data_sent = Arc::new(AtomicU64::new(0));
 
     // Spawn keep-alive task
+    let keepalive_interval = streaming_read_timeout / 12;
+    let keepalive_timeout = streaming_read_timeout;
     let last_ds = last_data_sent.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(KEEP_ALIVE_INTERVAL);
+        let mut interval = tokio::time::interval(keepalive_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
             let elapsed_since_last = Duration::from_secs(
                 stream_base.elapsed().as_secs() - last_ds.load(Ordering::Relaxed),
             );
-            if elapsed_since_last >= KEEP_ALIVE_TIMEOUT {
+            if elapsed_since_last >= keepalive_timeout {
                 debug!("SSE keep-alive: stream timed out after {:?} of inactivity", elapsed_since_last);
                 break;
             }
@@ -1043,6 +1083,11 @@ pub async fn handle_stream_openai_output(
         let stream_start = Instant::now();
         let mut decoder = EventStreamDecoder::new();
         let mut state = OpenAiStreamState::new();
+        // Initialize ThinkingParser for extracting thinking tags from assistant responses
+        if let Some(ref mode_str) = thinking_mode_owned {
+            let mode = ThinkingHandlingMode::from_str(mode_str);
+            state.thinking_parser = Some(ThinkingParser::new(mode));
+        }
         let mut upstream_chunks: u64 = 0;
         let mut emitted_events: u64 = 0;
 
@@ -1078,9 +1123,9 @@ pub async fn handle_stream_openai_output(
 
         loop {
             let timeout_duration = if first_chunk {
-                Duration::from_secs(15) // first-token timeout
+                first_token_timeout
             } else {
-                KEEP_ALIVE_TIMEOUT // overall stream stall timeout
+                streaming_read_timeout
             };
             let keepalive_timer = tokio::time::sleep(timeout_duration);
             tokio::pin!(keepalive_timer);

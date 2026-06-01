@@ -4,6 +4,7 @@ mod fallback;
 mod handlers;
 pub mod ip_filter;
 pub mod metrics;
+pub mod request_id;
 pub(crate) mod state;
 pub mod site_guard;
 

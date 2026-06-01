@@ -33,7 +33,21 @@ impl AuthMethod {
 
 // ---- Credential ----
 
-#[derive(Debug, Clone)]
+/// Where a credential was originally loaded from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialSource {
+    /// From TOML config file (KiroConfig / KiroAccountEntry)
+    Config,
+    /// From model-proxy's own persisted JSON cache
+    PersistedFile,
+    /// From kiro-cli SQLite database
+    KiroCliSqlite,
+    /// From AWS SSO cache
+    AwsSsoCache,
+    /// Unknown or ad-hoc
+    Unknown,
+}
+
 pub struct KiroCredential {
     pub auth_method: AuthMethod,
     pub access_token: Option<String>,
@@ -46,6 +60,8 @@ pub struct KiroCredential {
     pub api_region: String,
     pub machine_id: String,
     pub disabled: bool,
+    /// Where this credential was originally loaded from
+    pub source: CredentialSource,
 }
 
 impl KiroCredential {
@@ -67,6 +83,7 @@ impl KiroCredential {
             api_region,
             machine_id,
             disabled: false,
+            source: CredentialSource::Config,
         }
     }
 
@@ -145,6 +162,94 @@ fn persist_token(cred: &KiroCredential) {
         }
         Err(e) => {
             tracing::warn!(error = %e, "序列化 Kiro token 失败");
+        }
+    }
+}
+
+/// Write refreshed token back to the original credential source.
+/// This ensures other clients (kiro-cli, kiro IDE) can use the updated token.
+fn write_back_to_source(cred: &KiroCredential, original_refresh_token: &str) {
+    // Only write back if the refresh token actually changed
+    let new_token = match &cred.refresh_token {
+        Some(t) if t != original_refresh_token => t,
+        _ => return,
+    };
+
+    match cred.source {
+        CredentialSource::KiroCliSqlite => {
+            write_back_to_sqlite(cred, new_token);
+        }
+        CredentialSource::AwsSsoCache => {
+            // SSO cache tokens are managed by AWS SSO, don't write back
+            tracing::debug!("SSO cache token refreshed, not writing back (managed by AWS SSO)");
+        }
+        CredentialSource::Config | CredentialSource::PersistedFile | CredentialSource::Unknown => {
+            // Already handled by persist_token() which writes to model-proxy's cache
+            tracing::debug!(
+                source = ?cred.source,
+                "Token persisted to model-proxy cache"
+            );
+        }
+    }
+}
+
+/// Try to write refreshed token back to kiro-cli SQLite database.
+fn write_back_to_sqlite(cred: &KiroCredential, new_refresh_token: &str) {
+    let home = match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+
+    #[cfg(target_os = "macos")]
+    let db_path = format!("{}/.local/share/kiro-cli/data.sqlite3", home);
+    #[cfg(target_os = "linux")]
+    let db_path = format!("{}/.local/share/kiro-cli/data.sqlite3", home);
+    #[cfg(target_os = "windows")]
+    let db_path = format!("{}\\AppData\\Local\\kiro-cli\\data.sqlite3", home);
+
+    if !std::path::Path::new(&db_path).exists() {
+        return;
+    }
+
+    // Use sqlite3 CLI to update the token in the auth_kv table.
+    // The kiro-cli stores tokens as base64-encoded JSON in the 'value' column.
+    let escaped_token = new_refresh_token.replace('\'', "''");
+
+    // Try to update the social token entry
+    for key_prefix in &["kirocli:social:token", "kirocli:odic:token"] {
+        let sql = format!(
+            "UPDATE auth_kv SET value = json_set(value, '$.refreshToken', '{}') WHERE key = '{}';",
+            escaped_token, key_prefix
+        );
+
+        match std::process::Command::new("sqlite3")
+            .arg(&db_path)
+            .arg(&sql)
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                tracing::info!(
+                    db_path = db_path.as_str(),
+                    key = key_prefix,
+                    "已将刷新后的 token 回写到 kiro-cli SQLite"
+                );
+                return;
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::debug!(
+                    key = key_prefix,
+                    stderr = %stderr,
+                    "SQLite 回写失败 (尝试下一个 key)"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "sqlite3 CLI 不可用，跳过 kiro-cli token 回写"
+                );
+                return;
+            }
         }
     }
 }
@@ -441,10 +546,14 @@ impl KiroAuthManager {
 
         // Token is expired or missing — refresh it
         info!("Kiro token 已过期或缺失，正在刷新...");
+        let original_rt = self.credentials[idx].refresh_token.clone().unwrap_or_default();
         Self::refresh_token(&mut self.credentials[idx], &self.client).await?;
 
         // Persist refreshed token
         persist_token(&self.credentials[idx]);
+
+        // Write back to original credential source (e.g., kiro-cli SQLite)
+        write_back_to_source(&self.credentials[idx], &original_rt);
 
         self.credentials[idx].access_token.clone().ok_or_else(|| {
             crate::error::AppError::Request("Kiro token 刷新后仍为空".to_string())
@@ -469,10 +578,14 @@ impl KiroAuthManager {
         }
 
         info!("Kiro 强制刷新 token（403 触发）");
+        let original_rt = self.credentials[idx].refresh_token.clone().unwrap_or_default();
         Self::refresh_token(&mut self.credentials[idx], &self.client).await?;
 
         // Persist refreshed token
         persist_token(&self.credentials[idx]);
+
+        // Write back to original credential source (e.g., kiro-cli SQLite)
+        write_back_to_source(&self.credentials[idx], &original_rt);
 
         self.credentials[idx].access_token.clone().ok_or_else(|| {
             crate::error::AppError::Request("Kiro token 强制刷新后仍为空".to_string())
@@ -700,6 +813,7 @@ mod tests {
             api_region: "us-east-1".to_string(),
             machine_id: "test".to_string(),
             disabled: false,
+            source: CredentialSource::Unknown,
         };
 
         // No expiry = expired
@@ -739,6 +853,12 @@ mod tests {
             accounts: None,
             load_balancing_mode: None,
             agentic_prompt_injection: None,
+            first_token_timeout: None,
+            streaming_read_timeout: None,
+            first_token_max_retries: None,
+            quota_cooldown_secs: None,
+            health_score_decay: None,
+            health_score_recovery: None,
         };
         let cred = KiroCredential::from_config(&config);
         assert_eq!(cred.auth_method, AuthMethod::Social);
