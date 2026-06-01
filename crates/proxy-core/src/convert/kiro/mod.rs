@@ -2,6 +2,8 @@
 pub mod account;
 pub mod auth;
 pub mod auth_flow;
+pub mod compression;
+pub mod endpoint_health;
 pub mod eventstream;
 pub mod flow_monitor;
 pub mod history;
@@ -11,6 +13,8 @@ pub mod prompt_cache;
 pub mod rate_limiter;
 pub mod request;
 pub mod responses;
+pub mod sanitize;
 pub mod stream;
 pub mod thinking_parser;
+pub mod tool_transform;
 pub mod truncation;

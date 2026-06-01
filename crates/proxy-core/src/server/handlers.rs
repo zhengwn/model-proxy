@@ -174,6 +174,9 @@ pub async fn proxy_messages(
 
     // Track total requests
     state.inc_total_requests();
+    if let Some(ref metrics) = state.metrics {
+        metrics.connection_start();
+    }
 
     request_guard.set_phase("auth");
     check_auth(&headers, &state.config)?;
@@ -190,7 +193,15 @@ pub async fn proxy_messages(
             }
         })?;
 
-    let body_json: Value = serde_json::from_slice(&bytes)?;
+    let body_json: Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            if let Some(ref metrics) = state.metrics {
+                metrics.record_error(request_start.elapsed().as_millis() as u64);
+            }
+            return Err(AppError::from(e));
+        }
+    };
     let requested_model = body_json
         .get("model")
         .and_then(|v| v.as_str())
@@ -225,7 +236,8 @@ pub async fn proxy_messages(
             AuthResult::TenantOk { refresh_token } => Some(refresh_token),
             _ => None,
         };
-        return handle_kiro_messages(
+        let metrics = state.metrics.clone();
+        return match handle_kiro_messages(
             state,
             body_json,
             bytes,
@@ -236,7 +248,21 @@ pub async fn proxy_messages(
             request_start,
             tenant_token,
         )
-        .await;
+        .await
+        {
+            Ok(resp) => {
+                if let Some(ref m) = metrics {
+                    m.record_request(request_start.elapsed().as_millis() as u64);
+                }
+                Ok(resp)
+            }
+            Err(e) => {
+                if let Some(ref m) = metrics {
+                    m.record_error(request_start.elapsed().as_millis() as u64);
+                }
+                Err(e)
+            }
+        };
     }
 
     request_guard.set_phase("prepare_body");
@@ -538,6 +564,22 @@ pub async fn proxy_messages(
         );
     }
 
+    // Record metrics at handler exit
+    if let Some(ref m) = state.metrics {
+        match &response {
+            Ok(resp) => {
+                if resp.status().is_server_error() {
+                    m.record_error(request_start.elapsed().as_millis() as u64);
+                } else {
+                    m.record_request(request_start.elapsed().as_millis() as u64);
+                }
+            }
+            Err(_) => {
+                m.record_error(request_start.elapsed().as_millis() as u64);
+            }
+        }
+    }
+
     response
 }
 
@@ -552,6 +594,9 @@ pub async fn proxy_chat_completions(
     let request_start = Instant::now();
 
     state.inc_total_requests();
+    if let Some(ref metrics) = state.metrics {
+        metrics.connection_start();
+    }
 
     check_auth(&headers, &state.config)?;
 
@@ -588,7 +633,8 @@ pub async fn proxy_chat_completions(
             AuthResult::TenantOk { refresh_token } => Some(refresh_token),
             _ => None,
         };
-        return handle_kiro_chat_completions(
+        let metrics = state.metrics.clone();
+        return match handle_kiro_chat_completions(
             state,
             body_json,
             requested_model,
@@ -596,7 +642,21 @@ pub async fn proxy_chat_completions(
             request_start,
             tenant_token,
         )
-        .await;
+        .await
+        {
+            Ok(resp) => {
+                if let Some(ref m) = metrics {
+                    m.record_request(request_start.elapsed().as_millis() as u64);
+                }
+                Ok(resp)
+            }
+            Err(e) => {
+                if let Some(ref m) = metrics {
+                    m.record_error(request_start.elapsed().as_millis() as u64);
+                }
+                Err(e)
+            }
+        };
     }
 
     let global_routes = model_routes.as_slice();
@@ -774,6 +834,21 @@ pub async fn proxy_chat_completions(
                 );
             }
 
+            // Record metrics at handler exit
+            if let Some(ref m) = state.metrics {
+                match &response {
+                    Ok(resp) => {
+                        if resp.status().is_server_error() {
+                            m.record_error(request_start.elapsed().as_millis() as u64);
+                        } else {
+                            m.record_request(request_start.elapsed().as_millis() as u64);
+                        }
+                    }
+                    Err(_) => {
+                        m.record_error(request_start.elapsed().as_millis() as u64);
+                    }
+                }
+            }
             response
         }
         crate::config::ProviderFormat::Anthropic => {
@@ -963,6 +1038,21 @@ pub async fn proxy_chat_completions(
                 );
             }
 
+            // Record metrics at handler exit
+            if let Some(ref m) = state.metrics {
+                match &response {
+                    Ok(resp) => {
+                        if resp.status().is_server_error() {
+                            m.record_error(request_start.elapsed().as_millis() as u64);
+                        } else {
+                            m.record_request(request_start.elapsed().as_millis() as u64);
+                        }
+                    }
+                    Err(_) => {
+                        m.record_error(request_start.elapsed().as_millis() as u64);
+                    }
+                }
+            }
             response
         }
         crate::config::ProviderFormat::Kiro => {
@@ -1172,8 +1262,17 @@ async fn handle_kiro_messages(
         (token, auth.amz_user_agent(), auth.user_agent(), false)
     } else if let Some(ref account_mgr) = state.kiro_account_manager {
         let mut mgr = account_mgr.lock().await;
-        let (_id, auth_arc) = mgr.get_available_account(&[])
-            .ok_or_else(|| AppError::Request("所有 Kiro 账户不可用".to_string()))?;
+        let (_id, auth_arc) = match mgr.get_available_account(&[]) {
+            Some(pair) => pair,
+            None => {
+                if mgr.self_heal() {
+                    mgr.get_available_account(&[])
+                        .ok_or_else(|| AppError::Request("所有 Kiro 账户不可用 (已尝试自愈)".to_string()))?
+                } else {
+                    return Err(AppError::Request("所有 Kiro 账户不可用".to_string()));
+                }
+            }
+        };
         let mut auth = auth_arc.lock().await;
         let token = auth.get_valid_token().await?;
         (token, auth.amz_user_agent(), auth.user_agent(), true)
@@ -1187,6 +1286,13 @@ async fn handle_kiro_messages(
         (token, auth.amz_user_agent(), auth.user_agent(), false)
     };
 
+    // Track inflight request for account manager
+    if is_account_managed {
+        if let Some(ref mgr) = state.kiro_account_manager {
+            mgr.lock().await.increment_inflight();
+        }
+    }
+
     // Build Kiro HTTP request
     request_guard.set_phase("kiro_request");
     let region = kiro_config
@@ -1198,8 +1304,17 @@ async fn handle_kiro_messages(
         region
     );
 
-    let payload_bytes = serde_json::to_vec(&kiro_payload)
-        .map_err(|e| AppError::Json(e))?;
+    let payload_bytes = match serde_json::to_vec(&kiro_payload) {
+        Ok(b) => b,
+        Err(e) => {
+            if is_account_managed {
+                if let Some(ref mgr) = state.kiro_account_manager {
+                    mgr.lock().await.release_inflight();
+                }
+            }
+            return Err(AppError::Json(e));
+        }
+    };
 
     let request_headers = build_kiro_headers(&token, &amz_user_agent, &user_agent_str);
 
@@ -1210,6 +1325,11 @@ async fn handle_kiro_messages(
             Err(_) => {
                 request_guard.complete();
                 state.inc_failed_requests();
+                if is_account_managed {
+                    if let Some(ref mgr) = state.kiro_account_manager {
+                        mgr.lock().await.release_inflight();
+                    }
+                }
                 return Err(AppError::TooManyRequests);
             }
         }
@@ -1241,7 +1361,7 @@ async fn handle_kiro_messages(
     });
     let kiro_client = build_kiro_client(proxy_url.as_deref());
 
-    let upstream_resp = kiro_request_with_retry(
+    let upstream_resp = match kiro_request_with_retry(
         &kiro_client,
         &url,
         &payload_bytes,
@@ -1250,7 +1370,27 @@ async fn handle_kiro_messages(
         &request_id,
         timeout,
     )
-    .await?;
+    .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            if is_account_managed {
+                if let Some(ref mgr) = state.kiro_account_manager {
+                    mgr.lock().await.release_inflight();
+                }
+            }
+            return Err(e);
+        }
+    };
+
+    // Release inflight tracking after request completes
+    if is_account_managed {
+        if let Some(ref mgr) = state.kiro_account_manager {
+            mgr.lock().await.release_inflight_with_latency(
+                upstream_start.elapsed().as_millis() as f64,
+            );
+        }
+    }
 
     let status = upstream_resp.status();
     let upstream_headers_ms = elapsed_ms(upstream_start);
@@ -1265,7 +1405,7 @@ async fn handle_kiro_messages(
             == crate::convert::kiro::account::ErrorClass::Recoverable
         {
             if let Some(ref mgr) = state.kiro_account_manager {
-                mgr.lock().await.record_failure();
+                mgr.lock().await.record_failure(crate::convert::kiro::account::ErrorClass::Recoverable);
             }
         }
     }
@@ -1527,8 +1667,17 @@ async fn handle_kiro_chat_completions(
         (token, auth.amz_user_agent(), auth.user_agent(), false)
     } else if let Some(ref account_mgr) = state.kiro_account_manager {
         let mut mgr = account_mgr.lock().await;
-        let (_id, auth_arc) = mgr.get_available_account(&[])
-            .ok_or_else(|| AppError::Request("所有 Kiro 账户不可用".to_string()))?;
+        let (_id, auth_arc) = match mgr.get_available_account(&[]) {
+            Some(pair) => pair,
+            None => {
+                if mgr.self_heal() {
+                    mgr.get_available_account(&[])
+                        .ok_or_else(|| AppError::Request("所有 Kiro 账户不可用 (已尝试自愈)".to_string()))?
+                } else {
+                    return Err(AppError::Request("所有 Kiro 账户不可用".to_string()));
+                }
+            }
+        };
         let mut auth = auth_arc.lock().await;
         let token = auth.get_valid_token().await?;
         (token, auth.amz_user_agent(), auth.user_agent(), true)
@@ -1552,8 +1701,17 @@ async fn handle_kiro_chat_completions(
         region
     );
 
-    let payload_bytes = serde_json::to_vec(&kiro_payload)
-        .map_err(|e| AppError::Json(e))?;
+    let payload_bytes = match serde_json::to_vec(&kiro_payload) {
+        Ok(b) => b,
+        Err(e) => {
+            if is_account_managed {
+                if let Some(ref mgr) = state.kiro_account_manager {
+                    mgr.lock().await.release_inflight();
+                }
+            }
+            return Err(AppError::Json(e));
+        }
+    };
 
     let request_headers = build_kiro_headers(&token, &amz_user_agent, &user_agent_str);
 
@@ -1563,6 +1721,11 @@ async fn handle_kiro_chat_completions(
             Ok(permit) => Some(permit),
             Err(_) => {
                 state.inc_failed_requests();
+                if is_account_managed {
+                    if let Some(ref mgr) = state.kiro_account_manager {
+                        mgr.lock().await.release_inflight();
+                    }
+                }
                 return Err(AppError::TooManyRequests);
             }
         }
@@ -1592,7 +1755,7 @@ async fn handle_kiro_chat_completions(
     });
     let kiro_client = build_kiro_client(proxy_url.as_deref());
 
-    let upstream_resp = kiro_request_with_retry(
+    let upstream_resp = match kiro_request_with_retry(
         &kiro_client,
         &url,
         &payload_bytes,
@@ -1601,7 +1764,27 @@ async fn handle_kiro_chat_completions(
         &request_id,
         timeout,
     )
-    .await?;
+    .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            if is_account_managed {
+                if let Some(ref mgr) = state.kiro_account_manager {
+                    mgr.lock().await.release_inflight();
+                }
+            }
+            return Err(e);
+        }
+    };
+
+    // Release inflight tracking after request completes
+    if is_account_managed {
+        if let Some(ref mgr) = state.kiro_account_manager {
+            mgr.lock().await.release_inflight_with_latency(
+                upstream_start.elapsed().as_millis() as f64,
+            );
+        }
+    }
 
     let status = upstream_resp.status();
     let upstream_headers_ms = elapsed_ms(upstream_start);
@@ -1616,7 +1799,7 @@ async fn handle_kiro_chat_completions(
             == crate::convert::kiro::account::ErrorClass::Recoverable
         {
             if let Some(ref mgr) = state.kiro_account_manager {
-                mgr.lock().await.record_failure();
+                mgr.lock().await.record_failure(crate::convert::kiro::account::ErrorClass::Recoverable);
             }
         }
     }
@@ -2081,8 +2264,17 @@ pub async fn proxy_responses(
         (token, auth.amz_user_agent(), auth.user_agent(), false)
     } else if let Some(ref account_mgr) = state.kiro_account_manager {
         let mut mgr = account_mgr.lock().await;
-        let (_id, auth_arc) = mgr.get_available_account(&[])
-            .ok_or_else(|| AppError::Request("所有 Kiro 账户不可用".to_string()))?;
+        let (_id, auth_arc) = match mgr.get_available_account(&[]) {
+            Some(pair) => pair,
+            None => {
+                if mgr.self_heal() {
+                    mgr.get_available_account(&[])
+                        .ok_or_else(|| AppError::Request("所有 Kiro 账户不可用 (已尝试自愈)".to_string()))?
+                } else {
+                    return Err(AppError::Request("所有 Kiro 账户不可用".to_string()));
+                }
+            }
+        };
         let mut auth = auth_arc.lock().await;
         let token = auth.get_valid_token().await?;
         (token, auth.amz_user_agent(), auth.user_agent(), true)
@@ -2096,15 +2288,39 @@ pub async fn proxy_responses(
         (token, auth.amz_user_agent(), auth.user_agent(), false)
     };
 
+    // Track inflight request for account manager
+    if is_account_managed {
+        if let Some(ref mgr) = state.kiro_account_manager {
+            mgr.lock().await.increment_inflight();
+        }
+    }
+
     let region = kiro_config.api_region.as_deref().unwrap_or(&kiro_config.region);
     let url = format!("https://runtime.{}.kiro.dev/generateAssistantResponse", region);
-    let payload_bytes = serde_json::to_vec(&kiro_payload).map_err(|e| AppError::Json(e))?;
+    let payload_bytes = match serde_json::to_vec(&kiro_payload) {
+        Ok(b) => b,
+        Err(e) => {
+            if is_account_managed {
+                if let Some(ref mgr) = state.kiro_account_manager {
+                    mgr.lock().await.release_inflight();
+                }
+            }
+            return Err(AppError::Json(e));
+        }
+    };
     let request_headers = build_kiro_headers(&token, &amz_user_agent, &user_agent_str);
 
     let _permit = if let Some(ref sem) = state.concurrency_semaphore {
         match sem.try_acquire() {
             Ok(permit) => Some(permit),
-            Err(_) => return Err(AppError::TooManyRequests),
+            Err(_) => {
+                if is_account_managed {
+                    if let Some(ref mgr) = state.kiro_account_manager {
+                        mgr.lock().await.release_inflight();
+                    }
+                }
+                return Err(AppError::TooManyRequests);
+            }
         }
     } else {
         None
@@ -2122,7 +2338,8 @@ pub async fn proxy_responses(
     });
     let kiro_client = build_kiro_client(proxy_url.as_deref());
 
-    let upstream_resp = kiro_request_with_retry(
+    let upstream_start = Instant::now();
+    let upstream_resp = match kiro_request_with_retry(
         &kiro_client,
         &url,
         &payload_bytes,
@@ -2131,7 +2348,27 @@ pub async fn proxy_responses(
         "responses",
         timeout,
     )
-    .await?;
+    .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            if is_account_managed {
+                if let Some(ref mgr) = state.kiro_account_manager {
+                    mgr.lock().await.release_inflight();
+                }
+            }
+            return Err(e);
+        }
+    };
+
+    // Release inflight tracking after request completes
+    if is_account_managed {
+        if let Some(ref mgr) = state.kiro_account_manager {
+            mgr.lock().await.release_inflight_with_latency(
+                upstream_start.elapsed().as_millis() as f64,
+            );
+        }
+    }
 
     // Record success/failure for circuit breaker (account-managed mode)
     if is_account_managed {
@@ -2143,7 +2380,7 @@ pub async fn proxy_responses(
             == crate::convert::kiro::account::ErrorClass::Recoverable
         {
             if let Some(ref mgr) = state.kiro_account_manager {
-                mgr.lock().await.record_failure();
+                mgr.lock().await.record_failure(crate::convert::kiro::account::ErrorClass::Recoverable);
             }
         }
     }

@@ -11,6 +11,8 @@ use tracing::info;
 use crate::config::{Config, ConfigError, KiroConfig, ModelRoute, ProviderConfig, ProviderFormat};
 use crate::logging::LogCollector;
 use crate::provider_registry::ProviderRegistry;
+use crate::server::ip_filter::IpFilter;
+use crate::server::site_guard::SiteGuardConfig;
 use crate::RequestCounters;
 
 pub(crate) const ANTHROPIC_BILLING_HEADER_PREFIX: &str = "x-anthropic-billing-header:";
@@ -114,6 +116,12 @@ pub struct AppState {
     pub rate_limiter: Option<Arc<tokio::sync::Mutex<crate::convert::kiro::rate_limiter::RateLimiter>>>,
     /// Cached /v1/models response (Instant = last update time, Value = JSON response).
     pub model_cache: Option<Arc<tokio::sync::Mutex<(Instant, serde_json::Value)>>>,
+    /// IP blacklist and request-rate tracker.
+    pub ip_filter: IpFilter,
+    /// SiteGuard config: maintenance mode and self-use mode toggles.
+    pub site_guard: SiteGuardConfig,
+    /// Prometheus-style metrics collector.
+    pub metrics: Option<Arc<crate::server::metrics::Metrics>>,
 }
 
 /// Collect Kiro accounts from config and initialize auth managers.
@@ -211,6 +219,7 @@ fn collect_kiro_accounts(kiro_config: &KiroConfig, provider_name: &str) -> Vec<(
                     web_search_enabled: kiro_config.web_search_enabled,
                     accounts: None,
                     load_balancing_mode: None,
+                    agentic_prompt_injection: kiro_config.agentic_prompt_injection,
                 };
                 (id, cfg)
             })
@@ -277,6 +286,9 @@ impl AppState {
                 crate::convert::kiro::rate_limiter::RateLimiter::new(0, 0, 0),
             ))),
             model_cache: None,
+            ip_filter: IpFilter::new(),
+            site_guard: SiteGuardConfig::default(),
+            metrics: Some(Arc::new(crate::server::metrics::Metrics::new())),
         }
     }
 
@@ -328,6 +340,9 @@ impl AppState {
                 crate::convert::kiro::rate_limiter::RateLimiter::new(0, 0, 0),
             ))),
             model_cache: None,
+            ip_filter: IpFilter::new(),
+            site_guard: SiteGuardConfig::default(),
+            metrics: Some(Arc::new(crate::server::metrics::Metrics::new())),
         }
     }
 

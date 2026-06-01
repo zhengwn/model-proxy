@@ -12,6 +12,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 use subtle::ConstantTimeEq;
 use tracing::warn;
 
@@ -19,6 +20,7 @@ use super::state::AppState;
 use crate::convert::kiro::account::LoadBalancingMode;
 use crate::convert::kiro::auth::KiroAuthManager;
 use crate::config::KiroConfig;
+use crate::server::site_guard::SiteGuardConfig;
 
 // ---- Response types ----
 
@@ -111,6 +113,27 @@ pub struct SetPriorityRequest {
 #[derive(Deserialize)]
 pub struct SetConfigRequest {
     pub load_balancing_mode: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct IpActionRequest {
+    pub ip: IpAddr,
+}
+
+#[derive(Deserialize)]
+pub struct ToggleRequest {
+    pub enabled: bool,
+}
+
+#[derive(Serialize)]
+struct SiteStatusResponse {
+    maintenance_mode: bool,
+    self_use_mode: bool,
+}
+
+#[derive(Serialize)]
+struct IpListResponse {
+    banned: Vec<String>,
 }
 
 // ---- Helper ----
@@ -253,6 +276,7 @@ pub async fn admin_add_credential(
         web_search_enabled: None,
         accounts: None,
         load_balancing_mode: None,
+        agentic_prompt_injection: None,
     };
 
     let id = {
@@ -558,6 +582,93 @@ pub async fn admin_set_config(
     }
 }
 
+// ---- IP Admin Handlers ----
+
+pub async fn admin_ip_ban(
+    State(state): State<AppState>,
+    Json(req): Json<IpActionRequest>,
+) -> Response {
+    let already_banned = state.ip_filter.is_banned(req.ip);
+    state.ip_filter.ban_ip(req.ip);
+
+    if already_banned {
+        admin_success(format!("IP {} was already banned", req.ip)).into_response()
+    } else {
+        (
+            StatusCode::CREATED,
+            Json(AdminSuccess {
+                success: true,
+                message: format!("IP {} banned", req.ip),
+            }),
+        )
+            .into_response()
+    }
+}
+
+pub async fn admin_ip_unban(
+    State(state): State<AppState>,
+    Json(req): Json<IpActionRequest>,
+) -> Response {
+    if !state.ip_filter.is_banned(req.ip) {
+        return admin_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            format!("IP {} is not banned", req.ip),
+        );
+    }
+
+    state.ip_filter.unban_ip(req.ip);
+    admin_success(format!("IP {} unbanned", req.ip)).into_response()
+}
+
+pub async fn admin_ip_list(
+    State(state): State<AppState>,
+) -> Json<IpListResponse> {
+    let banned = state
+        .ip_filter
+        .list_banned()
+        .into_iter()
+        .map(|ip| ip.to_string())
+        .collect();
+
+    Json(IpListResponse { banned })
+}
+
+// ---- Site Guard Admin Handlers ----
+
+pub async fn admin_toggle_maintenance(
+    State(state): State<AppState>,
+    Json(req): Json<ToggleRequest>,
+) -> Response {
+    state.site_guard.set_maintenance(req.enabled);
+    admin_success(format!(
+        "Maintenance mode {}",
+        if req.enabled { "enabled" } else { "disabled" }
+    ))
+    .into_response()
+}
+
+pub async fn admin_toggle_self_use(
+    State(state): State<AppState>,
+    Json(req): Json<ToggleRequest>,
+) -> Response {
+    state.site_guard.set_self_use(req.enabled);
+    admin_success(format!(
+        "Self-use mode {}",
+        if req.enabled { "enabled" } else { "disabled" }
+    ))
+    .into_response()
+}
+
+pub async fn admin_get_site_status(
+    State(state): State<AppState>,
+) -> Json<SiteStatusResponse> {
+    Json(SiteStatusResponse {
+        maintenance_mode: state.site_guard.is_maintenance(),
+        self_use_mode: state.site_guard.is_self_use(),
+    })
+}
+
 /// Build the admin API router.
 pub fn admin_router(state: AppState) -> Router<AppState> {
     Router::new()
@@ -592,5 +703,29 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
         .route(
             "/api/admin/config",
             get(admin_get_config).put(admin_set_config),
+        )
+        .route(
+            "/api/admin/ip/ban",
+            post(admin_ip_ban),
+        )
+        .route(
+            "/api/admin/ip/unban",
+            post(admin_ip_unban),
+        )
+        .route(
+            "/api/admin/ip/list",
+            get(admin_ip_list),
+        )
+        .route(
+            "/api/admin/site/maintenance",
+            post(admin_toggle_maintenance),
+        )
+        .route(
+            "/api/admin/site/self-use",
+            post(admin_toggle_self_use),
+        )
+        .route(
+            "/api/admin/site/status",
+            get(admin_get_site_status),
         )
 }

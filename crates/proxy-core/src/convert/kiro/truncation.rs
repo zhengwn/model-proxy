@@ -29,6 +29,40 @@ impl TruncationReason {
 }
 
 /// Check if a tool call JSON is truncated (has unclosed braces/brackets).
+/// Also checks for content length exceeded in upstream error bodies.
+pub fn is_content_length_exceeded(body: &str) -> bool {
+    body.contains("CONTENT_LENGTH_EXCEEDS")
+}
+
+/// Progressive truncation tiers for CONTENT_LENGTH_EXCEEDS errors.
+/// Each value represents the fraction of history to KEEP.
+pub const TRUNCATION_TIERS: [f64; 3] = [0.5, 0.25, 0.0];
+
+/// Truncate the history in a Kiro payload by the given fraction.
+/// fraction=0.5 means keep the newest 50% of history entries.
+pub fn truncate_kiro_payload_history(payload: &mut Value, keep_fraction: f64) {
+    if let Some(history) = payload
+        .pointer_mut("/conversationState/history")
+        .and_then(|v| v.as_array_mut())
+    {
+        let original_len = history.len();
+        let target_len = ((original_len as f64) * keep_fraction) as usize;
+        let target_len = target_len.max(2).min(original_len);
+
+        if original_len > target_len {
+            let to_remove = original_len - target_len;
+            history.drain(..to_remove);
+            warn!(
+                original = original_len,
+                kept = history.len(),
+                fraction = keep_fraction,
+                "Kiro payload history 渐进式截断"
+            );
+        }
+    }
+}
+
+/// Check if a tool call JSON is truncated (has unclosed braces/brackets).
 pub fn is_json_truncated(json_str: &str) -> bool {
     let mut brace_depth: i32 = 0;
     let mut bracket_depth: i32 = 0;

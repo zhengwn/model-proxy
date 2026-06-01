@@ -282,9 +282,12 @@ pub struct KiroConfig {
     /// 多账户凭据池配置（当 accounts 非空时启用多账户模式）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accounts: Option<Vec<KiroAccountEntry>>,
-    /// 负载均衡模式: "priority"（按优先级）| "balanced"（轮询），默认 "priority"
+    /// 负载均衡模式: "priority"（按优先级）| "balanced"（轮询）| "smart"（智能评分），默认 "priority"
     #[serde(default)]
     pub load_balancing_mode: Option<String>,
+    /// 是否注入 Agentic System Prompt（文件操作限制 + 时间戳），默认 false
+    #[serde(default)]
+    pub agentic_prompt_injection: Option<bool>,
 }
 
 impl ProviderConfig {

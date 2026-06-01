@@ -62,6 +62,8 @@ struct AccountCircuitBreaker {
     total_requests: u64,
     successful_requests: u64,
     failed_requests: u64,
+    /// Classification of the last error (for self-healing decisions).
+    last_error_class: Option<ErrorClass>,
 }
 
 impl AccountCircuitBreaker {
@@ -73,6 +75,7 @@ impl AccountCircuitBreaker {
             total_requests: 0,
             successful_requests: 0,
             failed_requests: 0,
+            last_error_class: None,
         }
     }
 
@@ -111,11 +114,12 @@ impl AccountCircuitBreaker {
     }
 
     /// Record a failed request (recoverable error).
-    fn record_failure(&mut self) {
+    fn record_failure(&mut self, error_class: ErrorClass) {
         self.total_requests += 1;
         self.failed_requests += 1;
         self.failures += 1;
         self.last_failure = Some(Instant::now());
+        self.last_error_class = Some(error_class);
         self.state = CircuitState::Broken;
     }
 }
@@ -131,6 +135,14 @@ struct ManagedAccount {
     priority: u32,
     /// Whether this account is manually disabled
     disabled: bool,
+    /// Number of currently inflight requests
+    inflight_count: u32,
+    /// Exponential moving average of response latency (ms)
+    latency_ema: f64,
+    /// Timestamp of last successful request
+    last_success_at: Option<Instant>,
+    /// Total recent requests for load balancing scoring
+    recent_requests: u64,
 }
 
 /// Load balancing mode for account selection.
@@ -140,12 +152,15 @@ pub enum LoadBalancingMode {
     Priority,
     /// Round-robin across available accounts
     Balanced,
+    /// Composite scoring: health + inflight + usage balance + idle time + latency + expiry
+    Smart,
 }
 
 impl LoadBalancingMode {
     pub fn from_str(s: &str) -> Self {
         match s {
             "balanced" => Self::Balanced,
+            "smart" => Self::Smart,
             _ => Self::Priority,
         }
     }
@@ -154,6 +169,7 @@ impl LoadBalancingMode {
         match self {
             Self::Priority => "priority",
             Self::Balanced => "balanced",
+            Self::Smart => "smart",
         }
     }
 }
@@ -210,6 +226,10 @@ impl AccountManager {
                     proxy_url: config.proxy_url.clone(),
                     priority: 0,
                     disabled: false,
+                    inflight_count: 0,
+                    latency_ema: 0.0,
+                    last_success_at: None,
+                    recent_requests: 0,
                 }
             })
             .collect();
@@ -250,6 +270,7 @@ impl AccountManager {
         match self.load_balancing_mode {
             LoadBalancingMode::Priority => self.get_available_priority(exclude),
             LoadBalancingMode::Balanced => self.get_available_balanced(exclude),
+            LoadBalancingMode::Smart => self.get_available_smart(exclude),
         }
     }
 
@@ -333,6 +354,137 @@ impl AccountManager {
         }
     }
 
+    /// Smart load balancing: composite scoring with jitter.
+    fn get_available_smart(
+        &mut self,
+        exclude: &[String],
+    ) -> Option<(&str, &Arc<Mutex<KiroAuthManager>>)> {
+        // Collect available accounts with scores
+        let avg_recent = {
+            let total: u64 = self.accounts.iter().map(|a| a.recent_requests).sum();
+            let count = self.accounts.len().max(1) as f64;
+            total as f64 / count
+        };
+
+        let mut candidates: Vec<(usize, f64)> = Vec::new();
+        for (i, account) in self.accounts.iter().enumerate() {
+            if account.disabled || exclude.contains(&account.id) {
+                continue;
+            }
+            if !account.circuit.is_available() {
+                // Probabilistic retry for broken accounts
+                if account.circuit.state == CircuitState::Broken && self.should_probabilistic_retry(i) {
+                    let score = Self::compute_account_score(account, avg_recent);
+                    candidates.push((i, score));
+                }
+                continue;
+            }
+            let score = Self::compute_account_score(account, avg_recent);
+            candidates.push((i, score));
+        }
+
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // Sort by score descending (higher = better)
+        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let best_score = candidates[0].1;
+        let threshold = (best_score.abs() * 0.15).max(5.0);
+
+        // Select randomly from top candidates within threshold
+        let top_candidates: Vec<usize> = candidates
+            .iter()
+            .filter(|(_, score)| (best_score - score).abs() <= threshold)
+            .map(|(idx, _)| *idx)
+            .collect();
+
+        let selected_idx = if top_candidates.is_empty() {
+            candidates[0].0
+        } else {
+            let pick = rand_index(top_candidates.len());
+            top_candidates[pick]
+        };
+
+        self.current_index = selected_idx;
+        let account = &self.accounts[selected_idx];
+        Some((account.id.as_str(), &account.auth))
+    }
+
+    /// Compute composite score for smart load balancing. Higher = better.
+    fn compute_account_score(account: &ManagedAccount, avg_recent: f64) -> f64 {
+        let health = 100.0 - (account.circuit.failures as f64 * 10.0).min(100.0);
+        let inflight_penalty = -(account.inflight_count as f64 * 30.0);
+        let usage_balance = if avg_recent > 0.0 {
+            let ratio = account.recent_requests as f64 / avg_recent;
+            (-40.0f64).max(40.0 * (1.0 - ratio))
+        } else if account.recent_requests == 0 {
+            40.0
+        } else {
+            0.0
+        };
+        let zero_use_bonus = if account.recent_requests == 0 { 30.0 } else { 0.0 };
+        let idle_bonus = account
+            .last_success_at
+            .map(|t| {
+                let idle_secs = t.elapsed().as_secs_f64();
+                if idle_secs > 30.0 {
+                    (idle_secs / 60.0 * 5.0).min(20.0)
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or(0.0);
+        let latency_bonus = if account.latency_ema > 0.0 && account.latency_ema < 5000.0 {
+            10.0
+        } else {
+            0.0
+        };
+
+        health + inflight_penalty + usage_balance + zero_use_bonus + idle_bonus + latency_bonus
+    }
+
+    /// Increment inflight count for the current account.
+    pub fn increment_inflight(&mut self) {
+        if let Some(account) = self.accounts.get_mut(self.current_index) {
+            account.inflight_count += 1;
+            account.recent_requests += 1;
+        }
+    }
+
+    /// Decrement inflight count for the current account.
+    pub fn release_inflight(&mut self) {
+        if let Some(account) = self.accounts.get_mut(self.current_index) {
+            account.inflight_count = account.inflight_count.saturating_sub(1);
+        }
+    }
+
+    /// Record response latency with exponential moving average (alpha=0.3).
+    pub fn record_response_latency(&mut self, latency_ms: f64) {
+        if let Some(account) = self.accounts.get_mut(self.current_index) {
+            if account.latency_ema == 0.0 {
+                account.latency_ema = latency_ms;
+            } else {
+                account.latency_ema = account.latency_ema * 0.7 + latency_ms * 0.3;
+            }
+        }
+    }
+
+    /// Release inflight count and record response latency in one call.
+    pub fn release_inflight_with_latency(&mut self, latency_ms: f64) {
+        self.release_inflight();
+        self.record_response_latency(latency_ms);
+    }
+
+    /// Record a successful request (also updates last_success_at).
+    pub fn record_success(&mut self) {
+        if let Some(account) = self.accounts.get_mut(self.current_index) {
+            account.circuit.record_success();
+            account.last_success_at = Some(Instant::now());
+        }
+    }
+
     /// Check if a broken account should be probabilistically retried.
     fn should_probabilistic_retry(&self, idx: usize) -> bool {
         let account = &self.accounts[idx];
@@ -356,25 +508,68 @@ impl AccountManager {
         }
     }
 
-    /// Record a successful request for the current account.
-    pub fn record_success(&mut self) {
-        if let Some(account) = self.accounts.get_mut(self.current_index) {
-            account.circuit.record_success();
-        }
-    }
-
     /// Record a failed request for the current account.
-    pub fn record_failure(&mut self) {
+    pub fn record_failure(&mut self, error_class: ErrorClass) {
         if let Some(account) = self.accounts.get_mut(self.current_index) {
             let id = account.id.clone();
-            account.circuit.record_failure();
+            account.circuit.record_failure(error_class.clone());
             warn!(
                 account_id = id.as_str(),
                 failures = account.circuit.failures,
                 backoff_secs = account.circuit.recovery_timeout().as_secs(),
+                error_class = ?error_class,
                 "账户 circuit breaker 触发"
             );
         }
+    }
+
+    /// Self-healing: when ALL non-disabled accounts are unavailable,
+    /// halve error counts for accounts with recoverable errors,
+    /// clear cooldowns, and move them to HalfOpen state.
+    /// Returns true if any account was healed.
+    pub fn self_heal(&mut self) -> bool {
+        // Only trigger when all accounts are unavailable
+        let all_unavailable = self.accounts.iter().all(|a| {
+            a.disabled || !a.circuit.is_available()
+        });
+        if !all_unavailable {
+            return false;
+        }
+
+        let mut healed = false;
+        for account in &mut self.accounts {
+            if account.disabled {
+                continue;
+            }
+            // Only heal accounts with recoverable errors, not fatal/quota
+            if account.circuit.state != CircuitState::Broken {
+                continue;
+            }
+            match &account.circuit.last_error_class {
+                Some(ErrorClass::Recoverable) | None => {
+                    // Heal: halve error count, clear cooldown, move to HalfOpen
+                    let old_failures = account.circuit.failures;
+                    account.circuit.failures = account.circuit.failures / 2;
+                    if account.circuit.failures == 0 {
+                        account.circuit.state = CircuitState::Active;
+                    } else {
+                        account.circuit.state = CircuitState::HalfOpen;
+                    }
+                    account.circuit.last_failure = None;
+                    healed = true;
+                    info!(
+                        account_id = account.id.as_str(),
+                        old_failures,
+                        new_failures = account.circuit.failures,
+                        "自愈: 账户错误计数减半"
+                    );
+                }
+                Some(ErrorClass::Fatal) => {
+                    // Don't heal fatal errors (e.g., quota exhausted)
+                }
+            }
+        }
+        healed
     }
 
     /// Check if we only have a single account (skip circuit breaker).
@@ -435,6 +630,10 @@ impl AccountManager {
             proxy_url: config.proxy_url.clone(),
             priority,
             disabled: false,
+            inflight_count: 0,
+            latency_ema: 0.0,
+            last_success_at: None,
+            recent_requests: 0,
         });
         // Re-sort by priority
         self.accounts.sort_by_key(|a| a.priority);
@@ -548,6 +747,18 @@ fn rand_chance() -> f64 {
     (nanos % 1000) as f64 / 1000.0
 }
 
+/// Simple pseudo-random index in range [0, n).
+fn rand_index(n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    (nanos as usize) % n
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -570,21 +781,21 @@ mod tests {
         let mut cb = AccountCircuitBreaker::new();
         assert_eq!(cb.recovery_timeout(), Duration::from_secs(60));
 
-        cb.record_failure();
+        cb.record_failure(ErrorClass::Recoverable);
         assert_eq!(cb.recovery_timeout(), Duration::from_secs(60));
 
-        cb.record_failure();
+        cb.record_failure(ErrorClass::Recoverable);
         assert_eq!(cb.recovery_timeout(), Duration::from_secs(120));
 
-        cb.record_failure();
+        cb.record_failure(ErrorClass::Recoverable);
         assert_eq!(cb.recovery_timeout(), Duration::from_secs(240));
     }
 
     #[test]
     fn circuit_breaker_reset_on_success() {
         let mut cb = AccountCircuitBreaker::new();
-        cb.record_failure();
-        cb.record_failure();
+        cb.record_failure(ErrorClass::Recoverable);
+        cb.record_failure(ErrorClass::Recoverable);
         assert_eq!(cb.failures, 2);
 
         cb.record_success();
@@ -609,5 +820,98 @@ mod tests {
     fn load_balancing_mode_as_str() {
         assert_eq!(LoadBalancingMode::Priority.as_str(), "priority");
         assert_eq!(LoadBalancingMode::Balanced.as_str(), "balanced");
+    }
+
+    #[test]
+    fn self_heal_recovers_recoverable_errors() {
+        let configs = vec![
+            ("acc1".to_string(), make_test_config()),
+            ("acc2".to_string(), make_test_config()),
+        ];
+        let client = reqwest::Client::new();
+        let mut mgr = AccountManager::new(&configs, client);
+
+        // Break both accounts with recoverable errors
+        mgr.current_index = 0;
+        mgr.record_failure(ErrorClass::Recoverable);
+        mgr.record_failure(ErrorClass::Recoverable);
+        mgr.record_failure(ErrorClass::Recoverable);
+        mgr.current_index = 1;
+        mgr.record_failure(ErrorClass::Recoverable);
+        mgr.record_failure(ErrorClass::Recoverable);
+
+        // Both should be unavailable now
+        assert!(mgr.get_available_account(&[]).is_none());
+
+        // Self-heal should recover them
+        assert!(mgr.self_heal());
+
+        // After healing, accounts should be available (failures halved, moved to HalfOpen)
+        assert!(mgr.get_available_account(&[]).is_some());
+    }
+
+    #[test]
+    fn self_heal_ignores_fatal_errors() {
+        let configs = vec![
+            ("acc1".to_string(), make_test_config()),
+        ];
+        let client = reqwest::Client::new();
+        let mut mgr = AccountManager::new(&configs, client);
+
+        // Break account with fatal error
+        mgr.current_index = 0;
+        mgr.record_failure(ErrorClass::Fatal);
+
+        // Should be unavailable
+        assert!(mgr.get_available_account(&[]).is_none());
+
+        // Self-heal should NOT recover fatal errors
+        assert!(!mgr.self_heal());
+        assert!(mgr.get_available_account(&[]).is_none());
+    }
+
+    #[test]
+    fn smart_load_balancing_selects_account() {
+        let configs = vec![
+            ("acc1".to_string(), make_test_config()),
+            ("acc2".to_string(), make_test_config()),
+        ];
+        let client = reqwest::Client::new();
+        let mut mgr = AccountManager::new_with_mode(
+            &configs,
+            client,
+            LoadBalancingMode::Smart,
+        );
+
+        // Both accounts are fresh - smart mode should select one
+        let result = mgr.get_available_account(&[]);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn smart_mode_from_str() {
+        assert_eq!(LoadBalancingMode::from_str("smart"), LoadBalancingMode::Smart);
+        assert_eq!(LoadBalancingMode::Smart.as_str(), "smart");
+    }
+
+    fn make_test_config() -> KiroConfig {
+        KiroConfig {
+            auth_method: "social".to_string(),
+            refresh_token: Some("test".to_string()),
+            client_id: None,
+            client_secret: None,
+            profile_arn: None,
+            region: "us-east-1".to_string(),
+            api_region: None,
+            model_aliases: None,
+            hidden_models: None,
+            kiro_version: None,
+            proxy_url: None,
+            thinking_mode: None,
+            web_search_enabled: None,
+            accounts: None,
+            load_balancing_mode: None,
+            agentic_prompt_injection: None,
+        }
     }
 }

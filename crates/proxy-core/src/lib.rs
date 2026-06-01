@@ -20,6 +20,9 @@ use tracing::info;
 
 use crate::config::Config;
 use crate::server::{event_logging_batch, proxy_chat_completions, proxy_count_tokens, proxy_flows, proxy_kiro_login_poll, proxy_kiro_login_start, proxy_kiro_social_exchange, proxy_kiro_social_start, proxy_messages, proxy_models, proxy_responses, proxy_status, proxy_usage};
+use crate::server::ip_filter::ip_filter_middleware;
+use crate::server::site_guard::site_guard_middleware;
+use axum::middleware;
 
 pub use tokio_util::sync::CancellationToken as ServerCancellationToken;
 
@@ -47,6 +50,22 @@ impl Default for RequestCounters {
 
 async fn health() -> Json<serde_json::Value> {
     Json(json!({"status": "ok"}))
+}
+
+async fn metrics_handler(
+    axum::extract::State(state): axum::extract::State<crate::AppState>,
+) -> axum::response::Response {
+    let body = match &state.metrics {
+        Some(m) => m.render(),
+        None => "# No metrics configured\n".to_string(),
+    };
+    axum::response::Response::builder()
+        .status(200)
+        .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|_| {
+            axum::response::Response::new(axum::body::Body::empty())
+        })
 }
 
 /// Start the proxy server with the given config and cancellation token.
@@ -82,6 +101,7 @@ fn start_server_with_state(state: AppState, port: u16, token: CancellationToken)
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics_handler))
         .route("/v1/messages", post(proxy_messages))
         .route("/v1/messages/count_tokens", post(proxy_count_tokens))
         .route("/v1/chat/completions", post(proxy_chat_completions))
@@ -96,6 +116,16 @@ fn start_server_with_state(state: AppState, port: u16, token: CancellationToken)
         .route("/api/kiro/social/exchange", post(proxy_kiro_social_exchange))
         .route("/api/event_logging/batch", post(event_logging_batch))
         .merge(admin_routes)
+        // IP filter middleware (rejects banned IPs, records request counts)
+        .layer(middleware::from_fn_with_state(
+            state.ip_filter.clone(),
+            ip_filter_middleware,
+        ))
+        // Site guard middleware (maintenance mode, self-use mode)
+        .layer(middleware::from_fn_with_state(
+            state.site_guard.clone(),
+            site_guard_middleware,
+        ))
         .layer(CorsLayer::permissive())
         .with_state(state);
 

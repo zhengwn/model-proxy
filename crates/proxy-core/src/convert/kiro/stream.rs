@@ -12,9 +12,11 @@ use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::eventstream::{Event, EventStreamDecoder};
 use super::model_map::context_window_size;
@@ -55,6 +57,15 @@ fn sse_content_block_stop(index: usize) -> String {
         ),
     )
 }
+
+// ---- SSE keep-alive constants ----
+
+/// Interval between keep-alive pings when the stream is idle.
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(25);
+/// Overall stream timeout when no real data arrives (upstream stall).
+const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Raw bytes sent as an SSE keep-alive comment (ignored by compliant parsers).
+const KEEP_ALIVE_BYTES: &[u8] = b": keepalive\n\n";
 
 // ---- Stream conversion state ----
 
@@ -474,9 +485,34 @@ pub async fn handle_stream_anthropic_output(
     );
 
     let byte_stream = upstream_resp.bytes_stream();
-    let (tx, rx) = mpsc::channel::<std::result::Result<Bytes, AppError>>(128);
     let model = model.to_string();
     let thinking_mode_owned: Option<String> = thinking_mode.map(|s| s.to_string());
+
+    // Create channel outside spawn so rx is available for the response body
+    let (tx, rx) = mpsc::channel::<std::result::Result<Bytes, AppError>>(128);
+    let keepalive_tx = tx.clone();
+    let stream_base = Instant::now();
+    let last_data_sent = Arc::new(AtomicU64::new(0));
+
+    // Spawn keep-alive task
+    let last_ds = last_data_sent.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(KEEP_ALIVE_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let elapsed_since_last = Duration::from_secs(
+                stream_base.elapsed().as_secs() - last_ds.load(Ordering::Relaxed),
+            );
+            if elapsed_since_last >= KEEP_ALIVE_TIMEOUT {
+                debug!("SSE keep-alive: stream timed out after {:?} of inactivity", elapsed_since_last);
+                break;
+            }
+            if keepalive_tx.send(Ok(Bytes::from_static(KEEP_ALIVE_BYTES))).await.is_err() {
+                break;
+            }
+        }
+    });
 
     tokio::spawn(async move {
         let stream_start = Instant::now();
@@ -521,87 +557,95 @@ pub async fn handle_stream_anthropic_output(
         };
 
         let mut stream = byte_stream;
-        const STREAMING_CHUNK_TIMEOUT: Duration = Duration::from_secs(300);
-        const FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(15);
         let mut first_chunk = true;
 
         loop {
-            let timeout_duration = if first_chunk { FIRST_TOKEN_TIMEOUT } else { STREAMING_CHUNK_TIMEOUT };
-            let next_result = tokio::time::timeout(timeout_duration, stream.next()).await;
-            let result = match next_result {
-                Ok(Some(result)) => result,
-                Ok(None) => break,
-                Err(_) => {
-                    let reason = if first_chunk { "first_token_timeout" } else { "chunk_timeout" };
-                    warn!("Kiro 流式超时: {}", reason);
-                    log_stream_end(reason, &state, upstream_chunks, emitted_events);
-                    return;
-                }
+            let timeout_duration = if first_chunk {
+                Duration::from_secs(15) // first-token timeout
+            } else {
+                KEEP_ALIVE_TIMEOUT // overall stream stall timeout
             };
-            first_chunk = false;
+            let keepalive_timer = tokio::time::sleep(timeout_duration);
+            tokio::pin!(keepalive_timer);
 
-            match result {
-                Ok(bytes) => {
-                    if let Err(e) = decoder.feed(&bytes) {
-                        error!(error = %e, "EventStream feed 错误");
-                        let _ = tx.send(Err(AppError::Request(e.to_string()))).await;
-                        log_stream_end("upstream_error", &state, upstream_chunks, emitted_events);
-                        return;
-                    }
+            tokio::select! {
+                biased;
+                result = stream.next() => {
+                    match result {
+                        Some(Ok(bytes)) => {
+                            // Real data received — reset keep-alive tracking
+                            last_data_sent.store(stream_base.elapsed().as_secs(), Ordering::Relaxed);
+                            first_chunk = false;
 
-                    // Decode all available frames
-                    loop {
-                        match decoder.decode() {
-                            Ok(Some(frame)) => {
-                                upstream_chunks += 1;
-                                match Event::from_frame(&frame) {
-                                    Ok(event) => {
-                                        let sse_events = process_event(
-                                            &event,
-                                            &model,
-                                            &mut state,
-                                            &tool_name_map,
-                                        );
-                                        for evt in sse_events {
-                                            match tx.send(Ok(Bytes::from(evt))).await {
-                                                Ok(_) => emitted_events += 1,
-                                                Err(_) => {
-                                                    log_stream_end("client_disconnected", &state, upstream_chunks, emitted_events);
-                                                    return;
+                            if let Err(e) = decoder.feed(&bytes) {
+                                error!(error = %e, "EventStream feed 错误");
+                                let _ = tx.send(Err(AppError::Request(e.to_string()))).await;
+                                log_stream_end("upstream_error", &state, upstream_chunks, emitted_events);
+                                return;
+                            }
+
+                            // Decode all available frames
+                            loop {
+                                match decoder.decode() {
+                                    Ok(Some(frame)) => {
+                                        upstream_chunks += 1;
+                                        match Event::from_frame(&frame) {
+                                            Ok(event) => {
+                                                let sse_events = process_event(
+                                                    &event,
+                                                    &model,
+                                                    &mut state,
+                                                    &tool_name_map,
+                                                );
+                                                for evt in sse_events {
+                                                    match tx.send(Ok(Bytes::from(evt))).await {
+                                                        Ok(_) => emitted_events += 1,
+                                                        Err(_) => {
+                                                            log_stream_end("client_disconnected", &state, upstream_chunks, emitted_events);
+                                                            return;
+                                                        }
+                                                    }
+                                                    if state.ended {
+                                                        has_emitted_message_delta = true;
+                                                    }
                                                 }
                                             }
-                                            if state.ended {
-                                                has_emitted_message_delta = true;
+                                            Err(e) => {
+                                                warn!(error = %e, "Event 解析错误，跳过");
                                             }
                                         }
                                     }
+                                    Ok(None) => break, // need more data
                                     Err(e) => {
-                                        warn!(error = %e, "Event 解析错误，跳过");
+                                        if decoder.is_stopped() {
+                                            error!(error = %e, "EventStream 解码器已停止");
+                                            let _ = tx.send(Err(AppError::Request(e.to_string()))).await;
+                                            log_stream_end("upstream_error", &state, upstream_chunks, emitted_events);
+                                            return;
+                                        }
+                                        // Recoverable error, continue
+                                        break;
                                     }
                                 }
                             }
-                            Ok(None) => break, // need more data
-                            Err(e) => {
-                                if decoder.is_stopped() {
-                                    error!(error = %e, "EventStream 解码器已停止");
-                                    let _ = tx.send(Err(AppError::Request(e.to_string()))).await;
-                                    log_stream_end("upstream_error", &state, upstream_chunks, emitted_events);
-                                    return;
-                                }
-                                // Recoverable error, continue
-                                break;
-                            }
                         }
+                        Some(Err(e)) => {
+                            error!(
+                                request_id = request_id.as_str(),
+                                error = %e,
+                                "Kiro 流式读取错误"
+                            );
+                            let _ = tx.send(Err(AppError::Http(e))).await;
+                            log_stream_end("upstream_error", &state, upstream_chunks, emitted_events);
+                            return;
+                        }
+                        None => break, // upstream EOF
                     }
                 }
-                Err(e) => {
-                    error!(
-                        request_id = request_id.as_str(),
-                        error = %e,
-                        "Kiro 流式读取错误"
-                    );
-                    let _ = tx.send(Err(AppError::Http(e))).await;
-                    log_stream_end("upstream_error", &state, upstream_chunks, emitted_events);
+                _ = &mut keepalive_timer => {
+                    let reason = if first_chunk { "first_token_timeout" } else { "stream_timeout" };
+                    warn!("Kiro 流式超时: {}", reason);
+                    log_stream_end(reason, &state, upstream_chunks, emitted_events);
                     return;
                 }
             }
@@ -967,8 +1011,33 @@ pub async fn handle_stream_openai_output(
     );
 
     let byte_stream = upstream_resp.bytes_stream();
-    let (tx, rx) = mpsc::channel::<std::result::Result<Bytes, AppError>>(128);
     let model = model.to_string();
+
+    // Create channel outside spawn so rx is available for the response body
+    let (tx, rx) = mpsc::channel::<std::result::Result<Bytes, AppError>>(128);
+    let keepalive_tx = tx.clone();
+    let stream_base = Instant::now();
+    let last_data_sent = Arc::new(AtomicU64::new(0));
+
+    // Spawn keep-alive task
+    let last_ds = last_data_sent.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(KEEP_ALIVE_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let elapsed_since_last = Duration::from_secs(
+                stream_base.elapsed().as_secs() - last_ds.load(Ordering::Relaxed),
+            );
+            if elapsed_since_last >= KEEP_ALIVE_TIMEOUT {
+                debug!("SSE keep-alive: stream timed out after {:?} of inactivity", elapsed_since_last);
+                break;
+            }
+            if keepalive_tx.send(Ok(Bytes::from_static(KEEP_ALIVE_BYTES))).await.is_err() {
+                break;
+            }
+        }
+    });
 
     tokio::spawn(async move {
         let stream_start = Instant::now();
@@ -1005,78 +1074,86 @@ pub async fn handle_stream_openai_output(
         };
 
         let mut stream = byte_stream;
-        const STREAMING_CHUNK_TIMEOUT: Duration = Duration::from_secs(300);
-        const FIRST_TOKEN_TIMEOUT: Duration = Duration::from_secs(15);
         let mut first_chunk = true;
 
         loop {
-            let timeout_duration = if first_chunk { FIRST_TOKEN_TIMEOUT } else { STREAMING_CHUNK_TIMEOUT };
-            let next_result = tokio::time::timeout(timeout_duration, stream.next()).await;
-            let result = match next_result {
-                Ok(Some(result)) => result,
-                Ok(None) => break,
-                Err(_) => {
-                    let reason = if first_chunk { "first_token_timeout" } else { "chunk_timeout" };
-                    warn!("Kiro 流式超时: {}", reason);
-                    log_stream_end(reason, &state, upstream_chunks, emitted_events);
-                    return;
-                }
+            let timeout_duration = if first_chunk {
+                Duration::from_secs(15) // first-token timeout
+            } else {
+                KEEP_ALIVE_TIMEOUT // overall stream stall timeout
             };
-            first_chunk = false;
+            let keepalive_timer = tokio::time::sleep(timeout_duration);
+            tokio::pin!(keepalive_timer);
 
-            match result {
-                Ok(bytes) => {
-                    if let Err(e) = decoder.feed(&bytes) {
-                        error!(error = %e, "EventStream feed 错误");
-                        let _ = tx.send(Err(AppError::Request(e.to_string()))).await;
-                        log_stream_end("upstream_error", &state, upstream_chunks, emitted_events);
-                        return;
-                    }
+            tokio::select! {
+                biased;
+                result = stream.next() => {
+                    match result {
+                        Some(Ok(bytes)) => {
+                            // Real data received — reset keep-alive tracking
+                            last_data_sent.store(stream_base.elapsed().as_secs(), Ordering::Relaxed);
+                            first_chunk = false;
 
-                    loop {
-                        match decoder.decode() {
-                            Ok(Some(frame)) => {
-                                upstream_chunks += 1;
-                                match Event::from_frame(&frame) {
-                                    Ok(event) => {
-                                        let sse_events = process_event_openai(
-                                            &event,
-                                            &model,
-                                            &mut state,
-                                            &tool_name_map,
-                                        );
-                                        for evt in sse_events {
-                                            match tx.send(Ok(Bytes::from(evt))).await {
-                                                Ok(_) => emitted_events += 1,
-                                                Err(_) => {
-                                                    log_stream_end("client_disconnected", &state, upstream_chunks, emitted_events);
-                                                    return;
+                            if let Err(e) = decoder.feed(&bytes) {
+                                error!(error = %e, "EventStream feed 错误");
+                                let _ = tx.send(Err(AppError::Request(e.to_string()))).await;
+                                log_stream_end("upstream_error", &state, upstream_chunks, emitted_events);
+                                return;
+                            }
+
+                            loop {
+                                match decoder.decode() {
+                                    Ok(Some(frame)) => {
+                                        upstream_chunks += 1;
+                                        match Event::from_frame(&frame) {
+                                            Ok(event) => {
+                                                let sse_events = process_event_openai(
+                                                    &event,
+                                                    &model,
+                                                    &mut state,
+                                                    &tool_name_map,
+                                                );
+                                                for evt in sse_events {
+                                                    match tx.send(Ok(Bytes::from(evt))).await {
+                                                        Ok(_) => emitted_events += 1,
+                                                        Err(_) => {
+                                                            log_stream_end("client_disconnected", &state, upstream_chunks, emitted_events);
+                                                            return;
+                                                        }
+                                                    }
                                                 }
+                                            }
+                                            Err(e) => {
+                                                warn!(error = %e, "Event 解析错误，跳过");
                                             }
                                         }
                                     }
+                                    Ok(None) => break,
                                     Err(e) => {
-                                        warn!(error = %e, "Event 解析错误，跳过");
+                                        if decoder.is_stopped() {
+                                            error!(error = %e, "EventStream 解码器已停止");
+                                            let _ = tx.send(Err(AppError::Request(e.to_string()))).await;
+                                            log_stream_end("upstream_error", &state, upstream_chunks, emitted_events);
+                                            return;
+                                        }
+                                        break;
                                     }
                                 }
                             }
-                            Ok(None) => break,
-                            Err(e) => {
-                                if decoder.is_stopped() {
-                                    error!(error = %e, "EventStream 解码器已停止");
-                                    let _ = tx.send(Err(AppError::Request(e.to_string()))).await;
-                                    log_stream_end("upstream_error", &state, upstream_chunks, emitted_events);
-                                    return;
-                                }
-                                break;
-                            }
                         }
+                        Some(Err(e)) => {
+                            error!(request_id = request_id.as_str(), error = %e, "Kiro 流式读取错误");
+                            let _ = tx.send(Err(AppError::Http(e))).await;
+                            log_stream_end("upstream_error", &state, upstream_chunks, emitted_events);
+                            return;
+                        }
+                        None => break, // upstream EOF
                     }
                 }
-                Err(e) => {
-                    error!(request_id = request_id.as_str(), error = %e, "Kiro 流式读取错误");
-                    let _ = tx.send(Err(AppError::Http(e))).await;
-                    log_stream_end("upstream_error", &state, upstream_chunks, emitted_events);
+                _ = &mut keepalive_timer => {
+                    let reason = if first_chunk { "first_token_timeout" } else { "stream_timeout" };
+                    warn!("Kiro 流式超时: {}", reason);
+                    log_stream_end(reason, &state, upstream_chunks, emitted_events);
                     return;
                 }
             }
