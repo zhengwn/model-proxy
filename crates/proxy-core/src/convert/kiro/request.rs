@@ -15,7 +15,7 @@ use crate::error::{AppError, Result};
 // ---- Constants ----
 
 /// Maximum tool name length in Kiro API (characters, not bytes)
-const TOOL_NAME_MAX_LEN: usize = 64;
+const TOOL_NAME_MAX_LEN: usize = 63;
 
 /// Maximum tool description length
 const TOOL_DESC_MAX_LEN: usize = 10_000;
@@ -138,12 +138,53 @@ pub fn anthropic_to_kiro(
     // 7. Process messages
     let messages = body_for_cache.get("messages").or_else(|| body.get("messages")).and_then(|v| v.as_array());
     let has_tools = kiro_tools.as_array().map(|a| !a.is_empty()).unwrap_or(false);
+    // Build reverse name map: original_name → shortened_name (for history tool_use fixup)
+    let reverse_name_map: HashMap<String, String> = tool_name_map
+        .iter()
+        .map(|(short, orig)| (orig.clone(), short.clone()))
+        .collect();
     let (mut history, current_content, current_images, current_tool_results) =
-        process_messages(messages, &full_system_text, thinking_ref, &kiro_model, has_tools);
+        process_messages(messages, &full_system_text, thinking_ref, &kiro_model, has_tools, &reverse_name_map);
 
     // 7b. Apply History Manager (auto-truncate long histories)
     let history_mgr = super::history::HistoryManager::new(super::history::HistoryConfig::default());
     history_mgr.process_history(&mut history);
+
+    // 7c. Add placeholder tool definitions for tools referenced in history but missing from current tools
+    if let Some(tools_arr) = kiro_tools.as_array() {
+        let current_tool_names: std::collections::HashSet<&str> = tools_arr
+            .iter()
+            .filter_map(|t| t["toolSpecification"]["name"].as_str())
+            .collect();
+        let mut missing_names = std::collections::HashSet::new();
+        for hist_msg in &history {
+            if let Some(tool_uses) = hist_msg.pointer("/assistantResponseMessage/toolUses")
+                .and_then(|v| v.as_array())
+            {
+                for tu in tool_uses {
+                    if let Some(name) = tu["name"].as_str() {
+                        if !current_tool_names.contains(name) {
+                            missing_names.insert(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if !missing_names.is_empty() {
+            if let Some(arr) = kiro_tools.as_array_mut() {
+                for name in &missing_names {
+                    arr.push(json!({
+                        "toolSpecification": {
+                            "name": name,
+                            "description": "Previously used tool",
+                            "inputSchema": {"json": {"type": "object", "properties": {}}}
+                        }
+                    }));
+                }
+                debug!("为历史消息中引用的 {} 个工具添加了 placeholder 定义", missing_names.len());
+            }
+        }
+    }
 
     // 8. Build currentMessage
     let mut user_input_message = json!({
@@ -247,6 +288,7 @@ fn process_messages(
     thinking_config: Option<&Value>,
     model: &str,
     has_tools: bool,
+    reverse_name_map: &HashMap<String, String>,
 ) -> (Vec<Value>, String, Vec<Value>, Vec<Value>) {
     let messages = match messages {
         Some(m) => m,
@@ -301,7 +343,7 @@ fn process_messages(
     let mut history = build_system_history(system_text, thinking_config, model);
 
     // Convert history messages
-    let converted_history = convert_history_messages(history_msgs);
+    let converted_history = convert_history_messages(history_msgs, reverse_name_map);
     history.extend(converted_history);
 
     // Sanitize history: enforce alternation, boundary guards, orphan repair
@@ -507,7 +549,8 @@ fn normalize_role(role: &str) -> &str {
 }
 
 /// Convert history messages, merging consecutive same-role messages.
-fn convert_history_messages(messages: &[Value]) -> Vec<Value> {
+/// `reverse_name_map` maps original tool names to shortened names (for history tool_use fixup).
+fn convert_history_messages(messages: &[Value], reverse_name_map: &HashMap<String, String>) -> Vec<Value> {
     let mut result = Vec::new();
     let mut buffered_user_content: Vec<String> = Vec::new();
     let mut buffered_user_images: Vec<Value> = Vec::new();
@@ -640,9 +683,14 @@ fn convert_history_messages(messages: &[Value]) -> Vec<Value> {
                                     .unwrap_or("");
                                 let input =
                                     block.get("input").cloned().unwrap_or(json!({}));
+                                // Apply tool name shortening to history entries for consistency
+                                let effective_name = reverse_name_map
+                                    .get(name)
+                                    .map(|s| s.as_str())
+                                    .unwrap_or(name);
                                 buffered_assistant_tool_uses.push(json!({
                                     "toolUseId": id,
-                                    "name": name,
+                                    "name": effective_name,
                                     "input": input
                                 }));
                             }
@@ -1133,7 +1181,7 @@ mod tests {
         assert_eq!(tools.len(), 1);
 
         let tool_name = tools[0]["toolSpecification"]["name"].as_str().unwrap();
-        assert_eq!(tool_name.chars().count(), 64);
+        assert_eq!(tool_name.chars().count(), 63);
         assert!(name_map.contains_key(tool_name));
     }
 

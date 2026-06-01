@@ -1,6 +1,6 @@
 use axum::{
     body::{to_bytes, Body},
-    extract::State,
+    extract::{OriginalUri, State},
     http::{header, HeaderMap},
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -166,6 +166,7 @@ fn check_auth(headers: &HeaderMap, config: &Config) -> Result<()> {
 pub async fn proxy_messages(
     State(state): State<super::state::AppState>,
     headers: HeaderMap,
+    uri: OriginalUri,
     body: Body,
 ) -> Result<Response> {
     let request_id = next_request_id();
@@ -177,6 +178,9 @@ pub async fn proxy_messages(
     if let Some(ref metrics) = state.metrics {
         metrics.connection_start();
     }
+
+    // Detect /cc/v1/messages path for buffered streaming mode
+    let is_buffered_path = uri.path().starts_with("/cc/");
 
     request_guard.set_phase("auth");
     check_auth(&headers, &state.config)?;
@@ -247,6 +251,7 @@ pub async fn proxy_messages(
             request_guard,
             request_start,
             tenant_token,
+            is_buffered_path,
         )
         .await
         {
@@ -1087,6 +1092,7 @@ struct KiroAuthInfo {
     user_agent: String,
     is_account_managed: bool,
     acct_idx: usize,
+    profile_arn: Option<String>,
 }
 
 /// Result of a successful Kiro upstream dispatch.
@@ -1116,6 +1122,7 @@ async fn acquire_kiro_auth(
             user_agent: auth.user_agent(),
             is_account_managed: false,
             acct_idx: 0,
+            profile_arn: auth.profile_arn().map(|s| s.to_string()),
         });
     }
 
@@ -1138,12 +1145,14 @@ async fn acquire_kiro_auth(
         drop(mgr);
         let mut auth = auth_arc.lock().await;
         let token = auth.get_valid_token().await?;
+        let profile_arn = auth.profile_arn().map(|s| s.to_string());
         return Ok(KiroAuthInfo {
             token,
             amz_user_agent: auth.amz_user_agent(),
             user_agent: auth.user_agent(),
             is_account_managed: true,
             acct_idx,
+            profile_arn,
         });
     }
 
@@ -1156,6 +1165,7 @@ async fn acquire_kiro_auth(
             user_agent: auth.user_agent(),
             is_account_managed: false,
             acct_idx: 0,
+            profile_arn: auth.profile_arn().map(|s| s.to_string()),
         });
     }
 
@@ -1167,6 +1177,7 @@ async fn acquire_kiro_auth(
         user_agent: auth.user_agent(),
         is_account_managed: false,
         acct_idx: 0,
+        profile_arn: auth.profile_arn().map(|s| s.to_string()),
     })
 }
 
@@ -1508,9 +1519,10 @@ async fn handle_kiro_messages(
     mut request_guard: RequestCompletionGuard,
     request_start: Instant,
     tenant_refresh_token: Option<String>,
+    buffered: bool,
 ) -> Result<Response> {
     use crate::convert::kiro::request::anthropic_to_kiro;
-    use crate::convert::kiro::stream::handle_stream_anthropic_output;
+    use crate::convert::kiro::stream::{handle_stream_anthropic_output, handle_stream_anthropic_output_buffered};
 
     let provider = state.current_provider();
     let model_routes = state.current_model_routes();
@@ -1519,12 +1531,13 @@ async fn handle_kiro_messages(
     request_guard.set_phase("kiro_convert");
 
     // Convert Anthropic request to Kiro payload
-    let (kiro_payload, tool_name_map) = anthropic_to_kiro(&body_json, &provider, global_routes)?;
+    let (mut kiro_payload, tool_name_map) = anthropic_to_kiro(&body_json, &provider, global_routes)?;
 
     let kiro_model = kiro_payload
         .pointer("/conversationState/currentMessage/userInputMessage/modelId")
         .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
+        .unwrap_or("unknown")
+        .to_string();
 
     let is_stream = body_json
         .get("stream")
@@ -1544,6 +1557,13 @@ async fn handle_kiro_messages(
         AppError::Request("Kiro provider 缺少 kiro_config 配置".to_string())
     })?;
     let auth_info = acquire_kiro_auth(&state, kiro_config, tenant_refresh_token.as_deref()).await?;
+
+    // Inject profileArn into payload if available (matches kiro.rs reference)
+    if let Some(ref arn) = auth_info.profile_arn {
+        if let Some(obj) = kiro_payload.as_object_mut() {
+            obj.insert("profileArn".to_string(), json!(arn));
+        }
+    }
 
     // Serialize payload
     request_guard.set_phase("kiro_request");
@@ -1587,38 +1607,58 @@ async fn handle_kiro_messages(
     request_guard.set_phase("kiro_response");
 
     if is_stream {
-        let response = handle_stream_anthropic_output(
-            dispatch_result.response,
-            kiro_model,
-            tool_name_map,
-            request_id.clone(),
+        let stream_log_ctx = Some(StreamLogContext {
+            collector: state.log_collector.clone(),
+            request_id: request_id.clone(),
+            method: "POST",
+            path: if buffered { "/cc/v1/messages" } else { "/v1/messages" },
+            provider: provider.name.clone(),
+            model: kiro_model.to_string(),
+            requested_model: requested_model.clone(),
             request_start,
-            Instant::now(),
-            dispatch_result.upstream_headers_ms,
-            Some(StreamLogContext {
-                collector: state.log_collector.clone(),
-                request_id: request_id.clone(),
-                method: "POST",
-                path: "/v1/messages",
-                provider: provider.name.clone(),
-                model: kiro_model.to_string(),
-                requested_model: requested_model.clone(),
+            upstream_start: Instant::now(),
+            raw_request_body: raw_request_body.clone(),
+        });
+        let first_token_timeout = std::time::Duration::from_secs(kiro_config.first_token_timeout.unwrap_or(15));
+        let streaming_read_timeout = std::time::Duration::from_secs(kiro_config.streaming_read_timeout.unwrap_or(300));
+        let thinking_mode = kiro_config.thinking_mode.as_deref();
+
+        let response = if buffered {
+            handle_stream_anthropic_output_buffered(
+                dispatch_result.response,
+                &kiro_model,
+                tool_name_map,
+                request_id.clone(),
                 request_start,
-                upstream_start: Instant::now(),
-                raw_request_body: raw_request_body.clone(),
-            }),
-            kiro_config.thinking_mode.as_deref(),
-            std::time::Duration::from_secs(kiro_config.first_token_timeout.unwrap_or(15)),
-            std::time::Duration::from_secs(kiro_config.streaming_read_timeout.unwrap_or(300)),
-        )
-        .await;
+                Instant::now(),
+                dispatch_result.upstream_headers_ms,
+                stream_log_ctx,
+                thinking_mode,
+                first_token_timeout,
+                streaming_read_timeout,
+            ).await
+        } else {
+            handle_stream_anthropic_output(
+                dispatch_result.response,
+                &kiro_model,
+                tool_name_map,
+                request_id.clone(),
+                request_start,
+                Instant::now(),
+                dispatch_result.upstream_headers_ms,
+                stream_log_ctx,
+                thinking_mode,
+                first_token_timeout,
+                streaming_read_timeout,
+            ).await
+        };
         request_guard.complete();
         response
     } else {
         // Non-streaming: collect all events and build Anthropic response
         let response = handle_kiro_non_stream(
             dispatch_result.response,
-            kiro_model,
+            &kiro_model,
             &tool_name_map,
             &request_id,
             request_start,
@@ -1791,13 +1831,14 @@ async fn handle_kiro_chat_completions(
     let anthropic_body = openai_to_anthropic(body_json, &provider, global_routes);
 
     // Step 2: Anthropic → Kiro payload
-    let (kiro_payload, tool_name_map) =
+    let (mut kiro_payload, tool_name_map) =
         anthropic_to_kiro(&anthropic_body, &provider, global_routes)?;
 
     let kiro_model = kiro_payload
         .pointer("/conversationState/currentMessage/userInputMessage/modelId")
         .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
+        .unwrap_or("unknown")
+        .to_string();
 
     info!(
         request_id = request_id.as_str(),
@@ -1811,6 +1852,13 @@ async fn handle_kiro_chat_completions(
         AppError::Request("Kiro provider 缺少 kiro_config 配置".to_string())
     })?;
     let auth_info = acquire_kiro_auth(&state, kiro_config, tenant_refresh_token.as_deref()).await?;
+
+    // Inject profileArn into payload if available
+    if let Some(ref arn) = auth_info.profile_arn {
+        if let Some(obj) = kiro_payload.as_object_mut() {
+            obj.insert("profileArn".to_string(), json!(arn));
+        }
+    }
 
     // Step 4: Serialize and dispatch
     let payload_bytes = serde_json::to_vec(&kiro_payload)?;
@@ -1843,7 +1891,7 @@ async fn handle_kiro_chat_completions(
     if is_stream {
         handle_stream_openai_output(
             dispatch_result.response,
-            kiro_model,
+            &kiro_model,
             tool_name_map,
             request_id.clone(),
             request_start,
@@ -1859,7 +1907,7 @@ async fn handle_kiro_chat_completions(
         // Non-streaming: collect events and build OpenAI response
         handle_kiro_non_stream_openai(
             dispatch_result.response,
-            kiro_model,
+            &kiro_model,
             &request_id,
             request_start,
             Instant::now(),
@@ -2272,8 +2320,15 @@ pub async fn proxy_responses(
         AppError::Request("Kiro provider 缺少 kiro_config 配置".to_string())
     })?;
 
-    let (kiro_payload, _tool_name_map) = responses_to_kiro(&body, &provider, global_routes)?;
+    let (mut kiro_payload, _tool_name_map) = responses_to_kiro(&body, &provider, global_routes)?;
     let auth_info = acquire_kiro_auth(&state, kiro_config, tenant_refresh_token.as_deref()).await?;
+
+    // Inject profileArn into payload if available
+    if let Some(ref arn) = auth_info.profile_arn {
+        if let Some(obj) = kiro_payload.as_object_mut() {
+            obj.insert("profileArn".to_string(), json!(arn));
+        }
+    }
 
     let payload_bytes = serde_json::to_vec(&kiro_payload)?;
     let is_stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
