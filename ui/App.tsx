@@ -4,6 +4,7 @@ import StatusPanel from "./components/StatusPanel";
 import { ProviderManager } from "./components/ProviderManager";
 import { ModelRoutesEditor } from "./components/ModelRoutesEditor";
 import LogViewer from "./components/LogViewer";
+import KiroPanel from "./components/KiroPanel";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 
 const { Header, Content } = Layout;
@@ -18,6 +19,11 @@ const items: TabsProps["items"] = [
     key: "providers",
     label: "Provider 管理",
     children: <ProviderManager />,
+  },
+  {
+    key: "kiro",
+    label: "Kiro 管理",
+    children: <KiroPanel />,
   },
   {
     key: "routes",

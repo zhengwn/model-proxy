@@ -90,3 +90,88 @@ export interface LoggingConfig {
   max_body_bytes: number;
   retention_days: number;
 }
+
+// ---- Kiro management types ----
+
+export interface KiroCredential {
+  id: string;
+  priority: number;
+  disabled: boolean;
+  failure_count: number;
+  is_current: boolean;
+  is_available: boolean;
+  auth_method: string;
+  total_requests: number;
+  successful_requests: number;
+  failed_requests: number;
+  proxy_url?: string;
+  region: string;
+  health_score: number;
+}
+
+export interface KiroCredentialFull {
+  id: string;
+  priority: number;
+  disabled: boolean;
+  proxy_url?: string;
+  credentials?: {
+    auth_method: string;
+    region: string;
+    api_region: string;
+  };
+  circuit: {
+    state: string;
+    failures: number;
+    health_score: number;
+    total_requests: number;
+    successful_requests: number;
+    failed_requests: number;
+  };
+  inflight_count: number;
+  latency_ema: number;
+  last_success_at?: string;
+}
+
+export interface KiroBatchResult {
+  success: boolean;
+  results: string[];
+}
+
+export interface KiroTestResult {
+  success: boolean;
+  latency_ms?: number;
+  status?: number;
+  error?: string;
+}
+
+export interface KiroEndpointHealth {
+  endpoints: {
+    endpoint: string;
+    success_count: number;
+    fail_count: number;
+    latency_ema_ms: number;
+    consecutive_errors: number;
+    success_rate: number;
+  }[];
+}
+
+export interface KiroThinkingConfig {
+  mode: string;
+}
+
+export interface KiroSettings {
+  preferred_endpoint?: string;
+  endpoint_fallback?: boolean;
+}
+
+export interface KiroSsoStartResult {
+  session_id: string;
+  authorize_url: string;
+  expires_in: number;
+}
+
+export interface KiroSsoCompleteResult {
+  success: boolean;
+  credential_id?: string;
+  error?: string;
+}

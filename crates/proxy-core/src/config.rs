@@ -306,6 +306,12 @@ pub struct KiroConfig {
     /// 健康分数每次成功恢复值，默认 10
     #[serde(default)]
     pub health_score_recovery: Option<u32>,
+    /// 首选端点: "auto" | "kiro" | "codewhisperer" | "amazonq"，默认 "auto"
+    #[serde(default)]
+    pub preferred_endpoint: Option<String>,
+    /// 429 时是否降级到其他端点，默认 true
+    #[serde(default)]
+    pub endpoint_fallback: Option<bool>,
 }
 
 impl ProviderConfig {

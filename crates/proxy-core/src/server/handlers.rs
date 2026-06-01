@@ -1078,6 +1078,314 @@ pub async fn event_logging_batch(body: String) -> Json<Value> {
     Json(json!({"status": "ok"}))
 }
 
+// ---- Kiro shared dispatch ----
+
+/// Auth info obtained from Kiro credential management.
+struct KiroAuthInfo {
+    token: String,
+    amz_user_agent: String,
+    user_agent: String,
+    is_account_managed: bool,
+    acct_idx: usize,
+}
+
+/// Result of a successful Kiro upstream dispatch.
+struct KiroDispatchResult {
+    response: reqwest::Response,
+    acct_idx: usize,
+    is_account_managed: bool,
+    upstream_headers_ms: u128,
+    endpoint_name: String,
+}
+
+/// Acquire auth info from the Kiro credential manager.
+async fn acquire_kiro_auth(
+    state: &super::state::AppState,
+    kiro_config: &crate::config::KiroConfig,
+    tenant_refresh_token: Option<&str>,
+) -> Result<KiroAuthInfo> {
+    if let Some(tenant_token) = tenant_refresh_token {
+        let mut tenant_cfg = kiro_config.clone();
+        tenant_cfg.auth_method = "social".to_string();
+        tenant_cfg.refresh_token = Some(tenant_token.to_string());
+        let mut auth = KiroAuthManager::new(&tenant_cfg, state.client.clone());
+        let token = auth.get_valid_token().await?;
+        return Ok(KiroAuthInfo {
+            token,
+            amz_user_agent: auth.amz_user_agent(),
+            user_agent: auth.user_agent(),
+            is_account_managed: false,
+            acct_idx: 0,
+        });
+    }
+
+    if let Some(ref account_mgr) = state.kiro_account_manager {
+        let mut mgr = account_mgr.lock().await;
+        let (acct_idx, _id, auth_arc_ref) = match mgr.get_available_account(&[]) {
+            Some(triple) => triple,
+            None => {
+                if mgr.self_heal() {
+                    mgr.get_available_account(&[]).ok_or_else(|| {
+                        AppError::Request("所有 Kiro 账户不可用 (已尝试自愈)".to_string())
+                    })?
+                } else {
+                    return Err(AppError::Request("所有 Kiro 账户不可用".to_string()));
+                }
+            }
+        };
+        let auth_arc = auth_arc_ref.clone();
+        let acct_idx = acct_idx;
+        drop(mgr);
+        let mut auth = auth_arc.lock().await;
+        let token = auth.get_valid_token().await?;
+        return Ok(KiroAuthInfo {
+            token,
+            amz_user_agent: auth.amz_user_agent(),
+            user_agent: auth.user_agent(),
+            is_account_managed: true,
+            acct_idx,
+        });
+    }
+
+    if let Some(ref auth_arc) = state.kiro_auth {
+        let mut auth = auth_arc.lock().await;
+        let token = auth.get_valid_token().await?;
+        return Ok(KiroAuthInfo {
+            token,
+            amz_user_agent: auth.amz_user_agent(),
+            user_agent: auth.user_agent(),
+            is_account_managed: false,
+            acct_idx: 0,
+        });
+    }
+
+    let mut auth = KiroAuthManager::new(kiro_config, state.client.clone());
+    let token = auth.get_valid_token().await?;
+    Ok(KiroAuthInfo {
+        token,
+        amz_user_agent: auth.amz_user_agent(),
+        user_agent: auth.user_agent(),
+        is_account_managed: false,
+        acct_idx: 0,
+    })
+}
+
+/// Dispatch a Kiro payload to the upstream API with multi-endpoint fallback.
+///
+/// Tries each endpoint in priority order. On 429, records failure and tries next.
+/// On 401/403/402, returns immediately (no cross-endpoint retry).
+async fn dispatch_kiro_request(
+    state: &super::state::AppState,
+    kiro_payload: &Value,
+    payload_bytes: &[u8],
+    auth_info: &KiroAuthInfo,
+    kiro_config: &crate::config::KiroConfig,
+    request_id: &str,
+    is_stream: bool,
+) -> Result<KiroDispatchResult> {
+    use crate::convert::kiro::endpoint::{
+        build_endpoint_headers, build_endpoint_url, get_sorted_endpoints, PreferredEndpoint,
+    };
+
+    let region = kiro_config
+        .api_region
+        .as_deref()
+        .unwrap_or(&kiro_config.region);
+
+    let preferred = PreferredEndpoint::from_str_opt(kiro_config.preferred_endpoint.as_deref());
+    let fallback = kiro_config.endpoint_fallback.unwrap_or(true);
+    let endpoints = get_sorted_endpoints(preferred, fallback);
+
+    // Track inflight for account manager
+    if auth_info.is_account_managed {
+        if let Some(ref mgr) = state.kiro_account_manager {
+            mgr.lock().await.increment_inflight_at(auth_info.acct_idx);
+        }
+    }
+
+    // Acquire concurrency permit
+    let _permit = if let Some(ref sem) = state.concurrency_semaphore {
+        match sem.try_acquire() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                state.inc_failed_requests();
+                if auth_info.is_account_managed {
+                    if let Some(ref mgr) = state.kiro_account_manager {
+                        mgr.lock().await.release_inflight_at(auth_info.acct_idx);
+                    }
+                }
+                return Err(AppError::TooManyRequests);
+            }
+        }
+    } else {
+        None
+    };
+
+    // Rate limiter check
+    if let Some(ref rl) = state.rate_limiter {
+        let mut limiter = rl.lock().await;
+        if let Err(wait) = limiter.check("kiro") {
+            warn!(wait_ms = wait.as_millis(), "Kiro 请求被限流，等待");
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    let timeout = if !is_stream {
+        Some(Duration::from_secs(super::state::NON_STREAM_REQUEST_TIMEOUT_SECS))
+    } else {
+        None
+    };
+
+    // Build proxy-aware client
+    let proxy_url = state.kiro_account_manager.as_ref().and_then(|m| {
+        m.try_lock()
+            .ok()
+            .and_then(|mgr| mgr.current_proxy_url().map(|s| s.to_string()))
+    });
+    let kiro_client = build_kiro_client(proxy_url.as_deref());
+
+    let mut last_error: Option<String> = None;
+
+    for endpoint in &endpoints {
+        let url = build_endpoint_url(endpoint, region);
+        let headers =
+            build_endpoint_headers(endpoint, &auth_info.token, &auth_info.amz_user_agent, &auth_info.user_agent);
+
+        let upstream_start = Instant::now();
+
+        let upstream_resp = match kiro_request_with_retry(
+            &kiro_client,
+            &url,
+            payload_bytes,
+            &headers,
+            state.kiro_auth.as_ref(),
+            request_id,
+            timeout,
+        )
+        .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                last_error = Some(e.to_string());
+                if let Some(ref tracker) = state.endpoint_health {
+                    tracker.record_failure(endpoint.name);
+                }
+                continue;
+            }
+        };
+
+        let status = upstream_resp.status();
+        let status_code = status.as_u16();
+
+        // 429: try next endpoint (unless this is the last one)
+        if status_code == 429 {
+            if let Some(ref tracker) = state.endpoint_health {
+                tracker.record_failure(endpoint.name);
+            }
+            // Also set cooldown on the account if managed
+            if auth_info.is_account_managed {
+                if let Some(ref mgr) = state.kiro_account_manager {
+                    let mut mgr = mgr.lock().await;
+                    if let Some(acct_id) = mgr.account_id_at(auth_info.acct_idx) {
+                        mgr.set_cooldown_for_account(&acct_id);
+                    }
+                }
+            }
+            warn!(
+                request_id,
+                endpoint = endpoint.name,
+                status = status_code,
+                "Kiro endpoint 返回 429，尝试下一个"
+            );
+            last_error = Some(format!("429 from {}", endpoint.name));
+            continue;
+        }
+
+        // 401/403/402: do NOT try next endpoint
+        if status_code == 401 || status_code == 403 || status_code == 402 {
+            if let Some(ref tracker) = state.endpoint_health {
+                tracker.record_failure(endpoint.name);
+            }
+        }
+
+        // Release inflight tracking
+        if auth_info.is_account_managed {
+            if let Some(ref mgr) = state.kiro_account_manager {
+                mgr.lock().await.release_inflight_with_latency_at(
+                    auth_info.acct_idx,
+                    upstream_start.elapsed().as_millis() as f64,
+                );
+            }
+        }
+
+        let upstream_headers_ms = elapsed_ms(upstream_start);
+
+        // Record success for circuit breaker
+        if status.is_success() {
+            if auth_info.is_account_managed {
+                if let Some(ref mgr) = state.kiro_account_manager {
+                    mgr.lock().await.record_success_at(auth_info.acct_idx);
+                }
+            }
+            if let Some(ref tracker) = state.endpoint_health {
+                tracker.record_success(endpoint.name, upstream_headers_ms as f64);
+            }
+        } else {
+            // Record failure for circuit breaker
+            let err_body = upstream_resp.text().await.unwrap_or_default();
+            let error_class =
+                crate::convert::kiro::account::classify_error(status_code, &err_body);
+            if auth_info.is_account_managed {
+                if let Some(ref mgr_arc) = state.kiro_account_manager {
+                    let mut mgr = mgr_arc.lock().await;
+                    match error_class {
+                        crate::convert::kiro::account::ErrorClass::Suspended => {
+                            if let Some(acct_id) = mgr.account_id_at(auth_info.acct_idx) {
+                                warn!(
+                                    account_id = acct_id.as_str(),
+                                    "账户已自动禁用 (temporarily_suspended)"
+                                );
+                                mgr.set_disabled(&acct_id, true);
+                            }
+                        }
+                        crate::convert::kiro::account::ErrorClass::Recoverable => {
+                            mgr.record_failure_at(auth_info.acct_idx, error_class.clone());
+                            if status_code == 429 {
+                                if let Some(acct_id) = mgr.account_id_at(auth_info.acct_idx) {
+                                    mgr.set_cooldown_for_account(&acct_id);
+                                }
+                            }
+                        }
+                        crate::convert::kiro::account::ErrorClass::Fatal => {}
+                    }
+                }
+            }
+            error!(
+                request_id,
+                endpoint = endpoint.name,
+                status = status_code,
+                body = err_body.as_str(),
+                "Kiro 上游返回错误"
+            );
+            // Return error response directly (not as Err) for upstream errors
+            return Err(AppError::UpstreamStatus(status_code, err_body));
+        }
+
+        return Ok(KiroDispatchResult {
+            response: upstream_resp,
+            acct_idx: auth_info.acct_idx,
+            is_account_managed: auth_info.is_account_managed,
+            upstream_headers_ms,
+            endpoint_name: endpoint.name.to_string(),
+        });
+    }
+
+    // All endpoints exhausted
+    Err(AppError::Request(
+        last_error.unwrap_or_else(|| "所有 Kiro endpoint 均不可用".to_string()),
+    ))
+}
+
 /// Build a reqwest client with optional proxy support.
 fn build_kiro_client(proxy_url: Option<&str>) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
@@ -1091,21 +1399,6 @@ fn build_kiro_client(proxy_url: Option<&str>) -> reqwest::Client {
     }
 
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
-}
-
-/// Build headers for Kiro API requests.
-fn build_kiro_headers(token: &str, amz_user_agent: &str, user_agent: &str) -> Vec<(String, String)> {
-    vec![
-        ("Content-Type".into(), "application/x-amz-json-1.0".into()),
-        ("Authorization".into(), format!("Bearer {}", token)),
-        ("x-amz-target".into(), "AmazonCodeWhispererStreamingService.GenerateAssistantResponse".into()),
-        ("x-amzn-codewhisperer-optout".into(), "true".into()),
-        ("x-amzn-kiro-agent-mode".into(), "vibe".into()),
-        ("x-amz-user-agent".into(), amz_user_agent.to_string()),
-        ("user-agent".into(), user_agent.to_string()),
-        ("amz-sdk-invocation-id".into(), uuid::Uuid::new_v4().to_string()),
-        ("amz-sdk-request".into(), "attempt=1; max=3".into()),
-    ]
 }
 
 /// Send a request to the Kiro API with retry logic.
@@ -1245,244 +1538,63 @@ async fn handle_kiro_messages(
         "Kiro 请求转换完成"
     );
 
-    // Get auth token
+    // Acquire auth
     request_guard.set_phase("kiro_auth");
     let kiro_config = provider.kiro_config.as_ref().ok_or_else(|| {
         AppError::Request("Kiro provider 缺少 kiro_config 配置".to_string())
     })?;
+    let auth_info = acquire_kiro_auth(&state, kiro_config, tenant_refresh_token.as_deref()).await?;
 
-    // Use multi-account manager if available, otherwise single auth manager
-    let (token, amz_user_agent, user_agent_str, is_account_managed, acct_idx) = if let Some(ref tenant_token) = tenant_refresh_token {
-        // Multi-tenant: create a temporary auth manager with the per-request refresh token
-        let mut tenant_cfg = kiro_config.clone();
-        tenant_cfg.auth_method = "social".to_string();
-        tenant_cfg.refresh_token = Some(tenant_token.clone());
-        let mut auth = KiroAuthManager::new(&tenant_cfg, state.client.clone());
-        let token = auth.get_valid_token().await?;
-        (token, auth.amz_user_agent(), auth.user_agent(), false, 0usize)
-    } else if let Some(ref account_mgr) = state.kiro_account_manager {
-        let mut mgr = account_mgr.lock().await;
-        let (acct_idx, _id, auth_arc_ref) = match mgr.get_available_account(&[]) {
-            Some(triple) => triple,
-            None => {
-                if mgr.self_heal() {
-                    mgr.get_available_account(&[])
-                        .ok_or_else(|| AppError::Request("所有 Kiro 账户不可用 (已尝试自愈)".to_string()))?
-                } else {
-                    return Err(AppError::Request("所有 Kiro 账户不可用".to_string()));
-                }
-            }
-        };
-        let auth_arc = auth_arc_ref.clone();
-        let acct_idx = acct_idx;
-        drop(mgr);
-        let mut auth = auth_arc.lock().await;
-        let token = auth.get_valid_token().await?;
-        (token, auth.amz_user_agent(), auth.user_agent(), true, acct_idx)
-    } else if let Some(ref auth_arc) = state.kiro_auth {
-        let mut auth = auth_arc.lock().await;
-        let token = auth.get_valid_token().await?;
-        (token, auth.amz_user_agent(), auth.user_agent(), false, 0usize)
-    } else {
-        let mut auth = KiroAuthManager::new(kiro_config, state.client.clone());
-        let token = auth.get_valid_token().await?;
-        (token, auth.amz_user_agent(), auth.user_agent(), false, 0usize)
-    };
-
-    // Track inflight request for account manager
-    if is_account_managed {
-        if let Some(ref mgr) = state.kiro_account_manager {
-            mgr.lock().await.increment_inflight_at(acct_idx);
-        }
-    }
-
-    // Build Kiro HTTP request
+    // Serialize payload
     request_guard.set_phase("kiro_request");
-    let region = kiro_config
-        .api_region
-        .as_deref()
-        .unwrap_or(&kiro_config.region);
-    let url = format!(
-        "https://runtime.{}.kiro.dev/generateAssistantResponse",
-        region
-    );
+    let payload_bytes = serde_json::to_vec(&kiro_payload)?;
 
-    let payload_bytes = match serde_json::to_vec(&kiro_payload) {
-        Ok(b) => b,
-        Err(e) => {
-            if is_account_managed {
-                if let Some(ref mgr) = state.kiro_account_manager {
-                    mgr.lock().await.release_inflight_at(acct_idx);
-                }
-            }
-            return Err(AppError::Json(e));
-        }
-    };
-
-    let request_headers = build_kiro_headers(&token, &amz_user_agent, &user_agent_str);
-
-    // Acquire concurrency permit
-    let _permit = if let Some(ref sem) = state.concurrency_semaphore {
-        match sem.try_acquire() {
-            Ok(permit) => Some(permit),
-            Err(_) => {
-                request_guard.complete();
-                state.inc_failed_requests();
-                if is_account_managed {
-                    if let Some(ref mgr) = state.kiro_account_manager {
-                        mgr.lock().await.release_inflight_at(acct_idx);
-                    }
-                }
-                return Err(AppError::TooManyRequests);
-            }
-        }
-    } else {
-        None
-    };
-
-    let upstream_start = Instant::now();
+    // Dispatch to Kiro with endpoint fallback
     request_guard.set_phase("kiro_send");
-
-    let timeout = if !is_stream {
-        Some(Duration::from_secs(super::state::NON_STREAM_REQUEST_TIMEOUT_SECS))
-    } else {
-        None
-    };
-
-    // Rate limiter check
-    if let Some(ref rl) = state.rate_limiter {
-        let mut limiter = rl.lock().await;
-        if let Err(wait) = limiter.check("kiro") {
-            warn!(wait_ms = wait.as_millis(), "Kiro 请求被限流，等待");
-            tokio::time::sleep(wait).await;
-        }
-    }
-
-    // Build proxy-aware client if account manager has proxy config
-    let proxy_url = state.kiro_account_manager.as_ref().and_then(|m| {
-        m.try_lock().ok().and_then(|mgr| mgr.current_proxy_url().map(|s| s.to_string()))
-    });
-    let kiro_client = build_kiro_client(proxy_url.as_deref());
-
-    let upstream_resp = match kiro_request_with_retry(
-        &kiro_client,
-        &url,
+    let dispatch_result = match dispatch_kiro_request(
+        &state,
+        &kiro_payload,
         &payload_bytes,
-        &request_headers,
-        state.kiro_auth.as_ref(),
+        &auth_info,
+        kiro_config,
         &request_id,
-        timeout,
+        is_stream,
     )
     .await
     {
-        Ok(resp) => resp,
-        Err(e) => {
-            if is_account_managed {
-                if let Some(ref mgr) = state.kiro_account_manager {
-                    mgr.lock().await.release_inflight_at(acct_idx);
-                }
-            }
-            return Err(e);
-        }
-    };
-
-    // Release inflight tracking after request completes
-    if is_account_managed {
-        if let Some(ref mgr) = state.kiro_account_manager {
-            mgr.lock().await.release_inflight_with_latency_at(acct_idx,
-                upstream_start.elapsed().as_millis() as f64,
-            );
-        }
-    }
-
-    let status = upstream_resp.status();
-    let upstream_headers_ms = elapsed_ms(upstream_start);
-
-    // Record success/failure for circuit breaker (account-managed mode)
-    if is_account_managed {
-        if status.is_success() {
-            if let Some(ref mgr) = state.kiro_account_manager {
-                mgr.lock().await.record_success_at(acct_idx);
-            }
-        } else {
-            // Read body first for accurate error classification
-            let err_body = upstream_resp.text().await.unwrap_or_default();
-            let error_class = crate::convert::kiro::account::classify_error(status.as_u16(), &err_body);
-            if let Some(ref mgr_arc) = state.kiro_account_manager {
-                let mut mgr = mgr_arc.lock().await;
-                match error_class {
-                    crate::convert::kiro::account::ErrorClass::Suspended => {
-                        if let Some(acct_id) = mgr.account_id_at(acct_idx) {
-                            warn!(account_id = acct_id.as_str(), "账户已自动禁用 (temporarily_suspended)");
-                            mgr.set_disabled(&acct_id, true);
-                        }
-                    }
-                    crate::convert::kiro::account::ErrorClass::Recoverable => {
-                        mgr.record_failure_at(acct_idx, error_class.clone());
-                        if status.as_u16() == 429 {
-                            if let Some(acct_id) = mgr.account_id_at(acct_idx) {
-                                mgr.set_cooldown_for_account(&acct_id);
-                            }
-                        }
-                    }
-                    crate::convert::kiro::account::ErrorClass::Fatal => {}
-                }
-            }
-            error!(
-                request_id = request_id.as_str(),
-                status = %status,
-                body = err_body.as_str(),
-                "Kiro 上游返回错误"
-            );
+        Ok(r) => r,
+        Err(AppError::UpstreamStatus(status, body)) => {
             request_guard.complete();
             return Ok((
-                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
                 Json(json!({
                     "type": "error",
                     "error": {
                         "type": "upstream_error",
-                        "message": err_body
+                        "message": body
                     }
                 })),
             )
                 .into_response());
         }
-    }
-
-    if !status.is_success() {
-        let text = upstream_resp.text().await.unwrap_or_default();
-        error!(
-            request_id = request_id.as_str(),
-            status = %status,
-            body = text.as_str(),
-            "Kiro 上游返回错误"
-        );
-        request_guard.complete();
-        return Ok((
-            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-            Json(json!({
-                "type": "error",
-                "error": {
-                    "type": "upstream_error",
-                    "message": text
-                }
-            })),
-        )
-            .into_response());
-    }
+        Err(e) => {
+            request_guard.complete();
+            return Err(e);
+        }
+    };
 
     // Handle response
     request_guard.set_phase("kiro_response");
 
     if is_stream {
         let response = handle_stream_anthropic_output(
-            upstream_resp,
+            dispatch_result.response,
             kiro_model,
             tool_name_map,
             request_id.clone(),
             request_start,
-            upstream_start,
-            upstream_headers_ms,
+            Instant::now(),
+            dispatch_result.upstream_headers_ms,
             Some(StreamLogContext {
                 collector: state.log_collector.clone(),
                 request_id: request_id.clone(),
@@ -1492,7 +1604,7 @@ async fn handle_kiro_messages(
                 model: kiro_model.to_string(),
                 requested_model: requested_model.clone(),
                 request_start,
-                upstream_start,
+                upstream_start: Instant::now(),
                 raw_request_body: raw_request_body.clone(),
             }),
             kiro_config.thinking_mode.as_deref(),
@@ -1505,13 +1617,13 @@ async fn handle_kiro_messages(
     } else {
         // Non-streaming: collect all events and build Anthropic response
         let response = handle_kiro_non_stream(
-            upstream_resp,
+            dispatch_result.response,
             kiro_model,
             &tool_name_map,
             &request_id,
             request_start,
-            upstream_start,
-            upstream_headers_ms,
+            Instant::now(),
+            dispatch_result.upstream_headers_ms,
         )
         .await;
         request_guard.complete();
@@ -1694,217 +1806,49 @@ async fn handle_kiro_chat_completions(
         "Kiro chat/completions 请求转换完成"
     );
 
-    // Step 3: Get auth token
+    // Step 3: Acquire auth
     let kiro_config = provider.kiro_config.as_ref().ok_or_else(|| {
         AppError::Request("Kiro provider 缺少 kiro_config 配置".to_string())
     })?;
+    let auth_info = acquire_kiro_auth(&state, kiro_config, tenant_refresh_token.as_deref()).await?;
 
-    let (token, amz_user_agent, user_agent_str, is_account_managed, acct_idx) = if let Some(ref tenant_token) = tenant_refresh_token {
-        let mut tenant_cfg = kiro_config.clone();
-        tenant_cfg.auth_method = "social".to_string();
-        tenant_cfg.refresh_token = Some(tenant_token.clone());
-        let mut auth = KiroAuthManager::new(&tenant_cfg, state.client.clone());
-        let token = auth.get_valid_token().await?;
-        (token, auth.amz_user_agent(), auth.user_agent(), false, 0usize)
-    } else if let Some(ref account_mgr) = state.kiro_account_manager {
-        let mut mgr = account_mgr.lock().await;
-        let (acct_idx, _id, auth_arc_ref) = match mgr.get_available_account(&[]) {
-            Some(triple) => triple,
-            None => {
-                if mgr.self_heal() {
-                    mgr.get_available_account(&[])
-                        .ok_or_else(|| AppError::Request("所有 Kiro 账户不可用 (已尝试自愈)".to_string()))?
-                } else {
-                    return Err(AppError::Request("所有 Kiro 账户不可用".to_string()));
-                }
-            }
-        };
-        let auth_arc = auth_arc_ref.clone();
-        let acct_idx = acct_idx;
-        drop(mgr);
-        let mut auth = auth_arc.lock().await;
-        let token = auth.get_valid_token().await?;
-        (token, auth.amz_user_agent(), auth.user_agent(), true, acct_idx)
-    } else if let Some(ref auth_arc) = state.kiro_auth {
-        let mut auth = auth_arc.lock().await;
-        let token = auth.get_valid_token().await?;
-        (token, auth.amz_user_agent(), auth.user_agent(), false, 0usize)
-    } else {
-        let mut auth = KiroAuthManager::new(kiro_config, state.client.clone());
-        let token = auth.get_valid_token().await?;
-        (token, auth.amz_user_agent(), auth.user_agent(), false, 0usize)
-    };
+    // Step 4: Serialize and dispatch
+    let payload_bytes = serde_json::to_vec(&kiro_payload)?;
 
-    // Step 4: Send to Kiro API
-    let region = kiro_config
-        .api_region
-        .as_deref()
-        .unwrap_or(&kiro_config.region);
-    let url = format!(
-        "https://runtime.{}.kiro.dev/generateAssistantResponse",
-        region
-    );
-
-    let payload_bytes = match serde_json::to_vec(&kiro_payload) {
-        Ok(b) => b,
-        Err(e) => {
-            if is_account_managed {
-                if let Some(ref mgr) = state.kiro_account_manager {
-                    mgr.lock().await.release_inflight_at(acct_idx);
-                }
-            }
-            return Err(AppError::Json(e));
-        }
-    };
-
-    let request_headers = build_kiro_headers(&token, &amz_user_agent, &user_agent_str);
-
-    // Acquire concurrency permit
-    let _permit = if let Some(ref sem) = state.concurrency_semaphore {
-        match sem.try_acquire() {
-            Ok(permit) => Some(permit),
-            Err(_) => {
-                state.inc_failed_requests();
-                if is_account_managed {
-                    if let Some(ref mgr) = state.kiro_account_manager {
-                        mgr.lock().await.release_inflight_at(acct_idx);
-                    }
-                }
-                return Err(AppError::TooManyRequests);
-            }
-        }
-    } else {
-        None
-    };
-
-    let timeout = if !is_stream {
-        Some(Duration::from_secs(super::state::NON_STREAM_REQUEST_TIMEOUT_SECS))
-    } else {
-        None
-    };
-
-    // Rate limiter check
-    if let Some(ref rl) = state.rate_limiter {
-        let mut limiter = rl.lock().await;
-        if let Err(wait) = limiter.check("kiro") {
-            warn!(wait_ms = wait.as_millis(), "Kiro 请求被限流，等待");
-            tokio::time::sleep(wait).await;
-        }
-    }
-
-    let upstream_start = Instant::now();
-    // Build proxy-aware client if account manager has proxy config
-    let proxy_url = state.kiro_account_manager.as_ref().and_then(|m| {
-        m.try_lock().ok().and_then(|mgr| mgr.current_proxy_url().map(|s| s.to_string()))
-    });
-    let kiro_client = build_kiro_client(proxy_url.as_deref());
-
-    let upstream_resp = match kiro_request_with_retry(
-        &kiro_client,
-        &url,
+    let dispatch_result = match dispatch_kiro_request(
+        &state,
+        &kiro_payload,
         &payload_bytes,
-        &request_headers,
-        state.kiro_auth.as_ref(),
+        &auth_info,
+        kiro_config,
         &request_id,
-        timeout,
+        is_stream,
     )
     .await
     {
-        Ok(resp) => resp,
-        Err(e) => {
-            if is_account_managed {
-                if let Some(ref mgr) = state.kiro_account_manager {
-                    mgr.lock().await.release_inflight_at(acct_idx);
-                }
-            }
-            return Err(e);
-        }
-    };
-
-    // Release inflight tracking after request completes
-    if is_account_managed {
-        if let Some(ref mgr) = state.kiro_account_manager {
-            mgr.lock().await.release_inflight_with_latency_at(acct_idx,
-                upstream_start.elapsed().as_millis() as f64,
-            );
-        }
-    }
-
-    let status = upstream_resp.status();
-    let upstream_headers_ms = elapsed_ms(upstream_start);
-
-    // Record success/failure for circuit breaker (account-managed mode)
-    if is_account_managed {
-        if status.is_success() {
-            if let Some(ref mgr) = state.kiro_account_manager {
-                mgr.lock().await.record_success_at(acct_idx);
-            }
-        } else {
-            let err_body = upstream_resp.text().await.unwrap_or_default();
-            let error_class = crate::convert::kiro::account::classify_error(status.as_u16(), &err_body);
-            if let Some(ref mgr_arc) = state.kiro_account_manager {
-                let mut mgr = mgr_arc.lock().await;
-                match error_class {
-                    crate::convert::kiro::account::ErrorClass::Suspended => {
-                        if let Some(acct_id) = mgr.account_id_at(acct_idx) {
-                            warn!(account_id = acct_id.as_str(), "账户已自动禁用 (temporarily_suspended)");
-                            mgr.set_disabled(&acct_id, true);
-                        }
-                    }
-                    crate::convert::kiro::account::ErrorClass::Recoverable => {
-                        mgr.record_failure_at(acct_idx, error_class.clone());
-                        if status.as_u16() == 429 {
-                            if let Some(acct_id) = mgr.account_id_at(acct_idx) {
-                                mgr.set_cooldown_for_account(&acct_id);
-                            }
-                        }
-                    }
-                    crate::convert::kiro::account::ErrorClass::Fatal => {}
-                }
-            }
-            error!(
-                request_id = request_id.as_str(),
-                status = %status,
-                body = err_body.as_str(),
-                "Kiro 上游返回错误"
-            );
+        Ok(r) => r,
+        Err(AppError::UpstreamStatus(status, body)) => {
             return Ok((
-                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
                 Json(json!({
-                    "error": {"message": err_body, "type": "upstream_error"}
+                    "error": {"message": body, "type": "upstream_error"}
                 })),
             )
                 .into_response());
         }
-    }
-
-    if !status.is_success() {
-        let text = upstream_resp.text().await.unwrap_or_default();
-        error!(
-            request_id = request_id.as_str(),
-            status = %status,
-            body = text.as_str(),
-            "Kiro 上游返回错误"
-        );
-        return Ok((
-            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-            Json(json!({
-                "error": {"message": text, "type": "upstream_error"}
-            })),
-        )
-            .into_response());
-    }
+        Err(e) => return Err(e),
+    };
 
     // Step 5: Convert response
     if is_stream {
         handle_stream_openai_output(
-            upstream_resp,
+            dispatch_result.response,
             kiro_model,
             tool_name_map,
             request_id.clone(),
             request_start,
-            upstream_start,
-            upstream_headers_ms,
+            Instant::now(),
+            dispatch_result.upstream_headers_ms,
             None,
             kiro_config.thinking_mode.as_deref(),
             std::time::Duration::from_secs(kiro_config.first_token_timeout.unwrap_or(15)),
@@ -1914,12 +1858,12 @@ async fn handle_kiro_chat_completions(
     } else {
         // Non-streaming: collect events and build OpenAI response
         handle_kiro_non_stream_openai(
-            upstream_resp,
+            dispatch_result.response,
             kiro_model,
             &request_id,
             request_start,
-            upstream_start,
-            upstream_headers_ms,
+            Instant::now(),
+            dispatch_result.upstream_headers_ms,
         )
         .await
     }
@@ -2309,7 +2253,6 @@ pub async fn proxy_responses(
 
     check_auth(&headers, &state.config)?;
 
-    // Extract tenant refresh token if multi-tenant auth
     let tenant_refresh_token = match check_auth_tenant(&headers, &state.config) {
         AuthResult::TenantOk { refresh_token } => Some(refresh_token),
         _ => None,
@@ -2330,182 +2273,43 @@ pub async fn proxy_responses(
     })?;
 
     let (kiro_payload, _tool_name_map) = responses_to_kiro(&body, &provider, global_routes)?;
+    let auth_info = acquire_kiro_auth(&state, kiro_config, tenant_refresh_token.as_deref()).await?;
 
-    let (token, amz_user_agent, user_agent_str, is_account_managed, acct_idx) = if let Some(ref tenant_token) = tenant_refresh_token {
-        let mut tenant_cfg = kiro_config.clone();
-        tenant_cfg.auth_method = "social".to_string();
-        tenant_cfg.refresh_token = Some(tenant_token.clone());
-        let mut auth = KiroAuthManager::new(&tenant_cfg, state.client.clone());
-        let token = auth.get_valid_token().await?;
-        (token, auth.amz_user_agent(), auth.user_agent(), false, 0usize)
-    } else if let Some(ref account_mgr) = state.kiro_account_manager {
-        let mut mgr = account_mgr.lock().await;
-        let (acct_idx, _id, auth_arc_ref) = match mgr.get_available_account(&[]) {
-            Some(triple) => triple,
-            None => {
-                if mgr.self_heal() {
-                    mgr.get_available_account(&[])
-                        .ok_or_else(|| AppError::Request("所有 Kiro 账户不可用 (已尝试自愈)".to_string()))?
-                } else {
-                    return Err(AppError::Request("所有 Kiro 账户不可用".to_string()));
-                }
-            }
-        };
-        let auth_arc = auth_arc_ref.clone();
-        let acct_idx = acct_idx;
-        drop(mgr);
-        let mut auth = auth_arc.lock().await;
-        let token = auth.get_valid_token().await?;
-        (token, auth.amz_user_agent(), auth.user_agent(), true, acct_idx)
-    } else if let Some(ref auth_arc) = state.kiro_auth {
-        let mut auth = auth_arc.lock().await;
-        let token = auth.get_valid_token().await?;
-        (token, auth.amz_user_agent(), auth.user_agent(), false, 0usize)
-    } else {
-        let mut auth = KiroAuthManager::new(kiro_config, state.client.clone());
-        let token = auth.get_valid_token().await?;
-        (token, auth.amz_user_agent(), auth.user_agent(), false, 0usize)
-    };
-
-    // Track inflight request for account manager
-    if is_account_managed {
-        if let Some(ref mgr) = state.kiro_account_manager {
-            mgr.lock().await.increment_inflight_at(acct_idx);
-        }
-    }
-
-    let region = kiro_config.api_region.as_deref().unwrap_or(&kiro_config.region);
-    let url = format!("https://runtime.{}.kiro.dev/generateAssistantResponse", region);
-    let payload_bytes = match serde_json::to_vec(&kiro_payload) {
-        Ok(b) => b,
-        Err(e) => {
-            if is_account_managed {
-                if let Some(ref mgr) = state.kiro_account_manager {
-                    mgr.lock().await.release_inflight_at(acct_idx);
-                }
-            }
-            return Err(AppError::Json(e));
-        }
-    };
-    let request_headers = build_kiro_headers(&token, &amz_user_agent, &user_agent_str);
-
-    let _permit = if let Some(ref sem) = state.concurrency_semaphore {
-        match sem.try_acquire() {
-            Ok(permit) => Some(permit),
-            Err(_) => {
-                if is_account_managed {
-                    if let Some(ref mgr) = state.kiro_account_manager {
-                        mgr.lock().await.release_inflight_at(acct_idx);
-                    }
-                }
-                return Err(AppError::TooManyRequests);
-            }
-        }
-    } else {
-        None
-    };
-
+    let payload_bytes = serde_json::to_vec(&kiro_payload)?;
     let is_stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-    let timeout = if !is_stream {
-        Some(Duration::from_secs(NON_STREAM_REQUEST_TIMEOUT_SECS))
-    } else {
-        None
-    };
 
-    let proxy_url = state.kiro_account_manager.as_ref().and_then(|m| {
-        m.try_lock().ok().and_then(|mgr| mgr.current_proxy_url().map(|s| s.to_string()))
-    });
-    let kiro_client = build_kiro_client(proxy_url.as_deref());
-
-    let upstream_start = Instant::now();
-    let upstream_resp = match kiro_request_with_retry(
-        &kiro_client,
-        &url,
+    let dispatch_result = match dispatch_kiro_request(
+        &state,
+        &kiro_payload,
         &payload_bytes,
-        &request_headers,
-        state.kiro_auth.as_ref(),
+        &auth_info,
+        kiro_config,
         "responses",
-        timeout,
+        is_stream,
     )
     .await
     {
-        Ok(resp) => resp,
-        Err(e) => {
-            if is_account_managed {
-                if let Some(ref mgr) = state.kiro_account_manager {
-                    mgr.lock().await.release_inflight_at(acct_idx);
-                }
-            }
-            return Err(e);
-        }
-    };
-
-    // Release inflight tracking after request completes
-    if is_account_managed {
-        if let Some(ref mgr) = state.kiro_account_manager {
-            mgr.lock().await.release_inflight_with_latency_at(acct_idx,
-                upstream_start.elapsed().as_millis() as f64,
-            );
-        }
-    }
-
-    // Record success/failure for circuit breaker (account-managed mode)
-    if is_account_managed {
-        if upstream_resp.status().is_success() {
-            if let Some(ref mgr) = state.kiro_account_manager {
-                mgr.lock().await.record_success_at(acct_idx);
-            }
-        } else {
-            let err_status = upstream_resp.status();
-            let err_body = upstream_resp.text().await.unwrap_or_default();
-            let error_class = crate::convert::kiro::account::classify_error(err_status.as_u16(), &err_body);
-            if let Some(ref mgr_arc) = state.kiro_account_manager {
-                let mut mgr = mgr_arc.lock().await;
-                match error_class {
-                    crate::convert::kiro::account::ErrorClass::Suspended => {
-                        if let Some(acct_id) = mgr.account_id_at(acct_idx) {
-                            warn!(account_id = acct_id.as_str(), "账户已自动禁用 (temporarily_suspended)");
-                            mgr.set_disabled(&acct_id, true);
-                        }
-                    }
-                    crate::convert::kiro::account::ErrorClass::Recoverable => {
-                        mgr.record_failure_at(acct_idx, error_class.clone());
-                        if err_status.as_u16() == 429 {
-                            if let Some(acct_id) = mgr.account_id_at(acct_idx) {
-                                mgr.set_cooldown_for_account(&acct_id);
-                            }
-                        }
-                    }
-                    crate::convert::kiro::account::ErrorClass::Fatal => {}
-                }
-            }
+        Ok(r) => r,
+        Err(AppError::UpstreamStatus(status, body)) => {
             return Ok((
-                StatusCode::from_u16(err_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-                Json(json!({"error": {"message": err_body, "type": "upstream_error"}})),
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                Json(json!({"error": {"message": body, "type": "upstream_error"}})),
             ).into_response());
         }
-    }
-
-    if !upstream_resp.status().is_success() {
-        let status = upstream_resp.status();
-        let text = upstream_resp.text().await.unwrap_or_default();
-        return Ok((
-            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-            Json(json!({"error": {"message": text, "type": "upstream_error"}})),
-        ).into_response());
-    }
+        Err(e) => return Err(e),
+    };
 
     let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("kiro");
 
     if is_stream {
         kiro_handle_stream(
-            upstream_resp,
+            dispatch_result.response,
             model,
             HashMap::new(),
             "responses".to_string(),
             Instant::now(),
             Instant::now(),
-            0,
+            dispatch_result.upstream_headers_ms,
             None,
             kiro_config.thinking_mode.as_deref(),
             std::time::Duration::from_secs(kiro_config.first_token_timeout.unwrap_or(15)),
@@ -2515,13 +2319,13 @@ pub async fn proxy_responses(
     } else {
         let tool_map = HashMap::new();
         handle_kiro_non_stream(
-            upstream_resp,
+            dispatch_result.response,
             model,
             &tool_map,
             "responses",
             Instant::now(),
             Instant::now(),
-            0,
+            dispatch_result.upstream_headers_ms,
         )
         .await
     }

@@ -75,6 +75,26 @@ pub fn run() {
             commands::get_model_routes,
             commands::save_model_routes,
             commands::test_provider,
+            // Kiro management commands
+            commands::kiro_list_credentials,
+            commands::kiro_add_credential,
+            commands::kiro_delete_credential,
+            commands::kiro_set_credential_disabled,
+            commands::kiro_batch_credentials,
+            commands::kiro_test_credential,
+            commands::kiro_get_credential_full,
+            commands::kiro_refresh_credential,
+            commands::kiro_reset_credential,
+            commands::kiro_get_endpoint_health,
+            commands::kiro_get_thinking,
+            commands::kiro_set_thinking,
+            commands::kiro_get_settings,
+            commands::kiro_set_settings,
+            commands::kiro_start_iam_sso,
+            commands::kiro_complete_iam_sso,
+            commands::kiro_import_sso_tokens,
+            commands::kiro_get_lb_config,
+            commands::kiro_set_lb_config,
         ])
         .setup(|app| {
             // Determine config path: prefer app_data_dir, fallback to exe directory

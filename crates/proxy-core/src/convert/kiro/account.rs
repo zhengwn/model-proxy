@@ -869,6 +869,69 @@ impl AccountManager {
     pub fn set_load_balancing_mode(&mut self, mode: LoadBalancingMode) {
         self.load_balancing_mode = mode;
     }
+
+    /// Get the auth manager Arc for a specific account by ID.
+    pub fn account_auth_at_id(&self, id: &str) -> Option<Arc<Mutex<KiroAuthManager>>> {
+        self.accounts
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| a.auth.clone())
+    }
+
+    /// Get the region for a specific account by ID.
+    pub fn account_region(&self, id: &str) -> Option<String> {
+        for a in &self.accounts {
+            if a.id == id {
+                let auth = a.auth.blocking_lock();
+                // Collect region into owned String before dropping guard
+                let region = auth.credentials_iter().map(|c| c.region.clone()).next();
+                return region;
+            }
+        }
+        None
+    }
+
+    /// Get a full JSON snapshot of a specific account including circuit breaker state.
+    pub fn account_full_snapshot(&self, id: &str) -> Option<serde_json::Value> {
+        for a in &self.accounts {
+            if a.id == id {
+                let cred_info = {
+                    let auth = a.auth.blocking_lock();
+                    let first = auth.credentials_iter().map(|c| {
+                        (format!("{:?}", c.auth_method), c.region.clone(), c.api_region.clone())
+                    }).next();
+                    match first {
+                        Some((am, reg, api)) => serde_json::json!({
+                            "auth_method": am,
+                            "region": reg,
+                            "api_region": api,
+                        }),
+                        None => serde_json::json!({}),
+                    }
+                };
+
+                return Some(serde_json::json!({
+                    "id": a.id,
+                    "priority": a.priority,
+                    "disabled": a.disabled,
+                    "proxy_url": a.proxy_url,
+                    "credentials": cred_info,
+                    "circuit": {
+                        "state": format!("{:?}", a.circuit.state),
+                        "failures": a.circuit.failures,
+                        "health_score": a.circuit.health_score,
+                        "total_requests": a.circuit.total_requests,
+                        "successful_requests": a.circuit.successful_requests,
+                        "failed_requests": a.circuit.failed_requests,
+                    },
+                    "inflight_count": a.inflight_count,
+                    "latency_ema": a.latency_ema,
+                    "last_success_at": a.last_success_at.map(|t| format!("{:?}", t)),
+                }));
+            }
+        }
+        None
+    }
 }
 
 /// Simple pseudo-random chance check (0.0 - 1.0).
@@ -1052,6 +1115,8 @@ mod tests {
             quota_cooldown_secs: None,
             health_score_decay: None,
             health_score_recovery: None,
+            preferred_endpoint: None,
+            endpoint_fallback: None,
         }
     }
 }

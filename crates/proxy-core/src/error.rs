@@ -19,6 +19,8 @@ pub enum AppError {
     PayloadTooLarge,
     TooManyRequests,
     UpstreamInvalidResponse(String),
+    /// Upstream returned a non-success HTTP status with a body.
+    UpstreamStatus(u16, String),
 }
 
 impl std::fmt::Display for AppError {
@@ -34,6 +36,9 @@ impl std::fmt::Display for AppError {
             AppError::TooManyRequests => write!(f, "too many concurrent requests"),
             AppError::UpstreamInvalidResponse(msg) => {
                 write!(f, "upstream invalid response: {}", msg)
+            }
+            AppError::UpstreamStatus(code, msg) => {
+                write!(f, "upstream error {}: {}", code, msg)
             }
         }
     }
@@ -97,6 +102,11 @@ impl IntoResponse for AppError {
                     StatusCode::BAD_GATEWAY,
                     format!("Upstream invalid response: {}", msg),
                 )
+            }
+            AppError::UpstreamStatus(code, msg) => {
+                error!("上游返回错误 {}: {}", code, msg);
+                let status = StatusCode::from_u16(*code).unwrap_or(StatusCode::BAD_GATEWAY);
+                (status, msg.clone())
             }
         };
 

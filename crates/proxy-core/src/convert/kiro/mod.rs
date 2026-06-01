@@ -3,6 +3,7 @@ pub mod account;
 pub mod auth;
 pub mod auth_flow;
 pub mod compression;
+pub mod endpoint;
 pub mod endpoint_health;
 pub mod eventstream;
 pub mod flow_monitor;

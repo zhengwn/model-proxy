@@ -13,6 +13,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
+use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tracing::warn;
 
@@ -285,6 +286,8 @@ pub async fn admin_add_credential(
         quota_cooldown_secs: None,
         health_score_decay: None,
         health_score_recovery: None,
+        preferred_endpoint: None,
+        endpoint_fallback: None,
     };
 
     let id = {
@@ -736,4 +739,324 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
             "/api/admin/site/status",
             get(admin_get_site_status),
         )
+        // ---- New endpoints for kiro-go alignment ----
+        .route(
+            "/api/admin/credentials/batch",
+            post(admin_batch_credentials),
+        )
+        .route(
+            "/api/admin/credentials/{id}/test",
+            post(admin_test_credential),
+        )
+        .route(
+            "/api/admin/credentials/{id}/full",
+            get(admin_get_credential_full),
+        )
+        .route(
+            "/api/admin/thinking",
+            get(admin_get_thinking).post(admin_set_thinking),
+        )
+        .route(
+            "/api/admin/settings",
+            get(admin_get_settings).post(admin_set_settings),
+        )
+        .route(
+            "/api/admin/endpoints/health",
+            get(admin_get_endpoint_health),
+        )
+}
+
+// ---- New admin handlers ----
+
+#[derive(Deserialize)]
+struct BatchCredentialRequest {
+    ids: Vec<String>,
+    action: String, // "enable" | "disable" | "refresh"
+}
+
+async fn admin_batch_credentials(
+    State(state): State<AppState>,
+    Json(req): Json<BatchCredentialRequest>,
+) -> Response {
+    let Some(ref mgr_arc) = state.kiro_account_manager else {
+        return admin_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Multi-account mode not enabled",
+        );
+    };
+
+    let mut results = Vec::new();
+
+    for id in &req.ids {
+        let result = match req.action.as_str() {
+            "enable" => {
+                let mut mgr = mgr_arc.lock().await;
+                if mgr.set_disabled(id, false) {
+                    format!("{}: enabled", id)
+                } else {
+                    format!("{}: not found", id)
+                }
+            }
+            "disable" => {
+                let mut mgr = mgr_arc.lock().await;
+                if mgr.set_disabled(id, true) {
+                    format!("{}: disabled", id)
+                } else {
+                    format!("{}: not found", id)
+                }
+            }
+            "refresh" => {
+                let mgr = mgr_arc.lock().await;
+                match mgr.force_refresh_account(id).await {
+                    Ok(_) => format!("{}: refreshed", id),
+                    Err(e) => format!("{}: refresh failed - {}", id, e),
+                }
+            }
+            other => {
+                format!("{}: unknown action '{}'", id, other)
+            }
+        };
+        results.push(result);
+    }
+
+    Json(serde_json::json!({
+        "success": true,
+        "results": results,
+    }))
+    .into_response()
+}
+
+async fn admin_test_credential(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(ref mgr_arc) = state.kiro_account_manager else {
+        return admin_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Multi-account mode not enabled",
+        );
+    };
+
+    // Get token from the specified account
+    let token = {
+        let mgr = mgr_arc.lock().await;
+        match mgr.account_auth_at_id(&id) {
+            Some(auth_arc) => {
+                let mut auth = auth_arc.lock().await;
+                match auth.get_valid_token().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        return admin_error(
+                            StatusCode::BAD_GATEWAY,
+                            "auth_error",
+                            format!("Failed to get token: {}", e),
+                        );
+                    }
+                }
+            }
+            None => {
+                return admin_error(
+                    StatusCode::NOT_FOUND,
+                    "not_found",
+                    format!("Credential '{}' not found", id),
+                );
+            }
+        }
+    };
+
+    // Send a minimal test request
+    let region = {
+        let mgr = mgr_arc.lock().await;
+        mgr.account_region(&id).unwrap_or_else(|| "us-east-1".to_string())
+    };
+    let url = format!(
+        "https://q.{}.amazonaws.com/generateAssistantResponse",
+        region
+    );
+
+    let test_payload = serde_json::json!({
+        "conversationState": {
+            "currentMessage": {
+                "userInputMessage": {
+                    "content": "say ok",
+                    "modelId": "claude-sonnet-4.5",
+                    " userInputMessageContext": {}
+                }
+            },
+            "chatTriggerType": "MANUAL"
+        }
+    });
+
+    let headers = crate::convert::kiro::endpoint::build_endpoint_headers(
+        &crate::convert::kiro::endpoint::KIRO_ENDPOINTS[0],
+        &token,
+        "aws-sdk-js/3.980.0 KiroIDE",
+        &format!("KiroIDE-{}-test", "0.11.107"),
+    );
+
+    let start = std::time::Instant::now();
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
+
+    let mut req = client.post(&url);
+    for (k, v) in &headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+
+    match req.json(&test_payload).send().await {
+        Ok(resp) => {
+            let latency = start.elapsed().as_millis() as u64;
+            let status = resp.status().as_u16();
+            if status == 200 || status == 204 {
+                Json(serde_json::json!({
+                    "success": true,
+                    "latency_ms": latency,
+                    "status": status,
+                }))
+                .into_response()
+            } else {
+                let body = resp.text().await.unwrap_or_default();
+                Json(serde_json::json!({
+                    "success": false,
+                    "latency_ms": latency,
+                    "status": status,
+                    "error": body,
+                }))
+                .into_response()
+            }
+        }
+        Err(e) => Json(serde_json::json!({
+            "success": false,
+            "error": format!("Request failed: {}", e),
+        }))
+        .into_response(),
+    }
+}
+
+async fn admin_get_credential_full(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(ref mgr_arc) = state.kiro_account_manager else {
+        return admin_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Multi-account mode not enabled",
+        );
+    };
+
+    let mgr = mgr_arc.lock().await;
+    match mgr.account_full_snapshot(&id) {
+        Some(snapshot) => Json(snapshot).into_response(),
+        None => admin_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            format!("Credential '{}' not found", id),
+        ),
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct ThinkingConfigResponse {
+    mode: String,
+}
+
+async fn admin_get_thinking(State(state): State<AppState>) -> Response {
+    let provider = state.current_provider();
+    let mode = provider
+        .kiro_config
+        .as_ref()
+        .and_then(|c| c.thinking_mode.clone())
+        .unwrap_or_else(|| "as_reasoning_content".to_string());
+
+    Json(ThinkingConfigResponse { mode }).into_response()
+}
+
+async fn admin_set_thinking(
+    State(state): State<AppState>,
+    Json(req): Json<ThinkingConfigResponse>,
+) -> Response {
+    let valid_modes = ["as_reasoning_content", "remove", "pass", "strip_tags"];
+    if !valid_modes.contains(&req.mode.as_str()) {
+        return admin_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            format!(
+                "Invalid thinking mode '{}'. Valid: {:?}",
+                req.mode, valid_modes
+            ),
+        );
+    }
+
+    // Update the active provider's kiro_config
+    let provider = state.current_provider();
+    if let Some(ref kiro_config) = provider.kiro_config {
+        let mut new_config = kiro_config.clone();
+        new_config.thinking_mode = Some(req.mode.clone());
+
+        let mut new_provider = provider.as_ref().clone();
+        new_provider.kiro_config = Some(new_config);
+
+        state.active_provider.store(Arc::new(new_provider));
+    }
+
+    admin_success(format!("Thinking mode set to '{}'", req.mode)).into_response()
+}
+
+#[derive(Serialize, Deserialize)]
+struct ProxySettingsResponse {
+    preferred_endpoint: Option<String>,
+    endpoint_fallback: Option<bool>,
+}
+
+async fn admin_get_settings(State(state): State<AppState>) -> Response {
+    let provider = state.current_provider();
+    let settings = if let Some(ref kiro_config) = provider.kiro_config {
+        ProxySettingsResponse {
+            preferred_endpoint: kiro_config.preferred_endpoint.clone(),
+            endpoint_fallback: kiro_config.endpoint_fallback,
+        }
+    } else {
+        ProxySettingsResponse {
+            preferred_endpoint: None,
+            endpoint_fallback: None,
+        }
+    };
+
+    Json(settings).into_response()
+}
+
+async fn admin_set_settings(
+    State(state): State<AppState>,
+    Json(req): Json<ProxySettingsResponse>,
+) -> Response {
+    let provider = state.current_provider();
+    if let Some(ref kiro_config) = provider.kiro_config {
+        let mut new_config = kiro_config.clone();
+        if let Some(ep) = req.preferred_endpoint {
+            new_config.preferred_endpoint = Some(ep);
+        }
+        if let Some(fb) = req.endpoint_fallback {
+            new_config.endpoint_fallback = Some(fb);
+        }
+
+        let mut new_provider = provider.as_ref().clone();
+        new_provider.kiro_config = Some(new_config);
+
+        state.active_provider.store(Arc::new(new_provider));
+    }
+
+    admin_success("Settings updated".to_string()).into_response()
+}
+
+async fn admin_get_endpoint_health(State(state): State<AppState>) -> Response {
+    if let Some(ref tracker) = state.endpoint_health {
+        Json(tracker.snapshot()).into_response()
+    } else {
+        Json(serde_json::json!({"endpoints": []})).into_response()
+    }
 }

@@ -114,6 +114,8 @@ pub struct AppState {
     pub flow_monitor: Option<Arc<tokio::sync::Mutex<crate::convert::kiro::flow_monitor::FlowMonitor>>>,
     /// Rate limiter for Kiro API requests.
     pub rate_limiter: Option<Arc<tokio::sync::Mutex<crate::convert::kiro::rate_limiter::RateLimiter>>>,
+    /// Endpoint health tracker for multi-endpoint fallback.
+    pub endpoint_health: Option<crate::convert::kiro::endpoint_health::EndpointHealthTracker>,
     /// Cached /v1/models response (Instant = last update time, Value = JSON response).
     pub model_cache: Option<Arc<tokio::sync::Mutex<(Instant, serde_json::Value)>>>,
     /// IP blacklist and request-rate tracker.
@@ -226,6 +228,8 @@ fn collect_kiro_accounts(kiro_config: &KiroConfig, provider_name: &str) -> Vec<(
                     quota_cooldown_secs: kiro_config.quota_cooldown_secs,
                     health_score_decay: kiro_config.health_score_decay,
                     health_score_recovery: kiro_config.health_score_recovery,
+                    preferred_endpoint: kiro_config.preferred_endpoint.clone(),
+                    endpoint_fallback: kiro_config.endpoint_fallback,
                 };
                 (id, cfg)
             })
@@ -291,6 +295,7 @@ impl AppState {
             rate_limiter: Some(Arc::new(tokio::sync::Mutex::new(
                 crate::convert::kiro::rate_limiter::RateLimiter::new(0, 0, 0),
             ))),
+            endpoint_health: Some(crate::convert::kiro::endpoint_health::EndpointHealthTracker::new()),
             model_cache: None,
             ip_filter: IpFilter::new(),
             site_guard: SiteGuardConfig::default(),
@@ -345,6 +350,7 @@ impl AppState {
             rate_limiter: Some(Arc::new(tokio::sync::Mutex::new(
                 crate::convert::kiro::rate_limiter::RateLimiter::new(0, 0, 0),
             ))),
+            endpoint_health: Some(crate::convert::kiro::endpoint_health::EndpointHealthTracker::new()),
             model_cache: None,
             ip_filter: IpFilter::new(),
             site_guard: SiteGuardConfig::default(),

@@ -859,6 +859,8 @@ mod tests {
             quota_cooldown_secs: None,
             health_score_decay: None,
             health_score_recovery: None,
+            preferred_endpoint: None,
+            endpoint_fallback: None,
         };
         let cred = KiroCredential::from_config(&config);
         assert_eq!(cred.auth_method, AuthMethod::Social);
