@@ -5,13 +5,14 @@
 //!
 //! Uses `tokio::net::lookup_host` for actual DNS resolution.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 const FRESH_TTL: Duration = Duration::from_secs(5 * 60);
 const STALE_TTL: Duration = Duration::from_secs(30 * 60);
+const MAX_ENTRIES: usize = 1000;
 
 #[derive(Debug, Clone)]
 struct DnsEntry {
@@ -19,16 +20,24 @@ struct DnsEntry {
     resolved_at: Instant,
 }
 
+struct DnsCacheInner {
+    entries: HashMap<String, DnsEntry>,
+    insertion_order: VecDeque<String>,
+}
+
 /// Thread-safe DNS cache.
 #[derive(Clone)]
 pub struct DnsCache {
-    inner: Arc<RwLock<HashMap<String, DnsEntry>>>,
+    inner: Arc<RwLock<DnsCacheInner>>,
 }
 
 impl DnsCache {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(HashMap::new())),
+            inner: Arc::new(RwLock::new(DnsCacheInner {
+                entries: HashMap::new(),
+                insertion_order: VecDeque::new(),
+            })),
         }
     }
 
@@ -39,8 +48,11 @@ impl DnsCache {
     pub async fn resolve(&self, host: &str) -> Option<Vec<IpAddr>> {
         // Check cache first
         {
-            let inner = self.inner.read().unwrap();
-            if let Some(entry) = inner.get(host) {
+            let inner = match self.inner.read() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(entry) = inner.entries.get(host) {
                 if entry.resolved_at.elapsed() < STALE_TTL {
                     return Some(entry.ips.clone());
                 }
@@ -54,13 +66,27 @@ impl DnsCache {
             resolved_at: Instant::now(),
         };
         {
-            let mut inner = self.inner.write().unwrap();
-            inner.insert(host.to_string(), entry);
+            let mut inner = match self.inner.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if !inner.entries.contains_key(host) {
+                inner.insertion_order.push_back(host.to_string());
+            }
+            inner.entries.insert(host.to_string(), entry);
+            // Evict oldest entries if over limit
+            while inner.entries.len() > MAX_ENTRIES {
+                if let Some(oldest_key) = inner.insertion_order.pop_front() {
+                    inner.entries.remove(&oldest_key);
+                } else {
+                    break;
+                }
+            }
         }
         Some(ips)
     }
 
-    /// Pre-warm the cache by resolving a list of hosts concurrently.
+    /// Pre-warm the cache by resolving a list of hosts.
     pub async fn prewarm(&self, hosts: &[&str]) {
         for host in hosts {
             if let Err(e) = self.resolve_and_store(host).await {
@@ -80,16 +106,33 @@ impl DnsCache {
             resolved_at: Instant::now(),
         };
         {
-            let mut inner = self.inner.write().unwrap();
-            inner.insert(host.to_string(), entry);
+            let mut inner = match self.inner.write() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if !inner.entries.contains_key(host) {
+                inner.insertion_order.push_back(host.to_string());
+            }
+            inner.entries.insert(host.to_string(), entry);
+            while inner.entries.len() > MAX_ENTRIES {
+                if let Some(oldest_key) = inner.insertion_order.pop_front() {
+                    inner.entries.remove(&oldest_key);
+                } else {
+                    break;
+                }
+            }
         }
         Ok(ips)
     }
 
     /// Check if a host has a fresh (within fresh TTL) cached entry.
     pub fn is_fresh(&self, host: &str) -> bool {
-        let inner = self.inner.read().unwrap();
+        let inner = match self.inner.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         inner
+            .entries
             .get(host)
             .map(|e| e.resolved_at.elapsed() < FRESH_TTL)
             .unwrap_or(false)
@@ -97,17 +140,26 @@ impl DnsCache {
 
     /// Get the number of cached entries.
     pub fn len(&self) -> usize {
-        self.inner.read().unwrap().len()
+        let inner = match self.inner.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        inner.entries.len()
     }
 
     /// Check if the cache is empty.
     pub fn is_empty(&self) -> bool {
-        self.inner.read().unwrap().is_empty()
+        self.len() == 0
     }
 
     /// Clear all cached entries.
     pub fn clear(&self) {
-        self.inner.write().unwrap().clear();
+        let mut inner = match self.inner.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        inner.entries.clear();
+        inner.insertion_order.clear();
     }
 }
 

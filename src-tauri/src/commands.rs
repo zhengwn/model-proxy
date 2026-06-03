@@ -16,6 +16,59 @@ use proxy_core::ProviderRegistry;
 use crate::logging::event_emitter_task;
 use crate::service::{ServiceManager, ServiceStatus};
 
+/// Validate that a URL does not point to localhost or private IP ranges (SSRF protection).
+fn validate_url_not_local(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| "Invalid URL".to_string())?;
+    let host = parsed.host_str().ok_or("URL has no host")?;
+    let host_lower = host.to_lowercase();
+
+    // Block localhost variants
+    if host_lower == "localhost"
+        || host_lower == "127.0.0.1"
+        || host_lower == "::1"
+        || host_lower == "[::1]"
+        || host_lower == "0.0.0.0"
+    {
+        return Err("Cannot test providers pointing to localhost".to_string());
+    }
+
+    // Block private IP ranges (10.x, 172.16-31.x, 192.168.x)
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                let octets = v4.octets();
+                if octets[0] == 10
+                    || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+                    || (octets[0] == 192 && octets[1] == 168)
+                    || octets[0] == 127
+                    || octets[0] == 0
+                {
+                    return Err("Cannot test providers pointing to private/local IPs".to_string());
+                }
+            }
+            std::net::IpAddr::V6(v6) => {
+                if v6.is_loopback() || v6.is_unspecified() {
+                    return Err("Cannot test providers pointing to local IPs".to_string());
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Sanitize a credential ID to prevent path injection.
+/// Only allows alphanumeric characters, hyphens, and underscores.
+fn sanitize_credential_id(id: &str) -> Result<String, String> {
+    if id.is_empty() || id.len() > 128 {
+        return Err("Invalid credential ID length".to_string());
+    }
+    if !id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+        return Err("Credential ID contains invalid characters".to_string());
+    }
+    Ok(id.to_string())
+}
+
 /// Response payload for the `get_providers` command.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProvidersInfo {
@@ -505,6 +558,7 @@ pub struct TestProviderResult {
 #[tauri::command]
 pub async fn test_provider(provider: ProviderConfig) -> Result<TestProviderResult, String> {
     validate_provider_fields(&provider)?;
+    validate_url_not_local(&provider.base_url)?;
 
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -699,7 +753,7 @@ fn persist_server_config(config_path: &PathBuf, server: ServerConfig) -> Result<
     persist_config(config_path, &config)
 }
 
-/// Persist the full config to the config file using the new format.
+/// Persist the full config to the config file atomically (write temp, then rename).
 fn persist_config(config_path: &PathBuf, config: &Config) -> Result<(), String> {
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {}", e))?;
@@ -709,7 +763,9 @@ fn persist_config(config_path: &PathBuf, config: &Config) -> Result<(), String> 
         .to_toml_string()
         .map_err(|e| format!("序列化配置失败: {}", e))?;
 
-    std::fs::write(config_path, output).map_err(|e| format!("写入配置文件失败: {}", e))?;
+    let temp_path = config_path.with_extension("toml.tmp");
+    std::fs::write(&temp_path, &output).map_err(|e| format!("写入临时配置文件失败: {}", e))?;
+    std::fs::rename(&temp_path, config_path).map_err(|e| format!("重命名配置文件失败: {}", e))?;
 
     Ok(())
 }
@@ -737,7 +793,9 @@ fn get_config_internal(path: &PathBuf) -> Result<Config, String> {
 // The proxy must be running for these commands to work.
 
 /// Build the admin API base URL and get the API key from config.
-fn admin_api_base(state: &AppState) -> Result<(String, String), String> {
+/// Acquires config_lock to ensure consistent read.
+async fn admin_api_base(state: &AppState) -> Result<(String, String), String> {
+    let _lock = state.config_lock.lock().await;
     let config = get_config_internal(&state.config_path)?;
     let port = config.server.port;
     let api_key = config.server.admin_api_key.clone().unwrap_or_default();
@@ -747,7 +805,7 @@ fn admin_api_base(state: &AppState) -> Result<(String, String), String> {
 
 /// Helper to make an authenticated GET request to the admin API.
 async fn admin_get(state: &AppState, path: &str) -> Result<serde_json::Value, String> {
-    let (base, api_key) = admin_api_base(state)?;
+    let (base, api_key) = admin_api_base(state).await?;
     let client = reqwest::Client::new();
     let mut req = client.get(format!("{}/api/admin/{}", base, path));
     if !api_key.is_empty() {
@@ -765,7 +823,7 @@ async fn admin_get(state: &AppState, path: &str) -> Result<serde_json::Value, St
 
 /// Helper to make an authenticated POST request to the admin API.
 async fn admin_post(state: &AppState, path: &str, body: serde_json::Value) -> Result<serde_json::Value, String> {
-    let (base, api_key) = admin_api_base(state)?;
+    let (base, api_key) = admin_api_base(state).await?;
     let client = reqwest::Client::new();
     let mut req = client.post(format!("{}/api/admin/{}", base, path))
         .header("Content-Type", "application/json")
@@ -810,7 +868,8 @@ pub async fn kiro_add_credential(
 /// Delete a Kiro credential.
 #[tauri::command]
 pub async fn kiro_delete_credential(state: State<'_, AppState>, id: String) -> Result<serde_json::Value, String> {
-    let (base, api_key) = admin_api_base(&state)?;
+    let id = sanitize_credential_id(&id)?;
+    let (base, api_key) = admin_api_base(&state).await?;
     let client = reqwest::Client::new();
     let mut req = client.delete(format!("{}/api/admin/credentials/{}", base, id));
     if !api_key.is_empty() {
@@ -833,6 +892,7 @@ pub async fn kiro_set_credential_disabled(
     id: String,
     disabled: bool,
 ) -> Result<serde_json::Value, String> {
+    let id = sanitize_credential_id(&id)?;
     admin_post(&state, &format!("credentials/{}/disabled", id), serde_json::json!({ "disabled": disabled })).await
 }
 
@@ -849,24 +909,28 @@ pub async fn kiro_batch_credentials(
 /// Test a Kiro credential.
 #[tauri::command]
 pub async fn kiro_test_credential(state: State<'_, AppState>, id: String) -> Result<serde_json::Value, String> {
+    let id = sanitize_credential_id(&id)?;
     admin_post(&state, &format!("credentials/{}/test", id), serde_json::json!({})).await
 }
 
 /// Get full details of a Kiro credential.
 #[tauri::command]
 pub async fn kiro_get_credential_full(state: State<'_, AppState>, id: String) -> Result<serde_json::Value, String> {
+    let id = sanitize_credential_id(&id)?;
     admin_get(&state, &format!("credentials/{}/full", id)).await
 }
 
 /// Force refresh a Kiro credential token.
 #[tauri::command]
 pub async fn kiro_refresh_credential(state: State<'_, AppState>, id: String) -> Result<serde_json::Value, String> {
+    let id = sanitize_credential_id(&id)?;
     admin_post(&state, &format!("credentials/{}/refresh", id), serde_json::json!({})).await
 }
 
 /// Reset failure count for a Kiro credential.
 #[tauri::command]
 pub async fn kiro_reset_credential(state: State<'_, AppState>, id: String) -> Result<serde_json::Value, String> {
+    let id = sanitize_credential_id(&id)?;
     admin_post(&state, &format!("credentials/{}/reset", id), serde_json::json!({})).await
 }
 

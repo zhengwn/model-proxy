@@ -11,7 +11,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use super::request::{anthropic_id_to_openai, openai_id_to_anthropic};
 use crate::server::state::elapsed_ms;
@@ -348,7 +348,7 @@ pub(crate) fn convert_stream_chunk(
     let reasoning = delta.get("reasoning_content").and_then(|v| v.as_str());
     let finish_reason = choice.get("finish_reason").and_then(|v| v.as_str());
 
-    if !state.started && delta.get("role").is_some() {
+    if !state.started && (delta.get("role").is_some() || content.is_some() || reasoning.is_some() || delta.get("tool_calls").is_some()) {
         state.started = true;
         events.push(sse_event(
             "message_start",
@@ -486,7 +486,10 @@ pub(crate) fn convert_stream_chunk(
                         .tool_block_indices
                         .get(&index)
                         .copied()
-                        .unwrap_or(index);
+                        .unwrap_or_else(|| {
+                            warn!(tool_index = index, "Tool delta fallback: no block index mapping for tool index");
+                            index
+                        });
                     events.push(sse_event(
                         "content_block_delta",
                         &json!({
@@ -1175,7 +1178,10 @@ fn parse_anthropic_sse_block(block: &str) -> Option<(String, Value)> {
         if let Some(et) = line.strip_prefix("event: ") {
             event_type = et.trim().to_string();
         } else if let Some(d) = line.strip_prefix("data: ") {
-            data_str = d.trim().to_string();
+            if !data_str.is_empty() {
+                data_str.push('\n');
+            }
+            data_str.push_str(d.trim());
         }
     }
 

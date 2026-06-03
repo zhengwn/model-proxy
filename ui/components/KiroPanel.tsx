@@ -272,7 +272,7 @@ function CredentialManager() {
         pagination={false}
         rowSelection={{
           selectedRowKeys: selectedIds,
-          onChange: (keys) => setSelectedKeys(keys as string[]),
+          onChange: (keys) => setSelectedIds(keys as string[]),
         }}
         loading={kiro.loading}
       />
@@ -303,11 +303,6 @@ function CredentialManager() {
       </Modal>
     </Card>
   );
-}
-
-// Helper for row selection
-function setSelectedKeys(_keys: string[]) {
-  // This is handled by the Table component's onChange
 }
 
 function AddCredentialModal({

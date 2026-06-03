@@ -99,16 +99,15 @@ impl RateLimiter {
     }
 
     /// Wait until a request is allowed, then proceed.
-    pub async fn acquire(&self, account_id: &str) {
-        // Simple implementation: check and sleep if needed
-        // In production, use a more sophisticated approach
+    /// Note: callers must hold the Mutex guard (SharedRateLimiter).
+    pub async fn acquire(&mut self, account_id: &str) {
         loop {
-            let result = {
-                // We need &mut self for check, but acquire takes &self
-                // This is a design limitation - callers should use Arc<Mutex<RateLimiter>>
-                // For now, this is a placeholder
-                break;
-            };
+            match self.check(account_id) {
+                Ok(_) => break,
+                Err(wait) => {
+                    tokio::time::sleep(wait).await;
+                }
+            }
         }
     }
 }

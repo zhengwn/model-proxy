@@ -41,6 +41,7 @@ pub(crate) struct RequestCompletionGuard {
     request_start: Instant,
     phase: &'static str,
     completed: bool,
+    metrics: Option<Arc<super::metrics::Metrics>>,
 }
 
 impl RequestCompletionGuard {
@@ -50,11 +51,16 @@ impl RequestCompletionGuard {
             request_start,
             phase: "received",
             completed: false,
+            metrics: None,
         }
     }
 
     pub(crate) fn set_phase(&mut self, phase: &'static str) {
         self.phase = phase;
+    }
+
+    pub(crate) fn set_metrics(&mut self, metrics: Arc<super::metrics::Metrics>) {
+        self.metrics = Some(metrics);
     }
 
     pub(crate) fn complete(&mut self) {
@@ -64,6 +70,10 @@ impl RequestCompletionGuard {
 
 impl Drop for RequestCompletionGuard {
     fn drop(&mut self) {
+        // Decrement active connections counter
+        if let Some(ref metrics) = self.metrics {
+            metrics.connection_end();
+        }
         if !self.completed {
             info!(
                 request_id = self.request_id.as_str(),

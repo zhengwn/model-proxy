@@ -67,11 +67,17 @@ pub fn is_json_truncated(json_str: &str) -> bool {
     let mut brace_depth: i32 = 0;
     let mut bracket_depth: i32 = 0;
     let mut in_string = false;
-    let mut prev_char = '\0';
+    let mut is_escaped = false;
 
     for ch in json_str.chars() {
-        if ch == '"' && prev_char != '\\' {
+        if ch == '"' && !is_escaped {
             in_string = !in_string;
+        }
+        // Track whether current char is escaped by odd number of preceding backslashes
+        if ch == '\\' {
+            is_escaped = !is_escaped;
+        } else {
+            is_escaped = false;
         }
         if !in_string {
             match ch {
@@ -82,7 +88,6 @@ pub fn is_json_truncated(json_str: &str) -> bool {
                 _ => {}
             }
         }
-        prev_char = ch;
     }
 
     brace_depth > 0 || bracket_depth > 0

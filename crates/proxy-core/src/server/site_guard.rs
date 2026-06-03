@@ -10,7 +10,6 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -93,28 +92,8 @@ pub async fn site_guard_middleware(
 
 // ---------- IP extraction ----------
 
-/// Extract client IP from `X-Forwarded-For` (first entry) or `X-Real-IP`.
-fn extract_client_ip<B>(req: &Request<B>) -> Option<IpAddr> {
-    // X-Forwarded-For: client, proxy1, proxy2 ...
-    if let Some(val) = req.headers().get("x-forwarded-for") {
-        if let Ok(s) = val.to_str() {
-            if let Some(first) = s.split(',').next() {
-                if let Ok(ip) = first.trim().parse::<IpAddr>() {
-                    return Some(ip);
-                }
-            }
-        }
-    }
-    // X-Real-IP
-    if let Some(val) = req.headers().get("x-real-ip") {
-        if let Ok(s) = val.to_str() {
-            if let Ok(ip) = s.parse::<IpAddr>() {
-                return Some(ip);
-            }
-        }
-    }
-    None
-}
+// Reuse the secure IP extraction from ip_filter (no X-Forwarded-For trust by default)
+use super::ip_filter::extract_client_ip;
 
 #[cfg(test)]
 mod tests {

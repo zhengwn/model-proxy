@@ -4,7 +4,8 @@
 //! and runtime configuration updates. Protected by `admin_api_key`.
 
 use axum::{
-    extract::{Path, State},
+    body::Body,
+    extract::{Path, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -15,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
-use tracing::warn;
+use tracing::{error, warn};
 
 use super::state::AppState;
 use crate::convert::kiro::account::LoadBalancingMode;
@@ -200,6 +201,19 @@ fn check_admin_auth(headers: &HeaderMap, state: &AppState) -> Option<Response> {
         ));
     }
     None
+}
+
+/// Axum middleware that enforces admin API key authentication on all admin routes.
+async fn admin_auth_middleware(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    if let Some(err_response) = check_admin_auth(&headers, &state) {
+        return err_response;
+    }
+    next.run(req).await
 }
 
 // ---- Handlers ----
@@ -431,11 +445,14 @@ pub async fn admin_force_refresh(
     match mgr.force_refresh_account(&id).await {
         Ok(_token) => admin_success(format!("Credential '{}' token refreshed", id))
             .into_response(),
-        Err(e) => admin_error(
-            StatusCode::BAD_GATEWAY,
-            "api_error",
-            format!("Token refresh failed: {}", e),
-        ),
+        Err(e) => {
+            error!(credential_id = %id, error = %e, "Token refresh failed");
+            admin_error(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                "Token refresh failed",
+            )
+        }
     }
 }
 
@@ -461,10 +478,11 @@ pub async fn admin_get_balance(
                 match auth.get_valid_token().await {
                     Ok(t) => t,
                     Err(e) => {
+                        error!(error = %e, "Failed to get auth token for balance query");
                         return admin_error(
                             StatusCode::BAD_GATEWAY,
                             "api_error",
-                            format!("Failed to get auth token: {}", e),
+                            "Failed to get auth token",
                         )
                     }
                 }
@@ -522,10 +540,11 @@ pub async fn admin_get_balance(
         Ok(r) => {
             let status = r.status();
             let text = r.text().await.unwrap_or_default();
+            error!(status = %status, body = %text, "Upstream balance query failed");
             admin_error(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
-                format!("Upstream error ({}): {}", status, text),
+                format!("Upstream error (HTTP {})", status),
             )
         }
         Err(e) => admin_error(
@@ -680,7 +699,7 @@ pub async fn admin_get_site_status(
     })
 }
 
-/// Build the admin API router.
+/// Build the admin API router. All routes are protected by admin API key authentication.
 pub fn admin_router(state: AppState) -> Router<AppState> {
     Router::new()
         .route(
@@ -764,6 +783,7 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
             "/api/admin/endpoints/health",
             get(admin_get_endpoint_health),
         )
+        .layer(middleware::from_fn_with_state(state, admin_auth_middleware))
 }
 
 // ---- New admin handlers ----

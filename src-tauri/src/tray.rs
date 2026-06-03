@@ -80,7 +80,12 @@ pub fn create_tray(app: &AppHandle) -> tauri::Result<()> {
                     });
                 }
                 "quit" => {
-                    app.exit(0);
+                    let app_handle = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let service = app_handle.state::<crate::service::ServiceManager>();
+                        let _ = crate::commands::stop_service(service).await;
+                        app_handle.exit(0);
+                    });
                 }
                 _ => {}
             }

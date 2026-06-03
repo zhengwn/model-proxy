@@ -213,10 +213,15 @@ fn write_back_to_sqlite(cred: &KiroCredential, new_refresh_token: &str) {
 
     // Use sqlite3 CLI to update the token in the auth_kv table.
     // The kiro-cli stores tokens as base64-encoded JSON in the 'value' column.
-    let escaped_token = new_refresh_token.replace('\'', "''");
+    // Escape for safe embedding in SQL string literal (single-quote doubling)
+    // and JSON string (backslash-escape double quotes and backslashes).
+    let escaped_token = new_refresh_token
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\'', "''");
 
     // Try to update the social token entry
-    for key_prefix in &["kirocli:social:token", "kirocli:odic:token"] {
+    for key_prefix in &["kirocli:social:token", "kirocli:oidc:token"] {
         let sql = format!(
             "UPDATE auth_kv SET value = json_set(value, '$.refreshToken', '{}') WHERE key = '{}';",
             escaped_token, key_prefix
@@ -404,7 +409,7 @@ pub fn load_from_sqlite() -> Option<(String, String)> {
     let data_str = String::from_utf8_lossy(&data);
 
     // Look for social token key
-    for key_prefix in &["kirocli:social:token", "kirocli:odic:token", "codewhisperer:odic:token"] {
+    for key_prefix in &["kirocli:social:token", "kirocli:oidc:token", "codewhisperer:oidc:token"] {
         if let Some(pos) = data_str.find(key_prefix) {
             // Try to find a JSON object nearby containing refreshToken
             let nearby = &data_str[pos..std::cmp::min(pos + 2000, data_str.len())];

@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useMemo, useRef, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type {
   KiroCredential,
@@ -12,19 +12,24 @@ import type {
 export function useKiroAdmin() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const isMounted = useRef(true);
+
+  useEffect(() => {
+    return () => { isMounted.current = false; };
+  }, []);
 
   const call = useCallback(
     async <T>(fn: () => Promise<T>): Promise<T> => {
-      setLoading(true);
-      setError(null);
+      if (isMounted.current) setLoading(true);
+      if (isMounted.current) setError(null);
       try {
         return await fn();
       } catch (e: unknown) {
         const msg = typeof e === "string" ? e : String(e);
-        setError(msg);
+        if (isMounted.current) setError(msg);
         throw e;
       } finally {
-        setLoading(false);
+        if (isMounted.current) setLoading(false);
       }
     },
     []
@@ -144,7 +149,7 @@ export function useKiroAdmin() {
     [call]
   );
 
-  return {
+  return useMemo(() => ({
     loading,
     error,
     setError,
@@ -167,5 +172,5 @@ export function useKiroAdmin() {
     importSsoTokens,
     getLbConfig,
     setLbConfig,
-  };
+  }), [loading, error, listCredentials, addCredential, deleteCredential, setDisabled, batchCredentials, testCredential, getCredentialFull, refreshCredential, resetCredential, getEndpointHealth, getThinking, setThinking, getSettings, setSettings, startIamSso, completeIamSso, importSsoTokens, getLbConfig, setLbConfig]);
 }

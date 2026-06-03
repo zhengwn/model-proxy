@@ -16,15 +16,14 @@ pub(crate) fn append_utf8_safe(buffer: &mut String, remainder: &mut Vec<u8>, byt
 }
 
 pub(crate) fn find_sse_block_end(buffer: &str) -> Option<(usize, usize)> {
-    let lf = buffer.find("\n\n").map(|pos| (pos, 2));
-    let crlf = buffer.find("\r\n\r\n").map(|pos| (pos, 4));
-
-    match (lf, crlf) {
-        (Some(lf), Some(crlf)) => Some(if lf.0 < crlf.0 { lf } else { crlf }),
-        (Some(lf), None) => Some(lf),
-        (None, Some(crlf)) => Some(crlf),
-        (None, None) => None,
+    // Prefer CRLF per SSE spec, then fall back to LF
+    if let Some(pos) = buffer.find("\r\n\r\n") {
+        return Some((pos, 4));
     }
+    if let Some(pos) = buffer.find("\n\n") {
+        return Some((pos, 2));
+    }
+    None
 }
 
 pub(crate) fn message_count(body: &Value) -> usize {

@@ -111,19 +111,11 @@ impl Default for IpFilter {
 
 /// Extract the client IP from request headers.
 ///
-/// Prefers the first entry in `X-Forwarded-For`, then falls back to `X-Real-IP`.
+/// Only trusts `X-Real-IP` header. Does NOT trust `X-Forwarded-For` by default
+/// as it can be spoofed by clients. Use `extract_client_ip_trusted` with a
+/// proxy count if behind a trusted reverse proxy.
 pub fn extract_client_ip<B>(req: &Request<B>) -> Option<IpAddr> {
-    // X-Forwarded-For: client, proxy1, proxy2 ...
-    if let Some(val) = req.headers().get("x-forwarded-for") {
-        if let Ok(s) = val.to_str() {
-            if let Some(first) = s.split(',').next() {
-                if let Ok(ip) = first.trim().parse::<IpAddr>() {
-                    return Some(ip);
-                }
-            }
-        }
-    }
-    // X-Real-IP
+    // X-Real-IP (set by trusted reverse proxies like nginx)
     if let Some(val) = req.headers().get("x-real-ip") {
         if let Ok(s) = val.to_str() {
             if let Ok(ip) = s.parse::<IpAddr>() {
@@ -131,7 +123,32 @@ pub fn extract_client_ip<B>(req: &Request<B>) -> Option<IpAddr> {
             }
         }
     }
+    // X-Forwarded-For: only trusted when behind a known proxy count
+    // For now, we do NOT trust this header to prevent IP spoofing
     None
+}
+
+/// Extract client IP with trusted proxy support.
+/// When `trusted_proxy_count > 0`, reads X-Forwarded-For from the right,
+/// skipping `trusted_proxy_count` entries (the proxies we trust).
+pub fn extract_client_ip_trusted<B>(req: &Request<B>, trusted_proxy_count: usize) -> Option<IpAddr> {
+    if trusted_proxy_count == 0 {
+        return extract_client_ip(req);
+    }
+    if let Some(val) = req.headers().get("x-forwarded-for") {
+        if let Ok(s) = val.to_str() {
+            let entries: Vec<&str> = s.split(',').map(|e| e.trim()).collect();
+            // Take the entry at position (len - 1 - trusted_proxy_count) from the right
+            if entries.len() > trusted_proxy_count {
+                let idx = entries.len() - 1 - trusted_proxy_count;
+                if let Ok(ip) = entries[idx].parse::<IpAddr>() {
+                    return Some(ip);
+                }
+            }
+        }
+    }
+    // Fallback to X-Real-IP
+    extract_client_ip(req)
 }
 
 // ---------- axum middleware ----------

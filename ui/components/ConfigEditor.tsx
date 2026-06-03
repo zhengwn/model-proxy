@@ -28,8 +28,9 @@ export function ConfigEditor() {
 
   const handleSave = async () => {
     try {
-      const values = await form.validateFields();
+      const rawValues = await form.validateFields();
       // Preserve existing providers when saving server config
+      const values = { ...rawValues };
       if (config) {
         values.providers = config.providers;
         values.active_provider = config.active_provider;

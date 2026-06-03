@@ -380,13 +380,16 @@ pub(crate) fn anthropic_to_openai(
                                     block.get("content").and_then(|v| v.as_array()).map(|arr| {
                                         let texts: Vec<String> = arr
                                             .iter()
-                                            .filter_map(|b| {
-                                                b.get("text")
-                                                    .and_then(|t| t.as_str())
-                                                    .map(|s| s.to_string())
+                                            .map(|b| {
+                                                if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
+                                                    t.to_string()
+                                                } else {
+                                                    // Serialize non-text blocks (images, etc.) as JSON
+                                                    serde_json::to_string(b).unwrap_or_default()
+                                                }
                                             })
                                             .collect();
-                                        texts.join("")
+                                        texts.join("\n")
                                     })
                                 })
                                 .unwrap_or_default();
@@ -462,11 +465,12 @@ pub(crate) fn anthropic_to_openai(
                 }
 
                 let mut msg = json!({"role": "assistant"});
-                if text_parts.is_empty() {
-                    msg["content"] = json!(null);
-                } else {
+                if !text_parts.is_empty() {
                     msg["content"] = json!(text_parts.join(""));
+                } else if tool_calls.is_empty() {
+                    msg["content"] = json!(null);
                 }
+                // When tool_calls present and no text, omit content entirely
                 if quirks.reasoning_all_or_nothing || !thinking_parts.is_empty() {
                     msg["reasoning_content"] = json!(thinking_parts.join(""));
                 }
@@ -813,8 +817,7 @@ pub(crate) fn openai_to_anthropic(
                     if !thinking.is_empty() {
                         content_blocks.push(json!({
                             "type": "thinking",
-                            "thinking": thinking,
-                            "signature": ""
+                            "thinking": thinking
                         }));
                     }
                 }

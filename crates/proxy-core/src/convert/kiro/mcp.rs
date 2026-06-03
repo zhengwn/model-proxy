@@ -109,7 +109,7 @@ fn format_search_results(results: &Value) -> String {
 
             output.push_str(&format!(
                 "<result index=\"{}\">\n<title>{}</title>\n<url>{}</url>\n<snippet>{}</snippet>\n</result>\n",
-                i + 1, title, url, snippet
+                i + 1, xml_escape(title), xml_escape(url), xml_escape(snippet)
             ));
         }
     } else if let Some(text) = results.as_str() {
@@ -119,6 +119,14 @@ fn format_search_results(results: &Value) -> String {
 
     output.push_str("</web_search>");
     output
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+     .replace('<', "&lt;")
+     .replace('>', "&gt;")
+     .replace('"', "&quot;")
+     .replace('\'', "&apos;")
 }
 
 /// Generate an Anthropic SSE response for web search results.

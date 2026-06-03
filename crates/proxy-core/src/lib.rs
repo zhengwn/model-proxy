@@ -119,6 +119,11 @@ fn start_server_with_state(state: AppState, port: u16, token: CancellationToken)
         .route("/api/kiro/social/exchange", post(proxy_kiro_social_exchange))
         .route("/api/event_logging/batch", post(event_logging_batch))
         .merge(admin_routes)
+        // Client auth middleware (skips /health, /metrics, /v1/models)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            server::client_auth_middleware,
+        ))
         // Request ID middleware (generates or forwards X-Request-ID)
         .layer(middleware::from_fn(request_id_middleware))
         // IP filter middleware (rejects banned IPs, records request counts)

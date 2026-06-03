@@ -1,8 +1,9 @@
 use axum::{
     body::{to_bytes, Body},
-    extract::{OriginalUri, State},
+    extract::{OriginalUri, Request, State},
     http::{header, HeaderMap},
     http::StatusCode,
+    middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
@@ -98,6 +99,17 @@ fn emit_log_entry(
     collector.emit(entry);
 }
 
+/// Sanitize upstream error messages before forwarding to clients.
+/// - 4xx errors: forward truncated message (client can fix their request)
+/// - 5xx errors: generic message (don't leak internal infrastructure details)
+fn sanitize_upstream_error(status: u16, body: &str) -> String {
+    if (400..500).contains(&status) {
+        truncate_for_log(body, 512)
+    } else {
+        format!("Upstream service error (HTTP {})", status)
+    }
+}
+
 /// Multi-tenant auth result.
 pub enum AuthResult {
     /// Global API key matched, or no API key configured
@@ -163,6 +175,24 @@ fn check_auth(headers: &HeaderMap, config: &Config) -> Result<()> {
     }
 }
 
+/// Axum middleware that enforces client API key authentication.
+/// Skip auth for public endpoints: /health, /metrics, /v1/models.
+pub async fn client_auth_middleware(
+    State(state): State<super::state::AppState>,
+    headers: HeaderMap,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let path = req.uri().path();
+    let is_public = matches!(path, "/health" | "/metrics" | "/v1/models");
+    if !is_public {
+        if let Err(e) = check_auth(&headers, &state.config) {
+            return e.into_response();
+        }
+    }
+    next.run(req).await
+}
+
 pub async fn proxy_messages(
     State(state): State<super::state::AppState>,
     headers: HeaderMap,
@@ -177,6 +207,7 @@ pub async fn proxy_messages(
     state.inc_total_requests();
     if let Some(ref metrics) = state.metrics {
         metrics.connection_start();
+        request_guard.set_metrics(metrics.clone());
     }
 
     // Detect /cc/v1/messages path for buffered streaming mode
@@ -431,7 +462,7 @@ pub async fn proxy_messages(
                 "type": "error",
                 "error": {
                     "type": "upstream_error",
-                    "message": text
+                    "message": sanitize_upstream_error(status_code, &text)
                 }
             })),
         )
@@ -597,10 +628,12 @@ pub async fn proxy_chat_completions(
 ) -> Result<Response> {
     let request_id = next_request_id();
     let request_start = Instant::now();
+    let mut request_guard = RequestCompletionGuard::new(request_id.clone(), request_start);
 
     state.inc_total_requests();
     if let Some(ref metrics) = state.metrics {
         metrics.connection_start();
+        request_guard.set_metrics(metrics.clone());
     }
 
     check_auth(&headers, &state.config)?;
@@ -769,7 +802,7 @@ pub async fn proxy_chat_completions(
                     StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY),
                     Json(json!({
                         "error": {
-                            "message": text,
+                            "message": sanitize_upstream_error(status_code, &text),
                             "type": "upstream_error"
                         }
                     })),
@@ -975,7 +1008,7 @@ pub async fn proxy_chat_completions(
                     StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_GATEWAY),
                     Json(json!({
                         "error": {
-                            "message": text,
+                            "message": sanitize_upstream_error(status_code, &text),
                             "type": "upstream_error"
                         }
                     })),

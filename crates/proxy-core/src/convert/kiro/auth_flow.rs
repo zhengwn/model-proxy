@@ -384,6 +384,7 @@ struct IamSsoSession {
     state: String,
     region: String,
     _start_url: String,
+    created_at: Instant,
 }
 
 /// In-memory session store with 10-minute expiry.
@@ -471,11 +472,16 @@ pub async fn start_iam_sso_login(
         state,
         region: region.to_string(),
         _start_url: start_url.to_string(),
+        created_at: Instant::now(),
     };
 
     let mut sessions = IAM_SSO_SESSIONS.lock().unwrap();
     if sessions.is_none() {
         *sessions = Some(HashMap::new());
+    }
+    // Clean up expired sessions
+    if let Some(ref mut map) = *sessions {
+        map.retain(|_, s| s.created_at.elapsed() < IAM_SSO_SESSION_TTL);
     }
     sessions.as_mut().unwrap().insert(session_id.clone(), session);
 
@@ -494,8 +500,9 @@ pub async fn complete_iam_sso_login(
         let mut sessions = IAM_SSO_SESSIONS.lock().unwrap();
         let sessions_map = sessions.as_mut().ok_or("No active IAM SSO sessions")?;
 
-        // Clean expired sessions
-        // (we store creation time implicitly via session_id generation)
+        // Clean expired sessions before lookup
+        sessions_map.retain(|_, s| s.created_at.elapsed() < IAM_SSO_SESSION_TTL);
+
         let session = sessions_map
             .remove(session_id)
             .ok_or("Session not found or expired")?;
@@ -867,14 +874,9 @@ fn getrandom(buf: &mut [u8]) {
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        // Fallback: use std time-based seed (not cryptographically secure, but OK for PKCE)
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        for (i, b) in buf.iter_mut().enumerate() {
-            *b = ((seed >> (i % 16 * 8)) & 0xFF) as u8;
-        }
+        // Use uuid v4 (CSPRNG-backed) for cross-platform random bytes
+        let uuid_bytes = uuid::Uuid::new_v4();
+        buf.copy_from_slice(uuid_bytes.as_bytes());
     }
 }
 
