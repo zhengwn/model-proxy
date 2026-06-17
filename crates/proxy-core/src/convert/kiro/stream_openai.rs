@@ -305,6 +305,10 @@ fn process_event_openai(
 }
 
 /// Handle a Kiro EventStream response, converting to OpenAI SSE format.
+///
+/// If `initial_bytes` is provided, it contains the first chunk already read
+/// (from first-token timeout retry), and the `byte_stream` starts from the
+/// second chunk onwards.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_stream_openai_output(
     upstream_resp: reqwest::Response,
@@ -318,6 +322,7 @@ pub(crate) async fn handle_stream_openai_output(
     thinking_mode: Option<&str>,
     first_token_timeout: Duration,
     streaming_read_timeout: Duration,
+    initial_bytes: Option<Bytes>,
 ) -> Result<Response> {
     info!(
         request_id = request_id.as_str(),
@@ -396,7 +401,50 @@ pub(crate) async fn handle_stream_openai_output(
         };
 
         let mut stream = byte_stream;
-        let mut first_chunk = true;
+        // If initial_bytes were provided (first-token retry succeeded), process them
+        // before entering the main loop and skip first-token timeout check.
+        let mut first_chunk = initial_bytes.is_none();
+        if let Some(bytes) = initial_bytes {
+            last_data_sent.store(stream_base.elapsed().as_secs(), Ordering::Relaxed);
+            if let Err(e) = decoder.feed(&bytes) {
+                error!(error = %e, "EventStream feed 错误 (initial_bytes)");
+                let _ = tx.send(Err(AppError::Request(e.to_string()))).await;
+                log_stream_end("upstream_error", &state, upstream_chunks, emitted_events);
+                return;
+            }
+            loop {
+                match decoder.decode() {
+                    Ok(Some(frame)) => {
+                        upstream_chunks += 1;
+                        match Event::from_frame(&frame) {
+                            Ok(event) => {
+                                let sse_events = process_event_openai(&event, &model, &mut state, &tool_name_map);
+                                for evt in sse_events {
+                                    match tx.send(Ok(Bytes::from(evt))).await {
+                                        Ok(_) => emitted_events += 1,
+                                        Err(_) => {
+                                            log_stream_end("client_disconnected", &state, upstream_chunks, emitted_events);
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => warn!(error = %e, "Event 解析错误 (initial_bytes)，跳过"),
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        if decoder.is_stopped() {
+                            error!(error = %e, "EventStream 解码器已停止 (initial_bytes)");
+                            let _ = tx.send(Err(AppError::Request(e.to_string()))).await;
+                            log_stream_end("upstream_error", &state, upstream_chunks, emitted_events);
+                            return;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
 
         loop {
             let timeout_duration = if first_chunk {

@@ -2725,6 +2725,7 @@ dependencies = [
  "chrono",
  "crc",
  "futures",
+ "http",
  "proptest",
  "regex",
  "reqwest 0.12.28",

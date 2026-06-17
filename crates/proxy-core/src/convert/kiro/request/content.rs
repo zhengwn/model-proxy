@@ -64,26 +64,44 @@ pub(super) fn convert_openai_image_block(block: &Value) -> Option<Value> {
     }))
 }
 
-pub(super) fn convert_tool_result(block: &Value) -> Option<Value> {
+pub(super) fn convert_tool_result(block: &Value) -> (Option<Value>, Vec<Value>) {
     let tool_use_id = block
         .get("tool_use_id")
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    let content = match block.get("content") {
-        Some(Value::String(s)) => vec![json!({"text": s})],
+    let (content, images) = match block.get("content") {
+        Some(Value::String(s)) => (vec![json!({"text": s})], vec![]),
         Some(Value::Array(arr)) => {
-            arr.iter()
-                .filter_map(|b| {
-                    if b.get("type").and_then(|v| v.as_str()) == Some("text") {
-                        b.get("text").map(|t| json!({"text": t}))
-                    } else {
-                        b.as_str().map(|s| json!({"text": s}))
+            let mut text_items = Vec::new();
+            let mut extracted_images = Vec::new();
+            for b in arr {
+                match b.get("type").and_then(|v| v.as_str()) {
+                    Some("text") => {
+                        if let Some(t) = b.get("text") {
+                            text_items.push(json!({"text": t}));
+                        }
                     }
-                })
-                .collect()
+                    Some("image") => {
+                        if let Some(img) = convert_image_block(b) {
+                            extracted_images.push(img);
+                        }
+                    }
+                    Some("image_url") => {
+                        if let Some(img) = convert_openai_image_block(b) {
+                            extracted_images.push(img);
+                        }
+                    }
+                    _ => {
+                        if let Some(s) = b.as_str() {
+                            text_items.push(json!({"text": s}));
+                        }
+                    }
+                }
+            }
+            (text_items, extracted_images)
         }
-        _ => vec![json!({"text": ""})],
+        _ => (vec![json!({"text": ""})], vec![]),
     };
 
     let is_error = block
@@ -103,5 +121,5 @@ pub(super) fn convert_tool_result(block: &Value) -> Option<Value> {
         result["status"] = json!("success");
     }
 
-    Some(result)
+    (Some(result), images)
 }

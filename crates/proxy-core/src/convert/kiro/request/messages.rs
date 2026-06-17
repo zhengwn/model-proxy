@@ -358,9 +358,11 @@ fn convert_history_messages(messages: &[Value], reverse_name_map: &HashMap<Strin
                                 }
                             }
                             Some("tool_result") => {
-                                if let Some(tr) = convert_tool_result(block) {
+                                let (tr, imgs) = convert_tool_result(block);
+                                if let Some(tr) = tr {
                                     buffered_user_tool_results.push(tr);
                                 }
+                                buffered_user_images.extend(imgs);
                             }
                             _ => {}
                         }
@@ -532,9 +534,11 @@ fn extract_current_message(msg: &Value) -> (String, Vec<Value>, Vec<Value>) {
                         }
                     }
                     Some("tool_result") => {
-                        if let Some(tr) = convert_tool_result(block) {
+                        let (tr, imgs) = convert_tool_result(block);
+                        if let Some(tr) = tr {
                             tool_results.push(tr);
                         }
+                        images.extend(imgs);
                     }
                     _ => {}
                 }

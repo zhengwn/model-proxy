@@ -191,16 +191,21 @@ async fn try_endpoint(
     auth_info: &KiroAuthInfo,
     request_id: &str,
     timeout: Option<Duration>,
+    is_stream: bool,
 ) -> EndpointOutcome {
     use crate::convert::kiro::endpoint::{build_endpoint_headers, build_endpoint_url};
 
     let url = build_endpoint_url(endpoint, region);
-    let headers = build_endpoint_headers(
+    let mut headers = build_endpoint_headers(
         endpoint,
         &auth_info.token,
         &auth_info.amz_user_agent,
         &auth_info.user_agent,
     );
+    // 流式请求添加 Connection: close 防止 VPN 断开时 CLOSE_WAIT 连接泄漏
+    if is_stream {
+        headers.push(("connection".to_string(), "close".to_string()));
+    }
 
     let upstream_start = Instant::now();
 
@@ -385,6 +390,7 @@ pub(crate) async fn dispatch_kiro_request(
             auth_info,
             request_id,
             timeout,
+            is_stream,
         )
         .await
         {

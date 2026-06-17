@@ -6,15 +6,100 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use bytes::Bytes;
+use futures::StreamExt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::Instant;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::dispatch::{acquire_kiro_auth, dispatch_kiro_request};
 use crate::convert::anthropic_openai::stream::StreamLogContext;
 use crate::server::state::{elapsed_ms, next_request_id, RequestCompletionGuard};
 use crate::error::{AppError, Result};
+
+/// Result of a successful first-token retry dispatch.
+struct FirstChunkDispatchResult {
+    upstream_headers_ms: u128,
+    initial_bytes: Bytes,
+    remaining_bytes_stream: std::pin::Pin<Box<dyn futures::Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send>>,
+}
+
+/// Dispatch a Kiro request with first-token timeout retry.
+///
+/// After getting the HTTP response, reads the first byte chunk with a timeout.
+/// If the first chunk arrives in time, returns it along with the remaining stream.
+/// If the timeout fires, drops the response and retries the dispatch (up to `max_retries`).
+async fn dispatch_with_first_token_retry(
+    state: &crate::server::state::AppState,
+    kiro_payload: &Value,
+    payload_bytes: &[u8],
+    auth_info: &super::dispatch::KiroAuthInfo,
+    kiro_config: &crate::config::KiroConfig,
+    request_id: &str,
+    first_token_timeout: std::time::Duration,
+    max_retries: u32,
+) -> crate::error::Result<FirstChunkDispatchResult> {
+    for attempt in 0..=max_retries {
+        let dispatch_result = dispatch_kiro_request(
+            state,
+            kiro_payload,
+            payload_bytes,
+            auth_info,
+            kiro_config,
+            request_id,
+            true,
+        )
+        .await?;
+
+        let upstream_headers_ms = dispatch_result.upstream_headers_ms;
+        let mut byte_stream = dispatch_result.response.bytes_stream();
+
+        match tokio::time::timeout(first_token_timeout, byte_stream.next()).await {
+            Ok(Some(Ok(first_bytes))) => {
+                if attempt > 0 {
+                    info!(request_id, attempt, "首 Token 重试成功");
+                }
+                let remaining = Box::pin(byte_stream);
+                return Ok(FirstChunkDispatchResult {
+                    upstream_headers_ms,
+                    initial_bytes: first_bytes,
+                    remaining_bytes_stream: remaining,
+                });
+            }
+            Ok(Some(Err(e))) => return Err(crate::error::AppError::Http(e)),
+            Ok(None) => {
+                return Ok(FirstChunkDispatchResult {
+                    upstream_headers_ms,
+                    initial_bytes: Bytes::new(),
+                    remaining_bytes_stream: Box::pin(futures::stream::empty()),
+                });
+            }
+            Err(_timeout) => {
+                warn!(
+                    request_id,
+                    attempt,
+                    timeout_secs = first_token_timeout.as_secs(),
+                    "首 Token 超时，重试中"
+                );
+                continue;
+            }
+        }
+    }
+
+    // All retries exhausted — dispatch once more without timeout check
+    warn!(request_id, max_retries, "首 Token 重试耗尽，执行最后一次请求（无超时检查）");
+    let dispatch_result = dispatch_kiro_request(
+        state, kiro_payload, payload_bytes, auth_info, kiro_config, request_id, true,
+    )
+    .await?;
+
+    Ok(FirstChunkDispatchResult {
+        upstream_headers_ms: dispatch_result.upstream_headers_ms,
+        initial_bytes: Bytes::new(),
+        remaining_bytes_stream: Box::pin(dispatch_result.response.bytes_stream()),
+    })
+}
 
 /// Handle `/v1/messages` request with Kiro as upstream provider.
 /// This is a separate function because Kiro uses a completely different
@@ -102,42 +187,40 @@ pub(crate) async fn handle_kiro_messages(
 
     // Dispatch to Kiro with endpoint fallback
     request_guard.set_phase("kiro_send");
-    let dispatch_result = match dispatch_kiro_request(
-        &state,
-        &kiro_payload,
-        &payload_bytes,
-        &auth_info,
-        kiro_config,
-        &request_id,
-        is_stream,
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(AppError::UpstreamStatus(status, body)) => {
-            request_guard.complete();
-            return Ok((
-                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-                Json(json!({
-                    "type": "error",
-                    "error": {
-                        "type": "upstream_error",
-                        "message": body
-                    }
-                })),
-            )
-                .into_response());
-        }
-        Err(e) => {
-            request_guard.complete();
-            return Err(e);
-        }
-    };
+    let first_token_timeout = std::time::Duration::from_secs(kiro_config.first_token_timeout.unwrap_or(15));
+    let first_token_max_retries = kiro_config.first_token_max_retries.unwrap_or(3);
 
     // Handle response
     request_guard.set_phase("kiro_response");
 
     if is_stream {
+        // Streaming: dispatch with first-token timeout retry
+        let first_chunk_result = match dispatch_with_first_token_retry(
+            &state,
+            &kiro_payload,
+            &payload_bytes,
+            &auth_info,
+            kiro_config,
+            &request_id,
+            first_token_timeout,
+            first_token_max_retries,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(AppError::UpstreamStatus(status, body)) => {
+                request_guard.complete();
+                return Ok((
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                    Json(json!({
+                        "type": "error",
+                        "error": { "type": "upstream_error", "message": body }
+                    })),
+                ).into_response());
+            }
+            Err(e) => { request_guard.complete(); return Err(e); }
+        };
+
         let stream_log_ctx = Some(StreamLogContext {
             collector: state.log_collector.clone(),
             request_id: request_id.clone(),
@@ -150,55 +233,65 @@ pub(crate) async fn handle_kiro_messages(
             upstream_start: Instant::now(),
             raw_request_body: raw_request_body.clone(),
         });
-        let first_token_timeout = std::time::Duration::from_secs(kiro_config.first_token_timeout.unwrap_or(15));
         let streaming_read_timeout = std::time::Duration::from_secs(kiro_config.streaming_read_timeout.unwrap_or(300));
         let thinking_mode = kiro_config.thinking_mode.as_deref();
+        let initial_bytes = if first_chunk_result.initial_bytes.is_empty() {
+            None
+        } else {
+            Some(first_chunk_result.initial_bytes)
+        };
+        let upstream_headers_ms = first_chunk_result.upstream_headers_ms;
+
+        // Build a synthetic reqwest::Response from the remaining byte stream
+        let remaining_body = reqwest::Body::wrap_stream(
+            first_chunk_result.remaining_bytes_stream.map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)))
+        );
+        let fake_resp = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .header("content-type", "application/vnd.amazon.eventstream")
+                .body(remaining_body)
+                .unwrap()
+        );
 
         let response = if buffered {
             handle_stream_anthropic_output_buffered(
-                dispatch_result.response,
-                &kiro_model,
-                tool_name_map,
-                request_id.clone(),
-                request_start,
-                Instant::now(),
-                dispatch_result.upstream_headers_ms,
-                stream_log_ctx,
-                thinking_mode,
-                first_token_timeout,
-                streaming_read_timeout,
-                state.kiro.as_ref().map(|k| k.truncation_state.clone()),
+                fake_resp, &kiro_model, tool_name_map, request_id.clone(),
+                request_start, Instant::now(), upstream_headers_ms,
+                stream_log_ctx, thinking_mode, first_token_timeout, streaming_read_timeout,
+                state.kiro.as_ref().map(|k| k.truncation_state.clone()), initial_bytes,
             ).await
         } else {
             handle_stream_anthropic_output(
-                dispatch_result.response,
-                &kiro_model,
-                tool_name_map,
-                request_id.clone(),
-                request_start,
-                Instant::now(),
-                dispatch_result.upstream_headers_ms,
-                stream_log_ctx,
-                thinking_mode,
-                first_token_timeout,
-                streaming_read_timeout,
-                state.kiro.as_ref().map(|k| k.truncation_state.clone()),
+                fake_resp, &kiro_model, tool_name_map, request_id.clone(),
+                request_start, Instant::now(), upstream_headers_ms,
+                stream_log_ctx, thinking_mode, first_token_timeout, streaming_read_timeout,
+                state.kiro.as_ref().map(|k| k.truncation_state.clone()), initial_bytes,
             ).await
         };
         request_guard.complete();
         response
     } else {
-        // Non-streaming: collect all events and build Anthropic response
+        // Non-streaming: simple dispatch without first-token retry
+        let dispatch_result = match dispatch_kiro_request(
+            &state, &kiro_payload, &payload_bytes, &auth_info, kiro_config, &request_id, false,
+        ).await {
+            Ok(r) => r,
+            Err(AppError::UpstreamStatus(status, body)) => {
+                request_guard.complete();
+                return Ok((
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                    Json(json!({
+                        "type": "error", "error": { "type": "upstream_error", "message": body }
+                    })),
+                ).into_response());
+            }
+            Err(e) => { request_guard.complete(); return Err(e); }
+        };
         let response = handle_kiro_non_stream(
-            dispatch_result.response,
-            &kiro_model,
-            &tool_name_map,
-            &request_id,
-            request_start,
-            Instant::now(),
-            dispatch_result.upstream_headers_ms,
-        )
-        .await;
+            dispatch_result.response, &kiro_model, &tool_name_map, &request_id,
+            request_start, Instant::now(), dispatch_result.upstream_headers_ms,
+        ).await;
         request_guard.complete();
         response
     }
@@ -394,57 +487,65 @@ pub(crate) async fn handle_kiro_chat_completions(
     // Step 4: Serialize and dispatch
     let payload_bytes = serde_json::to_vec(&kiro_payload)?;
 
-    let dispatch_result = match dispatch_kiro_request(
-        &state,
-        &kiro_payload,
-        &payload_bytes,
-        &auth_info,
-        kiro_config,
-        &request_id,
-        is_stream,
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(AppError::UpstreamStatus(status, body)) => {
-            return Ok((
-                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-                Json(json!({
-                    "error": {"message": body, "type": "upstream_error"}
-                })),
-            )
-                .into_response());
-        }
-        Err(e) => return Err(e),
-    };
+    let first_token_timeout = std::time::Duration::from_secs(kiro_config.first_token_timeout.unwrap_or(15));
+    let first_token_max_retries = kiro_config.first_token_max_retries.unwrap_or(3);
 
     // Step 5: Convert response
     if is_stream {
+        let first_chunk_result = match dispatch_with_first_token_retry(
+            &state, &kiro_payload, &payload_bytes, &auth_info, kiro_config,
+            &request_id, first_token_timeout, first_token_max_retries,
+        ).await {
+            Ok(r) => r,
+            Err(AppError::UpstreamStatus(status, body)) => {
+                return Ok((
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                    Json(json!({"error": {"message": body, "type": "upstream_error"}})),
+                ).into_response());
+            }
+            Err(e) => return Err(e),
+        };
+
+        let initial_bytes = if first_chunk_result.initial_bytes.is_empty() {
+            None
+        } else {
+            Some(first_chunk_result.initial_bytes)
+        };
+        let remaining_body = reqwest::Body::wrap_stream(
+            first_chunk_result.remaining_bytes_stream.map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)))
+        );
+        let fake_resp = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .header("content-type", "application/vnd.amazon.eventstream")
+                .body(remaining_body)
+                .unwrap()
+        );
+
         handle_stream_openai_output(
-            dispatch_result.response,
-            &kiro_model,
-            tool_name_map,
-            request_id.clone(),
-            request_start,
-            Instant::now(),
-            dispatch_result.upstream_headers_ms,
-            None,
-            kiro_config.thinking_mode.as_deref(),
-            std::time::Duration::from_secs(kiro_config.first_token_timeout.unwrap_or(15)),
-            std::time::Duration::from_secs(kiro_config.streaming_read_timeout.unwrap_or(300)),
-        )
-        .await
+            fake_resp, &kiro_model, tool_name_map, request_id.clone(),
+            request_start, Instant::now(), first_chunk_result.upstream_headers_ms,
+            None, kiro_config.thinking_mode.as_deref(),
+            first_token_timeout, std::time::Duration::from_secs(kiro_config.streaming_read_timeout.unwrap_or(300)),
+            initial_bytes,
+        ).await
     } else {
-        // Non-streaming: collect events and build OpenAI response
+        let dispatch_result = match dispatch_kiro_request(
+            &state, &kiro_payload, &payload_bytes, &auth_info, kiro_config, &request_id, false,
+        ).await {
+            Ok(r) => r,
+            Err(AppError::UpstreamStatus(status, body)) => {
+                return Ok((
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                    Json(json!({"error": {"message": body, "type": "upstream_error"}})),
+                ).into_response());
+            }
+            Err(e) => return Err(e),
+        };
         handle_kiro_non_stream_openai(
-            dispatch_result.response,
-            &kiro_model,
-            &request_id,
-            request_start,
-            Instant::now(),
-            dispatch_result.upstream_headers_ms,
-        )
-        .await
+            dispatch_result.response, &kiro_model, &request_id,
+            request_start, Instant::now(), dispatch_result.upstream_headers_ms,
+        ).await
     }
 }
 
