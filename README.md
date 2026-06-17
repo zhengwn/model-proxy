@@ -6,13 +6,14 @@
 
 ## 功能特性
 
-- **多 Provider 管理** — 配置多个 AI 服务提供商（OpenAI、Anthropic、DeepSeek、Gemini、Azure 等），通过 GUI 一键切换，支持 6 种预设模板快速添加
+- **多 Provider 管理** — 配置多个 AI 服务提供商（OpenAI、Anthropic、DeepSeek、Gemini、Azure、Kiro/Amazon Q Developer 等），通过 GUI 一键切换，支持预设模板快速添加
 - **运行时热切换** — 基于 `ArcSwap` 无锁原子指针交换，切换 Provider 无需重启服务，进行中的请求不受影响，新请求立即使用新 Provider
 - **格式自动转换** — 暴露 Anthropic Messages API 格式（`/v1/messages`），内部自动将请求转为 OpenAI Chat Completions 格式发给上游，并将响应转回 Anthropic 格式；同时支持 `/v1/chat/completions` 直通代理
 - **流式状态机** — OpenAI ↔ Anthropic 流式转换使用状态机追踪 reasoning → text → tool_use 块切换，确保 content_block_start/stop 事件语义正确
 - **模型路由** — 基于子串匹配（大小写不敏感）将客户端请求的模型名路由到实际目标模型，支持 `reasoning_effort` 覆盖（low/medium/high/max），GUI 内置 5 个预设路由模板
 - **Provider 兼容性适配（Quirks）** — 针对不同提供商的差异提供细粒度兼容配置：`reasoning_all_or_nothing`、`no_json_schema`、`supports_reasoning_effort`、`max_reasoning_effort`
-- **图形化配置管理** — 通过 4 个选项卡（服务状态、Provider 管理、模型路由、请求日志）编辑所有配置项，首次启动引导式配置
+- **Kiro 管理面板** — 支持 Kiro 凭据池、端点健康、Thinking 模式、端点偏好和负载均衡配置
+- **图形化配置管理** — 通过服务状态、Provider 管理、模型路由、Kiro 管理、请求日志等页面编辑配置项，首次启动引导式配置
 - **服务启停控制** — 一键启动/停止代理服务，实时显示运行状态、请求计数（含失败数）、监听地址（可一键复制）
 - **系统托盘** — 最小化到托盘，右键菜单快速启停服务
 - **请求日志** — JSONL 格式日志文件按天轮转，前端实时流式查看（通过 Tauri 事件推送），支持状态码、Provider、关键词过滤，记录代理开销、首 token 延迟、传输时间
@@ -53,21 +54,32 @@ cargo build --release
 
 ## 使用方式
 
-1. 启动应用后，在 **Provider 管理** 页面添加你的 AI 服务提供商配置（支持 6 种模板快速填充）
-2. 在 **服务状态** 页面的内联设置中配置监听端口和认证密钥
+1. 启动应用后，在 **Provider 管理** 页面添加你的 AI 服务提供商配置（可用模板快速填充）
+2. 在 **服务状态** 页面的内联设置中配置监听 Host、端口、客户端认证密钥和 Admin 密钥
 3. 在 **服务状态** 页面点击启动服务
 4. 将 IDE 或客户端的 API Base URL 指向 `http://localhost:4000`，API Key 设为你配置的 `server.api_key`
-5. 可在 **模型路由** 页面配置模型名称映射（如将 `claude-sonnet` 路由到 `deepseek-v4-pro`），随时修改无需重启
+5. 可在 **模型路由** 页面配置模型名称映射（如将 `claude-sonnet` 路由到 `deepseek-v4-pro`），随时修改无需重启；Kiro provider 的运行参数可在 **Kiro 管理** 页面调整
 
 ## API 端点
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/health` | 健康检查，返回 `{"status": "ok"}` |
+| GET | `/metrics` | Prometheus 文本指标 |
+| GET | `/v1/models` | OpenAI 兼容模型列表 |
 | POST | `/v1/messages` | 主代理端点，接受 Anthropic Messages API 格式，自动转换为目标 Provider 格式后转发 |
+| POST | `/v1/messages/count_tokens` | Anthropic count_tokens 兼容端点 |
+| POST | `/cc/v1/messages` | Claude Code 兼容 Messages 端点 |
+| POST | `/cc/v1/messages/count_tokens` | Claude Code 兼容 count_tokens 端点 |
 | POST | `/v1/chat/completions` | OpenAI Chat Completions 格式代理，内部转 Anthropic 再转回 OpenAI |
+| POST | `/v1/responses` | OpenAI Responses API 兼容端点（Kiro provider） |
+| GET | `/api/status` | 服务状态 |
+| GET | `/api/usage` | Kiro 用量查询 |
+| GET | `/api/flows` | Kiro flow 监控 |
+| POST | `/api/event_logging/batch` | 遥测事件接收兼容端点 |
+| `/api/admin/*` | Admin API | Kiro 凭据、设置、IP、站点状态等管理端点 |
 
-**认证：** 若配置了 `server.api_key`，客户端需通过 `x-api-key` 或 `Authorization: Bearer` 头提供密钥，否则返回 401。
+**认证：** 若配置了 `server.api_key`，客户端代理请求需通过 `x-api-key` 或 `Authorization: Bearer` 头提供密钥，否则返回 401。`/health`、`/metrics`、`/v1/models` 为公开端点。`/api/admin/*` 使用独立的 `server.admin_api_key`，不叠加客户端 key。
 
 **超时：** 上游连接 30s，非流式请求 300s，流式请求无总超时，连接池空闲 90s。
 
@@ -79,25 +91,19 @@ model-proxy/
 │   ├── src/config.rs        #   配置解析、验证、序列化、向后兼容迁移
 │   ├── src/error.rs         #   统一错误类型（thiserror）
 │   ├── src/provider_registry.rs  # Provider 注册表（按名查找、重复检测）
-│   ├── src/proxy/           #   HTTP 处理器 & 格式转换核心
-│   │   ├── convert.rs       #     Anthropic ↔ OpenAI 非流式转换
-│   │   ├── stream.rs        #     流式转换状态机（SSE 解析 & 事件生成）
-│   │   ├── passthrough.rs   #     Anthropic 格式直通代理
-│   │   ├── response.rs      #     响应构建 & SSE 输出
-│   │   ├── fallback.rs      #     故障回退 & 重试逻辑
-│   │   ├── utils.rs         #     认证、请求体限制等工具
-│   │   └── state.rs         #     ArcSwap 共享状态
+│   ├── src/convert/         #   Anthropic/OpenAI/Kiro 请求响应转换
+│   ├── src/server/          #   HTTP 路由、鉴权、中间件、Kiro/admin handlers
 │   └── src/logging/         #   日志收集器、文件写入（JSONL）、截断、轮转
 ├── src/                     # CLI 二进制入口
 │   └── main.rs              #   配置加载、信号处理、服务器启动
 ├── src-tauri/               # Tauri 桌面应用壳
 │   ├── src/lib.rs           #   Tauri 插件注册 & 启动
-│   ├── src/commands.rs      #   16 个 IPC 命令（配置/Provider/路由 CRUD）
+│   ├── src/commands/        #   IPC 命令（配置/Provider/路由/Kiro 管理）
 │   ├── src/service.rs       #   代理服务生命周期管理
 │   ├── src/tray.rs          #   系统托盘集成
 │   └── src/logging.rs       #   日志事件转发到前端
 ├── ui/                      # React 18 + TypeScript + Ant Design 5
-│   ├── components/          #   8 个组件（见下方组件树）
+│   ├── components/          #   React 组件（见下方组件树）
 │   ├── hooks/               #   useConfig / useProviders / useServiceStatus
 │   ├── utils/               #   日志过滤 & 验证工具
 │   └── types/               #   10 个 TypeScript 接口定义
@@ -121,6 +127,7 @@ model-proxy/
         │                      │    └── <TestConnectionButton>
         │                      └── <ProviderList>     (列表 + 操作按钮)
         ├── "模型路由"  → <ModelRoutesEditor>  ← 匹配→目标 规则编辑
+        ├── "Kiro 管理" → <KiroPanel>          ← 凭据、端点、运行设置
         └── "请求日志"  → <LogViewer>           ← 实时流式日志表格
                              └── <LogSettings>  (内联日志配置)
 ```

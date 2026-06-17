@@ -91,7 +91,11 @@ pub(crate) fn check_auth(headers: &HeaderMap, config: &Config) -> Result<()> {
 }
 
 /// Axum middleware that enforces client API key authentication.
-/// Skip auth for public endpoints: /health, /metrics, /v1/models.
+/// Skip auth for public endpoints and admin routes.
+///
+/// Admin routes are protected by their own `admin_api_key` middleware. Applying
+/// client auth to them as well would make deployments with separate client and
+/// admin keys impossible to use.
 pub async fn client_auth_middleware(
     State(state): State<super::state::AppState>,
     headers: HeaderMap,
@@ -99,7 +103,8 @@ pub async fn client_auth_middleware(
     next: Next,
 ) -> Response {
     let path = req.uri().path();
-    let is_public = matches!(path, "/health" | "/metrics" | "/v1/models");
+    let is_public = matches!(path, "/health" | "/metrics" | "/v1/models")
+        || path.starts_with("/api/admin/");
     if !is_public {
         if let Err(e) = check_auth(&headers, &state.config) {
             return e.into_response();

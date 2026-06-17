@@ -5,6 +5,7 @@ import type { Config, ServerConfig } from "../types";
 const DEFAULT_CONFIG: Config = {
   server: {
     port: 4000,
+    host: "127.0.0.1",
   },
   providers: [],
   model_routes: [],

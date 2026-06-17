@@ -13,6 +13,7 @@ use super::admin_error;
 use super::admin_success;
 use crate::convert::kiro::account::LoadBalancingMode;
 use crate::server::state::AppState;
+use crate::ProviderRegistry;
 
 // ---- Response types ----
 
@@ -38,6 +39,19 @@ pub(super) struct ThinkingConfigResponse {
 pub(super) struct ProxySettingsResponse {
     pub preferred_endpoint: Option<String>,
     pub endpoint_fallback: Option<bool>,
+}
+
+fn store_updated_active_provider(state: &AppState, provider: crate::config::ProviderConfig) {
+    let provider_name = provider.name.clone();
+    state.active_provider.store(Arc::new(provider.clone()));
+
+    let mut providers = state.registry.load().list().to_vec();
+    if let Some(existing) = providers.iter_mut().find(|p| p.name == provider_name) {
+        *existing = provider;
+        if let Ok(registry) = ProviderRegistry::new(providers) {
+            state.registry.store(Arc::new(registry));
+        }
+    }
 }
 
 // ---- Handlers ----
@@ -135,7 +149,7 @@ pub(super) async fn admin_set_thinking(
         let mut new_provider = provider.as_ref().clone();
         new_provider.kiro_config = Some(new_config);
 
-        state.active_provider.store(Arc::new(new_provider));
+        store_updated_active_provider(&state, new_provider);
     }
 
     admin_success(format!("Thinking mode set to '{}'", req.mode)).into_response()
@@ -175,7 +189,7 @@ pub(super) async fn admin_set_settings(
         let mut new_provider = provider.as_ref().clone();
         new_provider.kiro_config = Some(new_config);
 
-        state.active_provider.store(Arc::new(new_provider));
+        store_updated_active_provider(&state, new_provider);
     }
 
     admin_success("Settings updated".to_string()).into_response()

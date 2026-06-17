@@ -223,6 +223,51 @@ async fn auth_accepts_bearer_token() {
 }
 
 #[tokio::test]
+async fn admin_routes_use_admin_key_not_client_key() {
+    let port = find_available_port();
+    let (mock_addr, mock_token) = start_mock_openai_server(json!({})).await;
+    let mut config = make_config(port, &format!("http://{}", mock_addr));
+    config.server.admin_api_key = Some("admin-key".to_string());
+
+    let token = CancellationToken::new();
+    let handle = proxy_core::start_server(config, token.clone());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = Client::new();
+    let admin_resp = client
+        .get(format!("http://127.0.0.1:{}/api/admin/config", port))
+        .header("x-api-key", "admin-key")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(admin_resp.status(), 200);
+
+    let admin_post_resp = client
+        .post(format!("http://127.0.0.1:{}/api/admin/config", port))
+        .header("x-api-key", "admin-key")
+        .json(&json!({ "load_balancing_mode": "priority" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(admin_post_resp.status(), 400);
+
+    let client_key_resp = client
+        .get(format!("http://127.0.0.1:{}/api/admin/config", port))
+        .header("x-api-key", "test-key")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(client_key_resp.status(), 401);
+
+    token.cancel();
+    let _ = handle.await;
+    mock_token.cancel();
+}
+
+#[tokio::test]
 async fn proxy_converts_anthropic_to_openai_and_back() {
     let port = find_available_port();
     let mock_response = json!({

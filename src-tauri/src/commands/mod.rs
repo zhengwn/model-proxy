@@ -439,6 +439,7 @@ pub async fn update_provider(
     existing.model = provider.model;
     existing.format = provider.format;
     existing.quirks = provider.quirks;
+    existing.kiro_config = provider.kiro_config;
 
     // If the renamed provider was the active one, update active_provider reference
     if config.active_provider.as_deref() == Some(lookup_name) {
@@ -727,7 +728,7 @@ fn validate_provider_fields(provider: &ProviderConfig) -> Result<(), String> {
             provider.name
         ));
     }
-    if provider.api_key.is_empty() {
+    if provider.api_key.is_empty() && provider.format != proxy_core::config::ProviderFormat::Kiro {
         return Err(format!(
             "Provider '{}' 缺少必填字段: api_key",
             provider.name
@@ -853,7 +854,7 @@ fn get_config_internal(path: &PathBuf) -> Result<Config, String> {
 mod tests {
     use super::*;
     use proxy_core::config::{
-        Config, FallbackConfig, ProviderFormat, ProviderQuirks, ServerConfig,
+        Config, FallbackConfig, KiroConfig, ProviderFormat, ProviderQuirks, ServerConfig,
     };
     use proxy_core::logging::LogConfig;
     use tempfile::TempDir;
@@ -917,6 +918,41 @@ mod tests {
         let result = validate_provider_fields(&provider);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("api_key"));
+    }
+
+    #[test]
+    fn validate_provider_fields_allows_kiro_empty_api_key() {
+        let mut provider = make_provider("kiro");
+        provider.api_key = String::new();
+        provider.format = ProviderFormat::Kiro;
+        provider.kiro_config = Some(KiroConfig {
+            auth_method: "social".to_string(),
+            refresh_token: Some("refresh-token".to_string()),
+            client_id: None,
+            client_secret: None,
+            profile_arn: None,
+            region: "us-east-1".to_string(),
+            api_region: None,
+            model_aliases: None,
+            hidden_models: None,
+            kiro_version: None,
+            proxy_url: None,
+            thinking_mode: None,
+            web_search_enabled: None,
+            accounts: None,
+            load_balancing_mode: None,
+            agentic_prompt_injection: None,
+            first_token_timeout: None,
+            streaming_read_timeout: None,
+            first_token_max_retries: None,
+            quota_cooldown_secs: None,
+            health_score_decay: None,
+            health_score_recovery: None,
+            preferred_endpoint: None,
+            endpoint_fallback: None,
+        });
+
+        assert!(validate_provider_fields(&provider).is_ok());
     }
 
     #[test]

@@ -162,7 +162,7 @@ pub fn admin_router(state: AppState) -> Router<AppState> {
         )
         .route(
             "/api/admin/config",
-            get(admin_get_config).put(admin_set_config),
+            get(admin_get_config).put(admin_set_config).post(admin_set_config),
         )
         .route(
             "/api/admin/ip/ban",

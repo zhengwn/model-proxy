@@ -365,13 +365,9 @@ pub(super) async fn admin_get_balance(
         }
     };
 
-    // Find the Kiro config for region info
-    let kiro_config = state
-        .config
-        .providers
-        .iter()
-        .find(|p| p.format == crate::config::ProviderFormat::Kiro)
-        .and_then(|p| p.kiro_config.as_ref());
+    // Find the active Kiro config for region info.
+    let provider = state.current_provider();
+    let kiro_config = provider.kiro_config.as_ref();
 
     let region = kiro_config
         .and_then(|c| c.api_region.as_deref().or(Some(c.region.as_str())))

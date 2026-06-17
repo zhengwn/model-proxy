@@ -34,7 +34,7 @@ base_url = "https://q.us-east-1.amazonaws.com"
 format = "kiro"
 model = "claude-sonnet-4.5"
 
-[providers.kiro]
+[providers.kiro_config]
 auth_method = "social"              # social | idc | api_key
 refresh_token = "..."
 client_id = ""                      # idc 时需要

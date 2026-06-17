@@ -74,10 +74,21 @@ impl KiroCredential {
         let api_region = config.api_region.clone().unwrap_or_else(|| region.clone());
         // Generate a stable machine ID using system fingerprint + token
         let machine_id = generate_machine_id(config.refresh_token.as_deref(), &region);
+        let auth_method = AuthMethod::from_str(&config.auth_method);
+        let access_token = if auth_method == AuthMethod::ApiKey {
+            config.refresh_token.clone()
+        } else {
+            None
+        };
+        let refresh_token = if auth_method == AuthMethod::ApiKey {
+            None
+        } else {
+            config.refresh_token.clone()
+        };
         Self {
-            auth_method: AuthMethod::from_str(&config.auth_method),
-            access_token: None,
-            refresh_token: config.refresh_token.clone(),
+            auth_method,
+            access_token,
+            refresh_token,
             client_id: config.client_id.clone(),
             client_secret: config.client_secret.clone(),
             profile_arn: config.profile_arn.clone(),

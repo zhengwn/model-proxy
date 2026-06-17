@@ -6,7 +6,10 @@
 
 use tauri::State;
 
-use super::{get_config_internal, sanitize_credential_id, TauriState};
+use super::{get_config_internal, persist_config, sanitize_credential_id, TauriState};
+use proxy_core::config::{KiroConfig, ProviderFormat};
+use proxy_core::ProviderRegistry;
+use std::sync::Arc;
 
 /// Build the admin API base URL and get the API key from config.
 /// Acquires config_lock to ensure consistent read.
@@ -63,6 +66,49 @@ async fn admin_post(state: &TauriState, path: &str, body: serde_json::Value) -> 
         return Err(format!("API 错误 ({}): {}", status, msg));
     }
     Ok(body)
+}
+
+async fn update_active_kiro_config<F>(state: &TauriState, update: F) -> Result<(), String>
+where
+    F: FnOnce(&mut KiroConfig),
+{
+    let _lock = state.config_lock.lock().await;
+    let mut config = get_config_internal(&state.config_path)?;
+    config.normalize();
+
+    let active_name = config
+        .active_provider
+        .clone()
+        .or_else(|| config.providers.first().map(|p| p.name.clone()))
+        .ok_or_else(|| "没有可更新的 Provider".to_string())?;
+
+    let provider = config
+        .providers
+        .iter_mut()
+        .find(|p| p.name == active_name)
+        .ok_or_else(|| format!("Provider 未找到: {}", active_name))?;
+
+    if provider.format != ProviderFormat::Kiro {
+        return Err(format!("当前活跃 Provider '{}' 不是 Kiro", provider.name));
+    }
+
+    let kiro_config = provider
+        .kiro_config
+        .as_mut()
+        .ok_or_else(|| format!("Kiro Provider '{}' 缺少 kiro_config", provider.name))?;
+    update(kiro_config);
+
+    persist_config(&state.config_path, &config)?;
+
+    let new_registry = ProviderRegistry::new(config.providers.clone())
+        .map_err(|e| format!("构建 Registry 失败: {}", e))?;
+    state.registry.store(Arc::new(new_registry));
+
+    if let Some(updated) = config.providers.iter().find(|p| p.name == active_name) {
+        state.active_provider.store(Arc::new(updated.clone()));
+    }
+
+    Ok(())
 }
 
 /// List all Kiro credentials.
@@ -173,7 +219,12 @@ pub async fn kiro_get_thinking(state: State<'_, TauriState>) -> Result<serde_jso
 /// Set thinking config.
 #[tauri::command]
 pub async fn kiro_set_thinking(state: State<'_, TauriState>, mode: String) -> Result<serde_json::Value, String> {
-    admin_post(&state, "thinking", serde_json::json!({ "mode": mode })).await
+    let response = admin_post(&state, "thinking", serde_json::json!({ "mode": mode.clone() })).await?;
+    update_active_kiro_config(&state, |config| {
+        config.thinking_mode = Some(mode);
+    })
+    .await?;
+    Ok(response)
 }
 
 /// Get proxy settings.
@@ -190,13 +241,24 @@ pub async fn kiro_set_settings(
     endpoint_fallback: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let mut body = serde_json::json!({});
+    let persist_preferred_endpoint = preferred_endpoint.clone();
     if let Some(ep) = preferred_endpoint {
         body["preferred_endpoint"] = serde_json::json!(ep);
     }
     if let Some(fb) = endpoint_fallback {
         body["endpoint_fallback"] = serde_json::json!(fb);
     }
-    admin_post(&state, "settings", body).await
+    let response = admin_post(&state, "settings", body).await?;
+    update_active_kiro_config(&state, |config| {
+        if let Some(ep) = persist_preferred_endpoint {
+            config.preferred_endpoint = Some(ep);
+        }
+        if let Some(fb) = endpoint_fallback {
+            config.endpoint_fallback = Some(fb);
+        }
+    })
+    .await?;
+    Ok(response)
 }
 
 /// Start IAM IdC SSO login flow.

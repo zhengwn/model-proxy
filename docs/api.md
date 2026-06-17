@@ -1,18 +1,33 @@
 # HTTP API 参考
 
-Model Proxy 对外暴露以下 HTTP 端点。所有端点监听在配置的 `server.port`（默认 4000）上。
+Model Proxy 对外暴露以下 HTTP 端点。所有端点监听在配置的 `server.host:server.port`（默认 `127.0.0.1:4000`）上。
 
 ## 端点列表
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/health` | 健康检查 |
+| GET | `/metrics` | Prometheus 文本指标 |
+| GET | `/v1/models` | OpenAI 兼容模型列表 |
 | POST | `/v1/messages` | 代理请求（主端点） |
+| POST | `/v1/messages/count_tokens` | Anthropic count_tokens 兼容端点 |
+| POST | `/cc/v1/messages` | Claude Code 兼容 Messages 端点 |
+| POST | `/cc/v1/messages/count_tokens` | Claude Code 兼容 count_tokens 端点 |
+| POST | `/v1/chat/completions` | OpenAI Chat Completions 代理端点 |
+| POST | `/v1/responses` | OpenAI Responses API 兼容端点（Kiro provider） |
+| GET | `/api/status` | 服务状态 |
+| GET | `/api/usage` | Kiro 用量查询 |
+| GET | `/api/flows` | Kiro flow 监控 |
+| POST | `/api/kiro/login/start` | Kiro OIDC device flow 登录启动 |
+| POST | `/api/kiro/login/poll` | Kiro OIDC device flow 轮询 |
+| POST | `/api/kiro/social/start` | Kiro social OAuth 登录启动 |
+| POST | `/api/kiro/social/exchange` | Kiro social OAuth code 交换 |
 | POST | `/api/event_logging/batch` | 遥测事件接收（静默丢弃） |
+| `/api/admin/*` | Admin API | Kiro 凭据、运行设置、IP 和站点管理 |
 
 ## 认证
 
-如果配置了 `server.api_key`，所有请求必须携带认证信息。支持两种方式：
+如果配置了 `server.api_key`，代理和状态请求必须携带认证信息。支持两种方式：
 
 ```
 x-api-key: your-api-key
@@ -26,7 +41,9 @@ Authorization: Bearer your-api-key
 
 未认证请求返回 `401 Unauthorized`。
 
-如果未配置 `server.api_key`，则不进行认证检查。
+`/health`、`/metrics`、`/v1/models` 不要求客户端 API key。`/api/admin/*` 使用独立的 `server.admin_api_key`，不会再叠加要求 `server.api_key`；如果未配置 `server.admin_api_key`，Admin API 返回 `403 Forbidden`。
+
+如果未配置 `server.api_key`，则客户端代理请求不进行认证检查。绑定到非本机地址（如 `0.0.0.0`）时强烈建议配置 `server.api_key`。
 
 ## POST /v1/messages
 
@@ -136,6 +153,43 @@ data: {"type":"message_stop"}
 
 示例：配置 `match = "sonnet"`，则请求 `claude-3-5-sonnet-20241022` 或 `claude-sonnet-4-20250514` 都会匹配。
 
+## POST /v1/chat/completions
+
+接受 OpenAI Chat Completions 格式请求。当前 Provider 为 OpenAI 格式时会直通上游；当前 Provider 为 Anthropic 或 Kiro 时会按内部转换路径代理。
+
+## GET /v1/models
+
+返回 OpenAI 兼容模型列表。该端点公开可访问，不要求 `server.api_key`。非 Kiro provider 返回当前默认模型和路由目标模型；Kiro provider 会优先尝试查询 Kiro 模型列表，失败时返回内置静态列表。
+
+## POST /v1/responses
+
+OpenAI Responses API 兼容端点，目前仅支持 Kiro provider。非 Kiro provider 会返回请求错误。
+
+## Admin API
+
+所有 `/api/admin/*` 端点都使用 `server.admin_api_key` 鉴权，支持 `x-api-key` 或 `Authorization: Bearer`。Admin API 不要求客户端 `server.api_key`。
+
+常用端点：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET/PUT/POST | `/api/admin/config` | Kiro 负载均衡配置 |
+| GET/POST | `/api/admin/credentials` | Kiro 凭据列表/新增 |
+| DELETE | `/api/admin/credentials/{id}` | 删除凭据 |
+| POST | `/api/admin/credentials/{id}/disabled` | 启用或禁用凭据 |
+| POST | `/api/admin/credentials/{id}/priority` | 调整凭据优先级 |
+| POST | `/api/admin/credentials/{id}/refresh` | 强制刷新凭据 |
+| POST | `/api/admin/credentials/{id}/test` | 测试凭据 |
+| GET/POST | `/api/admin/thinking` | 查询或更新 Kiro thinking 处理模式 |
+| GET/POST | `/api/admin/settings` | 查询或更新 Kiro 首选端点和 429 降级配置 |
+| GET | `/api/admin/endpoints/health` | Kiro 端点健康快照 |
+| GET | `/api/admin/site/status` | 站点保护状态 |
+| POST | `/api/admin/site/maintenance` | 切换维护模式 |
+| POST | `/api/admin/site/self-use` | 切换自用模式 |
+| GET | `/api/admin/ip/list` | 查看封禁 IP |
+| POST | `/api/admin/ip/ban` | 封禁 IP |
+| POST | `/api/admin/ip/unban` | 解封 IP |
+
 ## 错误响应
 
 所有错误返回统一的 JSON 格式：
@@ -180,6 +234,10 @@ data: {"type":"message_stop"}
 ```json
 {"status": "ok"}
 ```
+
+## GET /metrics
+
+Prometheus 文本格式指标端点，公开可访问。
 
 ## POST /api/event_logging/batch
 
@@ -237,4 +295,4 @@ curl -X POST http://localhost:4000/v1/messages \
 http://localhost:4000
 ```
 
-API Key 设置为配置文件中的 `server.api_key` 值。
+API Key 设置为配置文件中的 `server.api_key` 值。Kiro 管理面板和 `/api/admin/*` 请求使用 `server.admin_api_key`，它可以和客户端 API Key 不同。

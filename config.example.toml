@@ -6,12 +6,19 @@
 # Must match one of the [[providers]] entries below.
 # If omitted, the first provider in the list is used.
 active_provider = "deepseek"
+model_routes_enabled = true
 
 [server]
 port = 4000
+host = "127.0.0.1"
 # Optional. If set, clients must provide this value via x-api-key or Authorization header.
 api_key = "change-me"
+# Optional but recommended for Kiro/admin management APIs.
+# Admin routes use this key only; they do not require server.api_key.
+admin_api_key = "change-admin-me"
 # max_body_bytes = 67108864
+# 0 means unlimited per-provider concurrency.
+max_concurrent_requests = 0
 
 # --- Global Model Routes ---
 # Model routes are global rules independent of any provider.
@@ -35,7 +42,8 @@ reasoning_effort = "high"
 
 # --- Provider Definitions ---
 # Define one or more providers using [[providers]] array sections.
-# Each provider requires: name, base_url, api_key, model
+# Each non-Kiro provider requires: name, base_url, api_key, model
+# Kiro providers use [providers.kiro_config] instead of api_key.
 # Optional fields: format (default "openai"), quirks
 
 [[providers]]
@@ -65,6 +73,35 @@ base_url = "https://api.anthropic.com"
 api_key = "sk-ant-key"
 model = "claude-sonnet-4-20250514"
 format = "anthropic"
+
+[[providers]]
+name = "kiro"
+base_url = "https://q.us-east-1.amazonaws.com"
+model = "claude-sonnet-4.5"
+format = "kiro"
+
+[providers.kiro_config]
+# "social" uses refresh_token, "idc" uses refresh_token/client_id/client_secret,
+# "api_key" treats refresh_token as the access token sent to Kiro.
+auth_method = "social"
+refresh_token = "your-kiro-refresh-token"
+region = "us-east-1"
+# api_region = "us-east-1"
+thinking_mode = "as_reasoning_content"
+preferred_endpoint = "auto"
+endpoint_fallback = true
+# web_search_enabled = false
+# agentic_prompt_injection = false
+# first_token_timeout = 15
+# streaming_read_timeout = 300
+
+# --- Fallback Configuration ---
+# Retry with fallback providers for selected upstream status codes.
+
+[fallback]
+enabled = false
+on_status_codes = [429, 500, 502, 503, 504]
+max_attempts = 2
 
 # --- Logging Configuration ---
 # Controls request logging (JSONL files + frontend log viewer).

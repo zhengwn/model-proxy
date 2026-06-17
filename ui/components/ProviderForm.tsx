@@ -11,10 +11,11 @@ import {
   Typography,
   Alert,
   message,
+  InputNumber,
 } from "antd";
 import { ThunderboltOutlined } from "@ant-design/icons";
 import { invoke } from "@tauri-apps/api/core";
-import type { ProviderConfig, TestProviderResult } from "../types";
+import type { KiroConfig, ProviderConfig, ProviderFormat, TestProviderResult } from "../types";
 
 const { Text } = Typography;
 
@@ -35,13 +36,22 @@ const defaultQuirks = {
   max_reasoning_effort: "high",
 };
 
+const defaultKiroConfig: KiroConfig = {
+  auth_method: "social",
+  region: "us-east-1",
+  thinking_mode: "as_reasoning_content",
+  preferred_endpoint: "auto",
+  endpoint_fallback: true,
+};
+
 interface ProviderTemplate {
   label: string;
   name: string;
   base_url: string;
   model: string;
-  format: "openai" | "anthropic";
+  format: ProviderFormat;
   quirks: typeof defaultQuirks;
+  kiro_config?: KiroConfig;
 }
 
 const PROVIDER_TEMPLATES: ProviderTemplate[] = [
@@ -91,6 +101,15 @@ const PROVIDER_TEMPLATES: ProviderTemplate[] = [
     quirks: defaultQuirks,
   },
   {
+    label: "Kiro / Amazon Q Developer",
+    name: "kiro",
+    base_url: "https://q.us-east-1.amazonaws.com",
+    model: "claude-sonnet-4.5",
+    format: "kiro",
+    quirks: defaultQuirks,
+    kiro_config: defaultKiroConfig,
+  },
+  {
     label: "自定义",
     name: "",
     base_url: "",
@@ -123,6 +142,7 @@ export function ProviderForm({
           model: template.model,
           format: template.format,
           quirks: template.quirks,
+          kiro_config: template.kiro_config,
         } as ProviderConfig;
       }
     }
@@ -138,16 +158,42 @@ export function ProviderForm({
     form.setFieldValue(["quirks", "no_json_schema"], quirks.no_json_schema);
     form.setFieldValue(["quirks", "supports_reasoning_effort"], quirks.supports_reasoning_effort);
     form.setFieldValue(["quirks", "max_reasoning_effort"], quirks.max_reasoning_effort);
+
+    if (computedInitialValues.format === "kiro" || computedInitialValues.kiro_config) {
+      const kiroConfig = {
+        ...defaultKiroConfig,
+        ...computedInitialValues.kiro_config,
+      };
+      form.setFieldValue("kiro_config", kiroConfig);
+    }
   }, [form, computedInitialValues]);
+
+  const providerFormat = Form.useWatch("format", form) ?? computedInitialValues.format;
+  const kiroAuthMethod =
+    Form.useWatch(["kiro_config", "auth_method"], form) ??
+    computedInitialValues.kiro_config?.auth_method ??
+    defaultKiroConfig.auth_method;
+  const isKiro = providerFormat === "kiro";
 
   const handleFinish = async (values: ProviderConfig) => {
     const config: ProviderConfig = {
       ...values,
+      api_key: values.api_key || "",
       quirks: {
         ...defaultQuirks,
         ...values.quirks,
       },
     };
+
+    if (config.format === "kiro") {
+      config.kiro_config = {
+        ...defaultKiroConfig,
+        ...values.kiro_config,
+      };
+    } else {
+      delete config.kiro_config;
+    }
+
     await onSubmit(config);
   };
 
@@ -157,14 +203,24 @@ export function ProviderForm({
       form.setFieldsValue({
         name: existingNames.includes(template.name) ? "" : template.name,
         base_url: template.base_url,
+        api_key: template.format === "kiro" ? "" : form.getFieldValue("api_key"),
         model: template.model,
         format: template.format,
+        kiro_config: template.kiro_config,
       });
       // Set quirks fields individually to ensure Switch components update correctly
       form.setFieldValue(["quirks", "reasoning_all_or_nothing"], template.quirks.reasoning_all_or_nothing);
       form.setFieldValue(["quirks", "no_json_schema"], template.quirks.no_json_schema);
       form.setFieldValue(["quirks", "supports_reasoning_effort"], template.quirks.supports_reasoning_effort);
       form.setFieldValue(["quirks", "max_reasoning_effort"], template.quirks.max_reasoning_effort);
+      if (template.kiro_config) {
+        form.setFieldValue("kiro_config", {
+          ...defaultKiroConfig,
+          ...template.kiro_config,
+        });
+      } else {
+        form.setFieldValue("kiro_config", undefined);
+      }
     }
   };
 
@@ -229,9 +285,19 @@ export function ProviderForm({
         <Form.Item
           label="API Key"
           name="api_key"
-          rules={[{ required: true, message: "请输入 API Key" }]}
+          dependencies={["format"]}
+          rules={[
+            ({ getFieldValue }) => ({
+              validator: (_, value) => {
+                if (getFieldValue("format") !== "kiro" && !value) {
+                  return Promise.reject(new Error("请输入 API Key"));
+                }
+                return Promise.resolve();
+              },
+            }),
+          ]}
         >
-          <Input.Password placeholder="sk-..." />
+          <Input.Password placeholder={isKiro ? "Kiro 认证信息在下方填写" : "sk-..."} />
         </Form.Item>
 
         <Form.Item
@@ -254,6 +320,7 @@ export function ProviderForm({
             options={[
               { value: "openai", label: "OpenAI" },
               { value: "anthropic", label: "Anthropic" },
+              { value: "kiro", label: "Kiro / Amazon Q Developer" },
             ]}
           />
         </Form.Item>
@@ -264,11 +331,148 @@ export function ProviderForm({
           message={
             <Text type="secondary" style={{ fontSize: 12 }}>
               大多数 Provider（OpenAI、DeepSeek、Gemini、Azure 等）都使用 OpenAI 格式。
-              只有直连 Anthropic 官方 API 时才选 Anthropic 格式。
+              直连 Anthropic 官方 API 时选 Anthropic 格式；Kiro 使用独立认证设置。
             </Text>
           }
         />
       </Card>
+
+      {isKiro && (
+        <Collapse
+          defaultActiveKey={["kiro"]}
+          style={{ marginBottom: 16 }}
+          items={[
+            {
+              key: "kiro",
+              label: "Kiro 设置",
+              children: (
+                <>
+                  <Form.Item
+                    label="认证方式"
+                    name={["kiro_config", "auth_method"]}
+                    rules={[{ required: true, message: "请选择认证方式" }]}
+                  >
+                    <Select
+                      style={{ width: 220 }}
+                      options={[
+                        { value: "social", label: "Social / Refresh Token" },
+                        { value: "idc", label: "IAM Identity Center" },
+                        { value: "api_key", label: "API Key" },
+                      ]}
+                    />
+                  </Form.Item>
+
+                  <Form.Item
+                    label={kiroAuthMethod === "api_key" ? "Access Token / API Key" : "Refresh Token"}
+                    name={["kiro_config", "refresh_token"]}
+                    tooltip={kiroAuthMethod === "api_key" ? "api_key 模式下会作为 Bearer token 使用" : undefined}
+                  >
+                    <Input.Password placeholder={kiroAuthMethod === "api_key" ? "eyJ..." : "refresh token"} />
+                  </Form.Item>
+
+                  {kiroAuthMethod === "idc" && (
+                    <>
+                      <Form.Item label="Client ID" name={["kiro_config", "client_id"]}>
+                        <Input placeholder="IAM IdC client id" />
+                      </Form.Item>
+                      <Form.Item label="Client Secret" name={["kiro_config", "client_secret"]}>
+                        <Input.Password placeholder="IAM IdC client secret" />
+                      </Form.Item>
+                      <Form.Item label="Profile ARN" name={["kiro_config", "profile_arn"]}>
+                        <Input placeholder="arn:aws:..." />
+                      </Form.Item>
+                    </>
+                  )}
+
+                  <Space size="middle" wrap>
+                    <Form.Item
+                      label="Region"
+                      name={["kiro_config", "region"]}
+                      rules={[{ required: true, message: "请输入 Region" }]}
+                    >
+                      <Input placeholder="us-east-1" style={{ width: 180 }} />
+                    </Form.Item>
+                    <Form.Item label="API Region" name={["kiro_config", "api_region"]}>
+                      <Input placeholder="默认同 Region" style={{ width: 180 }} />
+                    </Form.Item>
+                    <Form.Item label="Kiro Version" name={["kiro_config", "kiro_version"]}>
+                      <Input placeholder="0.11.107" style={{ width: 180 }} />
+                    </Form.Item>
+                  </Space>
+
+                  <Form.Item label="Proxy URL" name={["kiro_config", "proxy_url"]}>
+                    <Input placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:7890" />
+                  </Form.Item>
+
+                  <Space size="middle" wrap>
+                    <Form.Item label="Thinking 模式" name={["kiro_config", "thinking_mode"]}>
+                      <Select
+                        style={{ width: 220 }}
+                        options={[
+                          { value: "as_reasoning_content", label: "Reasoning Content" },
+                          { value: "remove", label: "移除" },
+                          { value: "pass", label: "保留标签" },
+                          { value: "strip_tags", label: "去标签保留内容" },
+                        ]}
+                      />
+                    </Form.Item>
+                    <Form.Item label="首选端点" name={["kiro_config", "preferred_endpoint"]}>
+                      <Select
+                        style={{ width: 180 }}
+                        options={[
+                          { value: "auto", label: "Auto" },
+                          { value: "kiro", label: "Kiro IDE" },
+                          { value: "codewhisperer", label: "CodeWhisperer" },
+                          { value: "amazonq", label: "AmazonQ" },
+                        ]}
+                      />
+                    </Form.Item>
+                    <Form.Item
+                      label="429 降级"
+                      name={["kiro_config", "endpoint_fallback"]}
+                      valuePropName="checked"
+                    >
+                      <Switch />
+                    </Form.Item>
+                  </Space>
+
+                  <Space size="middle" wrap>
+                    <Form.Item
+                      label="Web Search"
+                      name={["kiro_config", "web_search_enabled"]}
+                      valuePropName="checked"
+                    >
+                      <Switch />
+                    </Form.Item>
+                    <Form.Item
+                      label="Agentic Prompt"
+                      name={["kiro_config", "agentic_prompt_injection"]}
+                      valuePropName="checked"
+                    >
+                      <Switch />
+                    </Form.Item>
+                  </Space>
+
+                  <Space size="middle" wrap>
+                    <Form.Item label="首 Token 超时" name={["kiro_config", "first_token_timeout"]}>
+                      <InputNumber min={1} addonAfter="秒" style={{ width: 140 }} />
+                    </Form.Item>
+                    <Form.Item label="流式读取超时" name={["kiro_config", "streaming_read_timeout"]}>
+                      <InputNumber min={1} addonAfter="秒" style={{ width: 140 }} />
+                    </Form.Item>
+                    <Form.Item label="首 Token 重试" name={["kiro_config", "first_token_max_retries"]}>
+                      <InputNumber min={0} style={{ width: 120 }} />
+                    </Form.Item>
+                    <Form.Item label="配额冷却" name={["kiro_config", "quota_cooldown_secs"]}>
+                      <InputNumber min={0} addonAfter="秒" style={{ width: 140 }} />
+                    </Form.Item>
+                  </Space>
+                </>
+              ),
+            },
+          ]}
+        />
+      )}
 
       <Collapse
         style={{ marginBottom: 16 }}
@@ -347,11 +551,15 @@ export function ProviderForm({
 /** Inline test button that validates form fields and tests the provider. */
 function TestConnectionButton({ form }: { form: ReturnType<typeof Form.useForm<ProviderConfig>>[0] }) {
   const [testing, setTesting] = useState(false);
+  const providerFormat = Form.useWatch("format", form);
 
   const handleTest = async () => {
     try {
       // Validate required fields first
-      const values = await form.validateFields(["name", "base_url", "api_key", "model", "format"]);
+      const requiredFields = providerFormat === "kiro"
+        ? ["name", "base_url", "model", "format"]
+        : ["name", "base_url", "api_key", "model", "format"];
+      const values = await form.validateFields(requiredFields);
       const provider: ProviderConfig = {
         ...values,
         quirks: form.getFieldValue("quirks") || {
@@ -388,8 +596,9 @@ function TestConnectionButton({ form }: { form: ReturnType<typeof Form.useForm<P
       icon={<ThunderboltOutlined />}
       loading={testing}
       onClick={handleTest}
+      disabled={providerFormat === "kiro"}
     >
-      测试连接
+      {providerFormat === "kiro" ? "在 Kiro 面板测试" : "测试连接"}
     </Button>
   );
 }

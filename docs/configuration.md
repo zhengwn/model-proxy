@@ -16,17 +16,26 @@
 # 必须匹配某个 [[providers]] 的 name 字段
 # 如果省略，使用 providers 列表中的第一个
 active_provider = "deepseek"
+model_routes_enabled = true
 
 [server]
 # 代理服务监听端口
 port = 4000
+# 监听地址，默认仅本机访问；对外提供服务可设为 "0.0.0.0"
+host = "127.0.0.1"
 
 # 客户端认证密钥（可选）
 # 设置后，客户端必须通过 x-api-key 或 Authorization: Bearer 提供此值
 # api_key = "your-server-api-key"
 
+# Admin API 认证密钥（可选，Kiro 管理面板需要）
+# admin_api_key = "your-admin-api-key"
+
 # 请求体大小上限（字节），默认 64MB
 # max_body_bytes = 67108864
+
+# 每个 Provider 的最大并发请求数，0 表示不限制
+# max_concurrent_requests = 0
 
 # --- 全局模型路由 ---
 # 当客户端请求的 model 名称包含 match 值时，路由到 target 模型
@@ -50,7 +59,7 @@ name = "deepseek"                        # 唯一标识名（1-64 字符）
 base_url = "https://api.deepseek.com/v1" # API 基础 URL
 api_key = "sk-deepseek-key"              # Provider 的 API Key
 model = "deepseek-v4-pro"                # 默认模型（未匹配路由时使用）
-format = "openai"                        # API 格式：openai 或 anthropic
+format = "openai"                        # API 格式：openai、anthropic 或 kiro
 
 # Provider 特殊行为配置
 [providers.quirks]
@@ -73,6 +82,27 @@ api_key = "sk-ant-key"
 model = "claude-sonnet-4-20250514"
 format = "anthropic"
 
+[[providers]]
+name = "kiro"
+base_url = "https://q.us-east-1.amazonaws.com"
+model = "claude-sonnet-4.5"
+format = "kiro"
+
+[providers.kiro_config]
+auth_method = "social"                   # social | idc | api_key
+refresh_token = "your-kiro-refresh-token"
+region = "us-east-1"
+thinking_mode = "as_reasoning_content"
+preferred_endpoint = "auto"
+endpoint_fallback = true
+
+# --- 故障回退配置 ---
+
+[fallback]
+enabled = false
+on_status_codes = [429, 500, 502, 503, 504]
+max_attempts = 2
+
 # --- 日志配置 ---
 
 [logging]
@@ -91,8 +121,11 @@ retention_days = 7       # 日志文件保留天数
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `port` | u16 | 必填 | 监听端口 |
+| `host` | string | "127.0.0.1" | 监听地址 |
 | `api_key` | string? | 无 | 客户端认证密钥，不设置则不鉴权 |
+| `admin_api_key` | string? | 无 | Admin API 认证密钥 |
 | `max_body_bytes` | usize | 67108864 (64MB) | 请求体大小上限 |
+| `max_concurrent_requests` | usize | 0 | 每个 Provider 最大并发请求数，0 表示不限制 |
 
 ### providers
 
@@ -100,10 +133,11 @@ retention_days = 7       # 日志文件保留天数
 |------|------|--------|------|
 | `name` | string | 必填 | 唯一标识，1-64 字符 |
 | `base_url` | string | 必填 | API 基础 URL（不含路径） |
-| `api_key` | string | 必填 | Provider API Key |
+| `api_key` | string | 非 Kiro 必填 | Provider API Key |
 | `model` | string | 必填 | 默认模型名 |
-| `format` | string | "openai" | API 格式：`openai` 或 `anthropic` |
+| `format` | string | "openai" | API 格式：`openai`、`anthropic` 或 `kiro` |
 | `quirks` | object | 全 false | 特殊行为开关 |
+| `kiro_config` | object? | 无 | Kiro 专用认证和运行配置 |
 
 ### providers.quirks
 
@@ -113,6 +147,23 @@ retention_days = 7       # 日志文件保留天数
 | `no_json_schema` | bool | false | 不支持 json_schema 响应格式，降级为 json_object |
 | `supports_reasoning_effort` | bool | false | 是否转发 reasoning_effort 参数 |
 | `max_reasoning_effort` | string | "high" | Anthropic "max" 推理强度映射到的值 |
+
+### providers.kiro_config
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `auth_method` | string | 必填 | `social`、`idc` 或 `api_key` |
+| `refresh_token` | string? | 无 | social/idc refresh token；api_key 模式下作为 access token |
+| `client_id` | string? | 无 | IAM Identity Center client id |
+| `client_secret` | string? | 无 | IAM Identity Center client secret |
+| `profile_arn` | string? | 无 | AWS profile ARN |
+| `region` | string | "us-east-1" | 认证区域 |
+| `api_region` | string? | 同 region | Kiro API 区域 |
+| `proxy_url` | string? | 无 | HTTP/SOCKS5 代理 |
+| `thinking_mode` | string? | "as_reasoning_content" | thinking 处理模式 |
+| `preferred_endpoint` | string? | "auto" | `auto`、`kiro`、`codewhisperer` 或 `amazonq` |
+| `endpoint_fallback` | bool? | true | 429 时是否降级到其他端点 |
+| `accounts` | array? | 无 | 多账户凭据池 |
 
 ### model_routes
 
@@ -164,6 +215,12 @@ model = "deepseek-chat"
 代理直接透传请求到 `{base_url}/v1/messages`，不做格式转换。
 
 适用于：Anthropic Claude API。
+
+### format = "kiro"
+
+代理使用 Kiro/Amazon Q Developer 上游协议。该格式需要配置 `[providers.kiro_config]`，Provider 的 `api_key` 可留空。
+
+适用于：Kiro IDE / Amazon Q Developer 兼容访问。
 
 ## 限制
 

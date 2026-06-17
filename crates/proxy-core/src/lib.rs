@@ -140,7 +140,7 @@ fn start_server_with_state(state: AppState, port: u16, token: CancellationToken)
         .route("/api/kiro/social/exchange", post(proxy_kiro_social_exchange))
         .route("/api/event_logging/batch", post(event_logging_batch))
         .merge(admin_routes)
-        // Client auth middleware (skips /health, /metrics, /v1/models)
+        // Client auth middleware (skips /health, /metrics, /v1/models, /api/admin/*)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             server::client_auth_middleware,

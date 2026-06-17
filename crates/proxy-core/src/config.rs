@@ -160,6 +160,7 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub name: String,
     pub base_url: String,
+    #[serde(default)]
     pub api_key: String,
     pub model: String,
     #[serde(default = "default_format")]
@@ -492,7 +493,7 @@ impl Config {
                     field: "base_url".to_string(),
                 });
             }
-            if provider.api_key.is_empty() {
+            if provider.api_key.is_empty() && provider.format != ProviderFormat::Kiro {
                 return Err(ConfigError::MissingField {
                     provider: provider.name.clone(),
                     field: "api_key".to_string(),
@@ -820,6 +821,42 @@ mod config_tests {
             config.validate(),
             Err(ConfigError::MissingField { field, .. }) if field == "api_key"
         ));
+    }
+
+    #[test]
+    fn kiro_provider_allows_empty_api_key() {
+        let mut p = make_provider("kiro");
+        p.format = ProviderFormat::Kiro;
+        p.api_key = String::new();
+        p.kiro_config = Some(KiroConfig {
+            auth_method: "social".to_string(),
+            refresh_token: Some("refresh".to_string()),
+            client_id: None,
+            client_secret: None,
+            profile_arn: None,
+            region: "us-east-1".to_string(),
+            api_region: None,
+            model_aliases: None,
+            hidden_models: None,
+            kiro_version: None,
+            proxy_url: None,
+            thinking_mode: None,
+            web_search_enabled: None,
+            accounts: None,
+            load_balancing_mode: None,
+            agentic_prompt_injection: None,
+            first_token_timeout: None,
+            streaming_read_timeout: None,
+            first_token_max_retries: None,
+            quota_cooldown_secs: None,
+            health_score_decay: None,
+            health_score_recovery: None,
+            preferred_endpoint: None,
+            endpoint_fallback: None,
+        });
+        let config = make_config(vec![p]);
+
+        assert!(config.validate().is_ok());
     }
 
     #[test]

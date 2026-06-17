@@ -1,6 +1,8 @@
 export interface ServerConfig {
   port: number;
+  host?: string;
   api_key?: string;
+  admin_api_key?: string;
   max_body_bytes?: number;
   max_concurrent_requests?: number;
 }
@@ -18,13 +20,57 @@ export interface ModelRoute {
   reasoning_effort?: string;
 }
 
+export type ProviderFormat = "openai" | "anthropic" | "kiro";
+
+export interface KiroAccountEntry {
+  auth_method?: string;
+  refresh_token?: string;
+  client_id?: string;
+  client_secret?: string;
+  profile_arn?: string;
+  region?: string;
+  api_region?: string;
+  proxy_url?: string;
+  priority?: number;
+  disabled?: boolean;
+}
+
+export interface KiroConfig {
+  auth_method: string;
+  refresh_token?: string;
+  client_id?: string;
+  client_secret?: string;
+  profile_arn?: string;
+  region: string;
+  api_region?: string;
+  model_aliases?: Record<string, string>;
+  hidden_models?: string[];
+  kiro_version?: string;
+  proxy_url?: string;
+  thinking_mode?: string;
+  web_search_enabled?: boolean;
+  accounts?: KiroAccountEntry[];
+  load_balancing_mode?: string;
+  agentic_prompt_injection?: boolean;
+  first_token_timeout?: number;
+  streaming_read_timeout?: number;
+  first_token_max_retries?: number;
+  quota_cooldown_secs?: number;
+  health_score_decay?: number;
+  health_score_recovery?: number;
+  preferred_endpoint?: string;
+  endpoint_fallback?: boolean;
+}
+
 export interface ProviderConfig {
   name: string;
   base_url: string;
   api_key: string;
   model: string;
-  format: "openai" | "anthropic";
+  format: ProviderFormat;
   quirks: ProviderQuirks;
+  model_routes?: ModelRoute[];
+  kiro_config?: KiroConfig;
 }
 
 export interface ProvidersInfo {
@@ -37,6 +83,7 @@ export interface Config {
   active_provider?: string;
   providers: ProviderConfig[];
   model_routes?: ModelRoute[];
+  model_routes_enabled?: boolean;
   logging?: LoggingConfig;
   fallback?: FallbackConfig;
 }

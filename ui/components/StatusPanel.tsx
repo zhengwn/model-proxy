@@ -50,14 +50,18 @@ function StatusPanel() {
   }, [loadProviders]);
   const { config, configPath, isNew, saveServerConfig } = useConfig();
   const [actionLoading, setActionLoading] = useState(false);
+  const [serverHost, setServerHost] = useState<string>("127.0.0.1");
   const [serverPort, setServerPort] = useState<number>(4000);
   const [serverApiKey, setServerApiKey] = useState<string>("");
+  const [serverAdminApiKey, setServerAdminApiKey] = useState<string>("");
   const [serverDirty, setServerDirty] = useState(false);
 
   useEffect(() => {
     if (config) {
+      setServerHost(config.server.host || "127.0.0.1");
       setServerPort(config.server.port);
       setServerApiKey(config.server.api_key || "");
+      setServerAdminApiKey(config.server.admin_api_key || "");
     }
   }, [config]);
 
@@ -67,8 +71,10 @@ function StatusPanel() {
       if (serverDirty && config) {
         await saveServerConfig({
           ...config.server,
+          host: serverHost || "127.0.0.1",
           port: serverPort,
           api_key: serverApiKey || undefined,
+          admin_api_key: serverAdminApiKey || undefined,
         });
         setServerDirty(false);
       }
@@ -98,8 +104,10 @@ function StatusPanel() {
     try {
       await saveServerConfig({
         ...config.server,
+        host: serverHost || "127.0.0.1",
         port: serverPort,
         api_key: serverApiKey || undefined,
+        admin_api_key: serverAdminApiKey || undefined,
       });
       setServerDirty(false);
       message.success("服务器设置已保存");
@@ -108,8 +116,10 @@ function StatusPanel() {
     }
   };
 
+  const localDisplayHost = !serverHost || serverHost === "0.0.0.0" ? "localhost" : serverHost;
+
   const handleCopyAddress = () => {
-    const addr = `http://localhost:${serverPort}`;
+    const addr = `http://${localDisplayHost}:${serverPort}`;
     navigator.clipboard.writeText(addr).then(() => {
       message.success("已复制: " + addr);
     });
@@ -185,7 +195,7 @@ function StatusPanel() {
           <Col span={6}>
             <Statistic
               title="监听地址"
-              value={isRunning ? `localhost:${serverPort}` : "-"}
+              value={isRunning ? status?.listen_addr ?? `${serverHost}:${serverPort}` : "-"}
               suffix={
                 isRunning && (
                   <Tooltip title="复制连接地址">
@@ -234,7 +244,22 @@ function StatusPanel() {
 
       {/* Inline server settings */}
       <Card title="服务器设置" size="small">
-        <Row gutter={16} align="middle">
+        <Row gutter={[16, 12]} align="middle">
+          <Col>
+            <Space>
+              <Text>Host:</Text>
+              <Input
+                placeholder="127.0.0.1"
+                value={serverHost}
+                disabled={isRunning}
+                onChange={(e) => {
+                  setServerHost(e.target.value);
+                  setServerDirty(true);
+                }}
+                style={{ width: 140 }}
+              />
+            </Space>
+          </Col>
           <Col>
             <Space>
               <Text>端口:</Text>
@@ -253,13 +278,28 @@ function StatusPanel() {
           </Col>
           <Col>
             <Space>
-              <Text>API Key:</Text>
+              <Text>Client Key:</Text>
               <Input.Password
                 placeholder="留空则不鉴权"
                 value={serverApiKey}
                 disabled={isRunning}
                 onChange={(e) => {
                   setServerApiKey(e.target.value);
+                  setServerDirty(true);
+                }}
+                style={{ width: 200 }}
+              />
+            </Space>
+          </Col>
+          <Col>
+            <Space>
+              <Text>Admin Key:</Text>
+              <Input.Password
+                placeholder="留空则不鉴权"
+                value={serverAdminApiKey}
+                disabled={isRunning}
+                onChange={(e) => {
+                  setServerAdminApiKey(e.target.value);
                   setServerDirty(true);
                 }}
                 style={{ width: 200 }}
@@ -297,7 +337,7 @@ function StatusPanel() {
             <Space direction="vertical" size={2}>
               <Text>
                 服务已启动，将 IDE 的 API Base URL 设置为{" "}
-                <Text code copyable>{`http://localhost:${serverPort}`}</Text>
+                <Text code copyable>{`http://${localDisplayHost}:${serverPort}`}</Text>
               </Text>
               {serverApiKey && (
                 <Text type="secondary" style={{ fontSize: 12 }}>

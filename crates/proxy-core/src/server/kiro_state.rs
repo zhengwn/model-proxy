@@ -22,6 +22,8 @@ use crate::convert::kiro::truncation::TruncationState;
 /// All Kiro-specific runtime state, only initialized when a Kiro provider exists.
 #[derive(Clone)]
 pub struct KiroState {
+    /// Provider name this runtime state was initialized from.
+    pub provider_name: String,
     /// Single-account auth manager (mutually exclusive with `account_manager`).
     pub auth: Option<Arc<Mutex<KiroAuthManager>>>,
     /// Multi-account manager for load balancing / failover.
@@ -48,16 +50,23 @@ impl KiroState {
     ///
     /// Returns `None` if no Kiro provider is configured.
     pub fn from_config(config: &Config, client: &reqwest::Client) -> Option<Self> {
-        let kiro_provider = config
-            .providers
-            .iter()
-            .find(|p| p.format == ProviderFormat::Kiro)?;
+        let active_kiro = config
+            .active_provider_config()
+            .ok()
+            .filter(|p| p.format == ProviderFormat::Kiro);
+        let kiro_provider = active_kiro.or_else(|| {
+            config
+                .providers
+                .iter()
+                .find(|p| p.format == ProviderFormat::Kiro)
+        })?;
 
         let kiro_config = kiro_provider.kiro_config.as_ref()?;
 
         let (auth, account_manager) = init_kiro_auth(kiro_config, &kiro_provider.name, client);
 
         Some(Self {
+            provider_name: kiro_provider.name.clone(),
             auth,
             account_manager,
             flow_monitor: Arc::new(Mutex::new(FlowMonitor::new(1000))),
