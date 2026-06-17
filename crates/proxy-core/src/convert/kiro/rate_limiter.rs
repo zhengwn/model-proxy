@@ -99,15 +99,14 @@ impl RateLimiter {
     }
 
     /// Wait until a request is allowed, then proceed.
-    /// Note: callers must hold the Mutex guard (SharedRateLimiter).
-    pub async fn acquire(&mut self, account_id: &str) {
-        loop {
-            match self.check(account_id) {
-                Ok(_) => break,
-                Err(wait) => {
-                    tokio::time::sleep(wait).await;
-                }
-            }
+    /// Returns the wait duration that was slept (if any).
+    /// Note: callers should NOT hold the Mutex guard across this call.
+    /// Instead, use `check()` to get the wait duration, drop the guard,
+    /// sleep, then re-acquire and call `check()` again.
+    pub fn wait_duration(&mut self, account_id: &str) -> Duration {
+        match self.check(account_id) {
+            Ok(_) => Duration::ZERO,
+            Err(wait) => wait,
         }
     }
 }

@@ -18,31 +18,25 @@ use tracing::debug;
 pub fn convert_cache_control(body: &mut Value) {
     let mut has_cache_markers = false;
 
-    if let Some(system) = body.get_mut("system") {
-        if let Value::Array(blocks) = system {
-            for block in blocks.iter_mut() {
-                if block.get("cache_control").is_some() {
-                    has_cache_markers = true;
-                    if let Some(obj) = block.as_object_mut() {
-                        obj.remove("cache_control");
-                    }
+    if let Some(Value::Array(blocks)) = body.get_mut("system") {
+        for block in blocks.iter_mut() {
+            if block.get("cache_control").is_some() {
+                has_cache_markers = true;
+                if let Some(obj) = block.as_object_mut() {
+                    obj.remove("cache_control");
                 }
             }
         }
     }
 
-    if let Some(messages) = body.get_mut("messages") {
-        if let Value::Array(msgs) = messages {
-            for msg in msgs.iter_mut() {
-                if let Some(content) = msg.get_mut("content") {
-                    if let Value::Array(blocks) = content {
-                        for block in blocks.iter_mut() {
-                            if block.get("cache_control").is_some() {
-                                has_cache_markers = true;
-                                if let Some(obj) = block.as_object_mut() {
-                                    obj.remove("cache_control");
-                                }
-                            }
+    if let Some(Value::Array(msgs)) = body.get_mut("messages") {
+        for msg in msgs.iter_mut() {
+            if let Some(Value::Array(blocks)) = msg.get_mut("content") {
+                for block in blocks.iter_mut() {
+                    if block.get("cache_control").is_some() {
+                        has_cache_markers = true;
+                        if let Some(obj) = block.as_object_mut() {
+                            obj.remove("cache_control");
                         }
                     }
                 }
@@ -50,15 +44,13 @@ pub fn convert_cache_control(body: &mut Value) {
         }
     }
 
-    if let Some(tools) = body.get_mut("tools") {
-        if let Value::Array(tool_arr) = tools {
-            for tool in tool_arr.iter_mut() {
-                if tool.get("cache_control").is_some() {
-                    has_cache_markers = true;
-                    if let Some(obj) = tool.as_object_mut() {
-                        obj.remove("cache_control");
-                        obj.insert("cachePoint".to_string(), json!(true));
-                    }
+    if let Some(Value::Array(tool_arr)) = body.get_mut("tools") {
+        for tool in tool_arr.iter_mut() {
+            if tool.get("cache_control").is_some() {
+                has_cache_markers = true;
+                if let Some(obj) = tool.as_object_mut() {
+                    obj.remove("cache_control");
+                    obj.insert("cachePoint".to_string(), json!(true));
                 }
             }
         }
@@ -125,6 +117,8 @@ pub struct PromptCacheProfile {
 #[derive(Debug, Clone)]
 struct CacheEntry {
     expires_at: Instant,
+    /// Retained for diagnostics; expiry is enforced via `expires_at`.
+    #[allow(dead_code)]
     ttl: Duration,
 }
 
@@ -317,7 +311,7 @@ fn flatten_cache_blocks(body: &Value) -> Vec<CacheableBlock> {
                 "input_schema": schema,
             });
             let tokens = estimate_approx_tokens(name) + estimate_approx_tokens(desc)
-                + schema.map(|s| estimate_json_tokens(s)).unwrap_or(0);
+                + schema.map(estimate_json_tokens).unwrap_or(0);
 
             blocks.push(CacheableBlock {
                 value: val,
@@ -527,7 +521,7 @@ pub fn estimate_approx_tokens(text: &str) -> usize {
     }
     let rune_count = text.chars().count();
     if rune_count < 5 {
-        return ((text.len() + 2) / 3).max(1);
+        return text.len().div_ceil(3).max(1);
     }
 
     let mut regular_ascii = 0f64;

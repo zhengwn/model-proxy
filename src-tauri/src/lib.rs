@@ -35,17 +35,19 @@ use proxy_core::config::{Config, ModelRoute, ProviderConfig};
 use proxy_core::logging::LogConfig;
 use proxy_core::ProviderRegistry;
 
-use commands::AppState;
+use commands::TauriState;
 use service::ServiceManager;
 
 type SharedRegistry = Arc<ArcSwap<ProviderRegistry>>;
 type SharedProvider = Arc<ArcSwap<ProviderConfig>>;
 type SharedModelRoutes = Arc<ArcSwap<Vec<ModelRoute>>>;
 type SharedLogConfig = Arc<ArcSwap<LogConfig>>;
+type SharedModelRoutesEnabled = Arc<std::sync::atomic::AtomicBool>;
 type SharedProviderState = (
     SharedRegistry,
     SharedProvider,
     SharedModelRoutes,
+    SharedModelRoutesEnabled,
     SharedLogConfig,
 );
 
@@ -74,6 +76,8 @@ pub fn run() {
             commands::delete_provider,
             commands::get_model_routes,
             commands::save_model_routes,
+            commands::get_model_routes_enabled,
+            commands::set_model_routes_enabled,
             commands::test_provider,
             // Kiro management commands
             commands::kiro_list_credentials,
@@ -110,36 +114,39 @@ pub fn run() {
 
             // Try to load config and build registry + active provider.
             // If config doesn't exist yet (first launch), use empty defaults.
-            let (registry, active_provider, model_routes, log_config) = if config_path.exists() {
+            let (registry, active_provider, model_routes, model_routes_enabled, log_config) = if config_path.exists() {
                 match load_provider_state(&config_path) {
-                    Ok((reg, active, routes, log_cfg)) => (reg, active, routes, log_cfg),
+                    Ok((reg, active, routes, routes_enabled, log_cfg)) => (reg, active, routes, routes_enabled, log_cfg),
                     Err(e) => {
                         warn!("加载配置失败，使用空 Registry: {}", e);
-                        let (reg, active, routes) = empty_provider_state();
+                        let (reg, active, routes, routes_enabled) = empty_provider_state();
                         (
                             reg,
                             active,
                             routes,
+                            routes_enabled,
                             Arc::new(ArcSwap::from_pointee(LogConfig::default())),
                         )
                     }
                 }
             } else {
-                let (reg, active, routes) = empty_provider_state();
+                let (reg, active, routes, routes_enabled) = empty_provider_state();
                 (
                     reg,
                     active,
                     routes,
+                    routes_enabled,
                     Arc::new(ArcSwap::from_pointee(LogConfig::default())),
                 )
             };
 
             // Register managed state
-            app.manage(AppState {
+            app.manage(TauriState {
                 config_path,
                 registry,
                 active_provider,
                 model_routes,
+                model_routes_enabled,
                 config_lock: Arc::new(Mutex::new(())),
                 log_config,
             });
@@ -183,26 +190,30 @@ fn load_provider_state(config_path: &std::path::Path) -> Result<SharedProviderSt
 
     let active_provider = Arc::new(ArcSwap::from_pointee(active.clone()));
     let model_routes = Arc::new(ArcSwap::from_pointee(config.model_routes.clone()));
+    let model_routes_enabled = Arc::new(std::sync::atomic::AtomicBool::new(config.model_routes_enabled));
     let log_config = Arc::new(ArcSwap::from_pointee(config.logging.clone()));
 
     Ok((
         Arc::new(ArcSwap::from_pointee(registry)),
         active_provider,
         model_routes,
+        model_routes_enabled,
         log_config,
     ))
 }
 
 /// Create empty provider state for when no config exists yet.
-fn empty_provider_state() -> (SharedRegistry, SharedProvider, SharedModelRoutes) {
+fn empty_provider_state() -> (SharedRegistry, SharedProvider, SharedModelRoutes, SharedModelRoutesEnabled) {
     let registry = ProviderRegistry::new(vec![]).expect("空 Registry 不应失败");
     let placeholder = ProviderConfig::placeholder();
     let active_provider = Arc::new(ArcSwap::from_pointee(placeholder));
     let model_routes = Arc::new(ArcSwap::from_pointee(Vec::new()));
+    let model_routes_enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
     (
         Arc::new(ArcSwap::from_pointee(registry)),
         active_provider,
         model_routes,
+        model_routes_enabled,
     )
 }

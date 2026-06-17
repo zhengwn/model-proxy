@@ -4,7 +4,6 @@
 //! encounters recoverable errors (403, 429, 402). Uses exponential backoff
 //! with probabilistic retry for broken accounts.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -32,21 +31,17 @@ pub fn classify_error(status: u16, body: &str) -> ErrorClass {
         402 | 403 | 429 => {
             if lower_body.contains("temporarily_suspended") || lower_body.contains("suspended") {
                 ErrorClass::Suspended
-            } else if status == 402 {
-                ErrorClass::Recoverable // Quota exceeded
-            } else if status == 403 {
-                ErrorClass::Recoverable // Token expired/invalid
             } else {
-                ErrorClass::Recoverable // Rate limit
+                // 402 quota exceeded, 403 token expired/invalid, 429 rate limit
+                ErrorClass::Recoverable
             }
         }
         400 => {
             if body.contains("INVALID_MODEL_ID") {
                 ErrorClass::Recoverable // Model not on this tier
-            } else if body.contains("CONTENT_LENGTH_EXCEEDS") {
-                ErrorClass::Fatal
             } else {
-                ErrorClass::Fatal // Malformed request
+                // CONTENT_LENGTH_EXCEEDS or other malformed request
+                ErrorClass::Fatal
             }
         }
         422 => ErrorClass::Fatal, // Validation error
@@ -178,6 +173,7 @@ pub enum LoadBalancingMode {
 }
 
 impl LoadBalancingMode {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
             "balanced" => Self::Balanced,
@@ -349,12 +345,11 @@ impl AccountManager {
             }
 
             // Probabilistic retry for broken accounts
-            if account.circuit.state == CircuitState::Broken {
-                if self.should_probabilistic_retry(i) {
+            if account.circuit.state == CircuitState::Broken
+                && self.should_probabilistic_retry(i) {
                     found_idx = Some(i);
                     break;
                 }
-            }
         }
 
         if let Some(idx) = found_idx {
@@ -386,12 +381,11 @@ impl AccountManager {
                 break;
             }
             // Probabilistic retry for broken accounts
-            if account.circuit.state == CircuitState::Broken {
-                if self.should_probabilistic_retry(idx) {
+            if account.circuit.state == CircuitState::Broken
+                && self.should_probabilistic_retry(idx) {
                     found_idx = Some(idx);
                     break;
                 }
-            }
         }
 
         if let Some(idx) = found_idx {
@@ -658,7 +652,7 @@ impl AccountManager {
                 Some(ErrorClass::Recoverable) | None => {
                     // Heal: halve error count, clear cooldown, move to HalfOpen
                     let old_failures = account.circuit.failures;
-                    account.circuit.failures = account.circuit.failures / 2;
+                    account.circuit.failures /= 2;
                     if account.circuit.failures == 0 {
                         account.circuit.state = CircuitState::Active;
                     } else {

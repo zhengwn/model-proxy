@@ -1,4 +1,3 @@
-use super::*;
 use super::request as convert;
 use super::response;
 use super::stream;
@@ -27,6 +26,7 @@ fn test_config_with_model(model: &str) -> Config {
         active_provider: None,
         providers: Vec::new(),
         model_routes: Vec::new(),
+        model_routes_enabled: true,
         logging: Default::default(),
         fallback: Default::default(),
     }

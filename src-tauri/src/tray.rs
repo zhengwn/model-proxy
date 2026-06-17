@@ -1,5 +1,4 @@
 use tauri::{
-    image::Image,
     menu::{MenuBuilder, MenuItemBuilder},
     tray::TrayIconBuilder,
     AppHandle, Manager,
@@ -37,7 +36,7 @@ pub fn create_tray(app: &AppHandle) -> tauri::Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        let tray_icon = Image::new(include_bytes!("../icons/tray-template.rgba"), 32, 32);
+        let tray_icon = tauri::image::Image::new(include_bytes!("../icons/tray-template.rgba"), 32, 32);
         builder = builder.icon(tray_icon).icon_as_template(true);
     }
 
@@ -60,7 +59,7 @@ pub fn create_tray(app: &AppHandle) -> tauri::Result<()> {
                     let app_handle = app.clone();
                     tauri::async_runtime::spawn(async move {
                         let service = app_handle.state::<crate::service::ServiceManager>();
-                        let app_state = app_handle.state::<crate::commands::AppState>();
+                        let app_state = app_handle.state::<crate::commands::TauriState>();
                         // Invoke the same logic as the start_service command
                         if let Err(e) =
                             crate::commands::start_service(app_handle.clone(), app_state, service)

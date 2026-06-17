@@ -5,7 +5,7 @@
 //!
 //! Supports 4 output modes:
 //! - `as_reasoning_content`: Extract thinking to reasoning_content field
-//! `remove`: Remove thinking content entirely
+//! - `remove`: Remove thinking content entirely
 //! - `pass`: Pass through with original tags in content
 //! - `strip_tags`: Remove tags but keep content
 
@@ -36,6 +36,7 @@ pub enum ThinkingHandlingMode {
 }
 
 impl ThinkingHandlingMode {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
             "as_reasoning_content" => Self::AsReasoningContent,
@@ -74,8 +75,6 @@ pub struct ThinkingParser {
     cautious_buffer_size: usize,
     /// Accumulated thinking content for pass/strip_tags modes
     thinking_content: String,
-    /// Whether we've emitted the thinking opening tag (for pass mode)
-    emitted_open_tag: bool,
 }
 
 impl ThinkingParser {
@@ -89,7 +88,6 @@ impl ThinkingParser {
             initial_buffer_size: 20,
             cautious_buffer_size: 30, // max("<thinking>", "<reasoning>") * 2 + margin
             thinking_content: String::new(),
-            emitted_open_tag: false,
         }
     }
 
@@ -152,7 +150,7 @@ impl ThinkingParser {
         let trimmed = self.buffer.trim_start().to_string();
 
         // Check for opening tags
-        let open_tags = ["<thinking>", "<think>>", "<reasoning>", "<thought>"];
+        let open_tags = ["<thinking>", "<think>", "<reasoning>", "<thought>"];
         let mut found_tag = None;
 
         for tag in &open_tags {
@@ -358,7 +356,7 @@ mod tests {
         let mut parser = ThinkingParser::new(ThinkingHandlingMode::AsReasoningContent);
         let mut all = Vec::new();
 
-        all.extend(parser.feed("<think>>short thought</think>answer"));
+        all.extend(parser.feed("<think>short thought</think>answer"));
         all.extend(parser.finalize());
 
         let thinking: Vec<_> = all.iter().filter(|o| matches!(o, ThinkingOutput::ThinkingDelta(_))).collect();

@@ -280,8 +280,8 @@ pub fn events_to_responses_sse(
 
     for event in &events {
         match event {
-            super::eventstream::Event::AssistantResponse { content } => {
-                if !content.is_empty() {
+            super::eventstream::Event::AssistantResponse { content }
+                if !content.is_empty() => {
                     full_text.push_str(content);
                     sse_events.push(format!(
                         "event: response.output_text.delta\ndata: {}\n\n",
@@ -293,7 +293,6 @@ pub fn events_to_responses_sse(
                         })
                     ));
                 }
-            }
             super::eventstream::Event::ToolUse { tool_use_id, name, input, stop } => {
                 tool_uses.push((tool_use_id.clone(), name.clone(), input.clone()));
                 if *stop {

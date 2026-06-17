@@ -4,6 +4,8 @@
 //! Supports multiple credentials with automatic failover.
 
 use crate::config::KiroConfig;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use chrono::{DateTime, Duration, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -21,6 +23,7 @@ pub enum AuthMethod {
 }
 
 impl AuthMethod {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "social" => Self::Social,
@@ -134,9 +137,12 @@ struct TokenRecord {
 
 /// Save token to a JSON file for persistence across restarts.
 fn persist_token(cred: &KiroCredential) {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
     let path = format!(
         "{}/.config/model-proxy/kiro-token-{}.json",
-        std::env::var("HOME").unwrap_or_else(|_| ".".to_string()),
+        home,
         cred.region
     );
 
@@ -150,11 +156,12 @@ fn persist_token(cred: &KiroCredential) {
 
     if let Some(parent) = std::path::Path::new(&path).parent() {
         let _ = std::fs::create_dir_all(parent);
+        restrict_dir_permissions(parent);
     }
 
     match serde_json::to_string_pretty(&record) {
         Ok(json) => {
-            if let Err(e) = std::fs::write(&path, json) {
+            if let Err(e) = write_secret_file(&path, json.as_bytes()) {
                 tracing::warn!(path = path.as_str(), error = %e, "保存 Kiro token 失败");
             } else {
                 tracing::debug!(path = path.as_str(), "Kiro token 已保存");
@@ -163,6 +170,47 @@ fn persist_token(cred: &KiroCredential) {
         Err(e) => {
             tracing::warn!(error = %e, "序列化 Kiro token 失败");
         }
+    }
+}
+
+/// Write a file containing secrets with owner-only permissions (0600 on Unix).
+///
+/// On Unix the file is created with mode 0600 before any data is written, so the
+/// secret is never briefly world-readable. On other platforms it falls back to a
+/// regular write (NTFS ACLs already restrict to the user profile directory).
+fn write_secret_file(path: &str, contents: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        // Ensure mode is 0600 even if the file already existed with looser bits.
+        let perms = std::fs::Permissions::from_mode(0o600);
+        let _ = file.set_permissions(perms);
+        file.write_all(contents)
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
+}
+
+/// Restrict a directory holding secrets to owner-only access (0700 on Unix).
+fn restrict_dir_permissions(dir: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
     }
 }
 
@@ -193,8 +241,22 @@ fn write_back_to_source(cred: &KiroCredential, original_refresh_token: &str) {
     }
 }
 
+/// Escape a string for safe embedding as a single-quoted SQLite string literal.
+///
+/// Within a SQLite single-quoted string literal the *only* metacharacter is the
+/// single quote, which is escaped by doubling it (`''`). Backslashes and double
+/// quotes have **no** special meaning in SQLite string literals and must NOT be
+/// pre-escaped — doing so would corrupt the stored value. This is the same
+/// transformation a prepared-statement text binding performs internally, so it
+/// is injection-safe.
+fn sqlite_quote_literal(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
 /// Try to write refreshed token back to kiro-cli SQLite database.
-fn write_back_to_sqlite(cred: &KiroCredential, new_refresh_token: &str) {
+fn write_back_to_sqlite(_cred: &KiroCredential, new_refresh_token: &str) {
+    use std::io::Write;
+
     let home = match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
         Ok(h) => h,
         Err(_) => return,
@@ -211,27 +273,64 @@ fn write_back_to_sqlite(cred: &KiroCredential, new_refresh_token: &str) {
         return;
     }
 
-    // Use sqlite3 CLI to update the token in the auth_kv table.
-    // The kiro-cli stores tokens as base64-encoded JSON in the 'value' column.
-    // Escape for safe embedding in SQL string literal (single-quote doubling)
-    // and JSON string (backslash-escape double quotes and backslashes).
-    let escaped_token = new_refresh_token
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\'', "''");
+    // Defense in depth: treat the refresh token as untrusted (it comes from a
+    // network response). A legitimate OAuth refresh token never contains NUL or
+    // other control characters and is not pathologically long. Refuse to write
+    // back anything that looks malformed, so a compromised upstream cannot use
+    // the token to tamper with the user's local kiro-cli database.
+    if new_refresh_token.is_empty()
+        || new_refresh_token.len() > 8192
+        || new_refresh_token.chars().any(|c| c.is_control())
+    {
+        tracing::warn!("refresh token 含非法字符或长度异常，跳过 SQLite 回写");
+        return;
+    }
 
-    // Try to update the social token entry
+    // The kiro-cli stores tokens as base64-encoded JSON in the 'value' column.
+    // We update only the refreshToken JSON field via json_set(), which performs
+    // its own JSON encoding of the value. The token is embedded as a SQL string
+    // literal escaped via `sqlite_quote_literal` (single-quote doubling only).
+    let token_literal = sqlite_quote_literal(new_refresh_token);
+
+    // Note: key_prefix values below are hardcoded constants (not user input),
+    // so they are safe to embed directly.
     for key_prefix in &["kirocli:social:token", "kirocli:oidc:token"] {
         let sql = format!(
             "UPDATE auth_kv SET value = json_set(value, '$.refreshToken', '{}') WHERE key = '{}';",
-            escaped_token, key_prefix
+            token_literal, key_prefix
         );
 
-        match std::process::Command::new("sqlite3")
+        // Feed the SQL (which contains the secret) via stdin rather than argv so
+        // the refresh token does not appear in the process argument list, which
+        // is readable by other local users (e.g. via `ps`).
+        let mut child = match std::process::Command::new("sqlite3")
             .arg(&db_path)
-            .arg(&sql)
-            .output()
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
         {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "sqlite3 CLI 不可用，跳过 kiro-cli token 回写"
+                );
+                return;
+            }
+        };
+
+        if let Some(mut stdin) = child.stdin.take() {
+            if let Err(e) = stdin.write_all(sql.as_bytes()) {
+                tracing::debug!(error = %e, "写入 sqlite3 stdin 失败");
+                let _ = child.kill();
+                let _ = child.wait();
+                continue;
+            }
+            // stdin dropped here → EOF signalled to sqlite3
+        }
+
+        match child.wait_with_output() {
             Ok(output) if output.status.success() => {
                 tracing::info!(
                     db_path = db_path.as_str(),
@@ -251,9 +350,8 @@ fn write_back_to_sqlite(cred: &KiroCredential, new_refresh_token: &str) {
             Err(e) => {
                 tracing::debug!(
                     error = %e,
-                    "sqlite3 CLI 不可用，跳过 kiro-cli token 回写"
+                    "等待 sqlite3 进程失败"
                 );
-                return;
             }
         }
     }
@@ -261,9 +359,12 @@ fn write_back_to_sqlite(cred: &KiroCredential, new_refresh_token: &str) {
 
 /// Try to load a persisted token from file.
 fn load_persisted_token(region: &str) -> Option<TokenRecord> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
     let path = format!(
         "{}/.config/model-proxy/kiro-token-{}.json",
-        std::env::var("HOME").unwrap_or_else(|_| ".".to_string()),
+        home,
         region
     );
     let data = std::fs::read_to_string(&path).ok()?;
@@ -636,7 +737,7 @@ impl KiroAuthManager {
             .json(&serde_json::json!({"refreshToken": refresh_token}))
             .send()
             .await
-            .map_err(|e| crate::error::AppError::Http(e))?;
+            .map_err(crate::error::AppError::Http)?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
@@ -660,7 +761,7 @@ impl KiroAuthManager {
         let data: RefreshResponse = resp
             .json()
             .await
-            .map_err(|e| crate::error::AppError::Http(e))?;
+            .map_err(crate::error::AppError::Http)?;
 
         cred.access_token = Some(data.access_token);
         if let Some(new_token) = data.refresh_token {
@@ -697,7 +798,7 @@ impl KiroAuthManager {
             .header("Content-Type", "application/json")
             .header(
                 "x-amz-user-agent",
-                format!("aws-sdk-js/3.980.0 KiroIDE"),
+                "aws-sdk-js/3.980.0 KiroIDE".to_string(),
             )
             .header(
                 "user-agent",
@@ -714,7 +815,7 @@ impl KiroAuthManager {
             }))
             .send()
             .await
-            .map_err(|e| crate::error::AppError::Http(e))?;
+            .map_err(crate::error::AppError::Http)?;
 
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
@@ -738,7 +839,7 @@ impl KiroAuthManager {
         let data: RefreshResponse = resp
             .json()
             .await
-            .map_err(|e| crate::error::AppError::Http(e))?;
+            .map_err(crate::error::AppError::Http)?;
 
         cred.access_token = Some(data.access_token);
         if let Some(new_token) = data.refresh_token {
@@ -802,6 +903,47 @@ mod tests {
         assert_eq!(AuthMethod::from_str("iam"), AuthMethod::IdC);
         assert_eq!(AuthMethod::from_str("api_key"), AuthMethod::ApiKey);
         assert_eq!(AuthMethod::from_str("apikey"), AuthMethod::ApiKey);
+    }
+
+    #[test]
+    fn sqlite_quote_literal_doubles_single_quotes() {
+        // Single quotes are the only metacharacter; they are doubled.
+        assert_eq!(sqlite_quote_literal("abc"), "abc");
+        assert_eq!(sqlite_quote_literal("a'b"), "a''b");
+        assert_eq!(sqlite_quote_literal("''"), "''''");
+    }
+
+    #[test]
+    fn sqlite_quote_literal_leaves_backslash_and_quotes_untouched() {
+        // Backslashes and double quotes have no special meaning in SQLite
+        // string literals and must NOT be escaped (escaping would corrupt them).
+        assert_eq!(sqlite_quote_literal("a\\b"), "a\\b");
+        assert_eq!(sqlite_quote_literal("a\"b"), "a\"b");
+    }
+
+    #[test]
+    fn sqlite_quote_literal_neutralizes_injection_attempt() {
+        // A malicious token attempting to break out of the string literal is
+        // rendered inert: every single quote is doubled, so when embedded in
+        // '{}' the value cannot terminate the literal early.
+        let malicious = "x'); DROP TABLE auth_kv;--";
+        let quoted = sqlite_quote_literal(malicious);
+        assert_eq!(quoted, "x''); DROP TABLE auth_kv;--");
+
+        // Security invariant: in the escaped output every single quote belongs
+        // to a doubled pair, i.e. there is no lone quote that could close the
+        // surrounding literal. Verify by confirming each run of consecutive
+        // quotes has even length.
+        let mut run = 0usize;
+        for ch in quoted.chars() {
+            if ch == '\'' {
+                run += 1;
+            } else {
+                assert_eq!(run % 2, 0, "found an odd run of single quotes");
+                run = 0;
+            }
+        }
+        assert_eq!(run % 2, 0, "trailing odd run of single quotes");
     }
 
     #[test]

@@ -63,15 +63,14 @@ impl ConversationSanitizer {
         result.modified += before.saturating_sub(messages.len());
 
         // Pass 2: Boundary guards - ensure first is user
-        if self.enforce_boundary_guards {
-            if !is_kiro_user(&messages[0]) {
+        if self.enforce_boundary_guards
+            && !is_kiro_user(&messages[0]) {
                 messages.insert(
                     0,
                     make_kiro_user(HELLO_SENTINEL),
                 );
                 result.inserted += 1;
             }
-        }
 
         // Pass 3: Enforce strict alternation
         let (inserted, removed) = self.pass_enforce_alternation(messages);

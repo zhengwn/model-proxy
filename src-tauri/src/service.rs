@@ -92,10 +92,11 @@ impl ServiceManager {
         }
 
         let port = config.server.port;
+        let host = config.server.host.clone();
         let token = CancellationToken::new();
         let handle = proxy_core::start_server(config, token.clone());
 
-        let listen_addr = format!("0.0.0.0:{}", port);
+        let listen_addr = format!("{}:{}", host, port);
         let started_at = iso_now();
 
         inner.running = true;
@@ -129,11 +130,12 @@ impl ServiceManager {
         }
 
         let counters = RequestCounters::new();
+        let host = state.config.server.host.clone();
         let token = cancel_token.unwrap_or_default();
         let handle =
             proxy_core::start_server_shared(state, port, token.clone(), Some(counters.clone()));
 
-        let listen_addr = format!("0.0.0.0:{}", port);
+        let listen_addr = format!("{}:{}", host, port);
         let started_at = iso_now();
 
         inner.running = true;
@@ -225,8 +227,10 @@ mod tests {
                 format: ProviderFormat::Openai,
                 quirks: ProviderQuirks::default(),
                 model_routes: Vec::new(),
+                kiro_config: None,
             }],
             model_routes: Vec::new(),
+            model_routes_enabled: true,
             logging: LogConfig::default(),
             fallback: FallbackConfig::default(),
         }
@@ -253,7 +257,7 @@ mod tests {
 
         let status = manager.get_status().await;
         assert!(status.running);
-        assert_eq!(status.listen_addr, Some(format!("0.0.0.0:{}", port)));
+        assert_eq!(status.listen_addr, Some(format!("127.0.0.1:{}", port)));
         assert!(status.started_at.is_some());
 
         // Cleanup
@@ -308,7 +312,7 @@ mod tests {
 
         let status = manager.get_status().await;
         assert!(status.running);
-        assert_eq!(status.listen_addr, Some(format!("0.0.0.0:{}", port2)));
+        assert_eq!(status.listen_addr, Some(format!("127.0.0.1:{}", port2)));
 
         manager.stop().await.unwrap();
     }

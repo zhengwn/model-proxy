@@ -90,6 +90,7 @@ fn make_config(port: u16, provider_url: &str) -> Config {
             kiro_config: None,
         }],
         model_routes: Vec::new(),
+        model_routes_enabled: true,
         logging: LogConfig::default(),
         fallback: FallbackConfig::default(),
     }
@@ -516,6 +517,7 @@ async fn fallback_tries_next_provider_on_error() {
             target: "routed-fallback-model".to_string(),
             reasoning_effort: None,
         }],
+        model_routes_enabled: true,
         logging: LogConfig::default(),
         fallback: FallbackConfig {
             enabled: true,

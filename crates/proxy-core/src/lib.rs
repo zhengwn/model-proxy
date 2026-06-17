@@ -72,8 +72,9 @@ async fn metrics_handler(
 /// Start the proxy server with the given config and cancellation token.
 ///
 /// Returns a `JoinHandle` that resolves when the server shuts down.
-/// The server will listen on `0.0.0.0:{config.server.port}` and will
-/// gracefully shut down when the cancellation token is cancelled.
+/// The server listens on `{config.server.host}:{config.server.port}`
+/// (host defaults to `127.0.0.1`) and will gracefully shut down when the
+/// cancellation token is cancelled.
 pub fn start_server(config: Config, token: CancellationToken) -> JoinHandle<()> {
     let port = config.server.port;
     let state = AppState::new(config);
@@ -97,6 +98,26 @@ pub fn start_server_shared(
 }
 
 fn start_server_with_state(state: AppState, port: u16, token: CancellationToken) -> JoinHandle<()> {
+    // Resolve bind address from config (secure default: 127.0.0.1).
+    let host = state.config.server.host.clone();
+    let api_key_set = state.config.server.api_key.is_some();
+    let bind_ip: std::net::IpAddr = host.parse().unwrap_or_else(|_| {
+        tracing::warn!(
+            host = host.as_str(),
+            "无法解析监听地址，回退到 127.0.0.1（仅本机访问）"
+        );
+        std::net::IpAddr::from([127, 0, 0, 1])
+    });
+
+    // Security warning: binding to a non-loopback address without an API key
+    // exposes the proxy (and any upstream credentials) to the local network.
+    if !bind_ip.is_loopback() && !api_key_set {
+        tracing::warn!(
+            host = host.as_str(),
+            "代理监听在非本机地址且未配置 server.api_key——任何能访问该地址的客户端都可使用本代理。强烈建议设置 api_key 或改回 127.0.0.1"
+        );
+    }
+
     // Build admin routes (has its own auth middleware)
     let admin_routes = server::admin::admin_router(state.clone());
 
@@ -139,7 +160,7 @@ fn start_server_with_state(state: AppState, port: u16, token: CancellationToken)
         .layer(CorsLayer::permissive())
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = SocketAddr::new(bind_ip, port);
 
     tokio::spawn(async move {
         info!("监听地址: http://{}", addr);

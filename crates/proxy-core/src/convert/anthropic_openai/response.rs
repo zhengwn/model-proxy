@@ -347,7 +347,7 @@ pub(crate) fn convert_anthropic_to_openai_response(body: Value, model: &str) -> 
     // Build message object
     let mut message = json!({
         "role": "assistant",
-        "content": if text_content.is_some() { Value::String(text_content.unwrap()) } else { Value::Null },
+        "content": text_content.map_or(Value::Null, Value::String),
     });
 
     if let Some(rc) = reasoning_content {

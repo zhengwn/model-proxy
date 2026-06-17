@@ -50,6 +50,9 @@ pub struct Config {
     /// 全局模型路由规则（独立于 Provider）
     #[serde(default)]
     pub model_routes: Vec<ModelRoute>,
+    /// 是否启用全局模型路由（默认 true）
+    #[serde(default = "default_model_routes_enabled")]
+    pub model_routes_enabled: bool,
     /// 日志配置，缺省时使用默认值
     #[serde(default)]
     pub logging: LogConfig,
@@ -70,6 +73,10 @@ pub struct FallbackConfig {
     /// Fallback 链中尝试的最大 Provider 数量（默认 3）
     #[serde(default = "default_max_fallback_attempts")]
     pub max_attempts: usize,
+}
+
+fn default_model_routes_enabled() -> bool {
+    true
 }
 
 fn default_fallback_status_codes() -> Vec<u16> {
@@ -93,6 +100,10 @@ impl Default for FallbackConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub port: u16,
+    /// 监听地址。默认 `127.0.0.1`（仅本机访问，安全默认值）。
+    /// 如需对外提供服务，显式设置为 `0.0.0.0`，并务必同时配置 `api_key`。
+    #[serde(default = "default_host")]
+    pub host: String,
     #[serde(default)]
     pub api_key: Option<String>,
     /// Admin API 认证密钥（独立于 client API key）
@@ -109,12 +120,18 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             port: 4000,
+            host: default_host(),
             api_key: None,
             admin_api_key: None,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_concurrent_requests: 0,
         }
     }
+}
+
+/// Secure-by-default bind address: loopback only.
+fn default_host() -> String {
+    "127.0.0.1".to_string()
 }
 
 fn default_max_body_bytes() -> usize {
@@ -619,12 +636,36 @@ mod config_tests {
             active_provider: providers.first().map(|p| p.name.clone()),
             providers,
             model_routes: Vec::new(),
+            model_routes_enabled: true,
             logging: LogConfig::default(),
             fallback: FallbackConfig::default(),
         }
     }
 
     // --- Basic unit tests ---
+
+    #[test]
+    fn server_config_default_host_is_loopback() {
+        // Secure default: bind to localhost only.
+        assert_eq!(ServerConfig::default().host, "127.0.0.1");
+    }
+
+    #[test]
+    fn server_config_host_defaults_when_absent_in_toml() {
+        // Older config files have no `host` key; deserialization must fill the
+        // secure default rather than failing or binding to all interfaces.
+        let toml_str = "port = 4000\n";
+        let server: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(server.host, "127.0.0.1");
+        assert_eq!(server.port, 4000);
+    }
+
+    #[test]
+    fn server_config_host_can_be_overridden() {
+        let toml_str = "port = 4000\nhost = \"0.0.0.0\"\n";
+        let server: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(server.host, "0.0.0.0");
+    }
 
     #[test]
     fn valid_config_passes_validation() {
@@ -694,6 +735,7 @@ mod config_tests {
             active_provider: None,
             providers: Vec::new(),
             model_routes: Vec::new(),
+            model_routes_enabled: true,
             logging: LogConfig::default(),
             fallback: FallbackConfig::default(),
         };
@@ -850,6 +892,7 @@ mod config_tests {
                 active_provider: Some(active.clone()),
                 providers,
                 model_routes: Vec::new(),
+                model_routes_enabled: true,
                 logging: LogConfig::default(),
                 fallback: FallbackConfig::default(),
             };

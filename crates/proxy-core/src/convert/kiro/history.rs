@@ -215,7 +215,7 @@ fn ensure_alternating(history: &mut Vec<Value>) {
     }
 
     // Remove leading assistant messages
-    while history.first().map(|m| is_assistant(m)).unwrap_or(false) {
+    while history.first().map(is_assistant).unwrap_or(false) {
         history.remove(0);
     }
 

@@ -41,8 +41,10 @@ pub static KIRO_ENDPOINTS: [KiroEndpoint; 3] = [
 /// Preferred endpoint selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum PreferredEndpoint {
     /// Try Kiro IDE first, fall back to others on 429.
+    #[default]
     Auto,
     /// Kiro IDE only (no fallback).
     Kiro,
@@ -52,11 +54,6 @@ pub enum PreferredEndpoint {
     AmazonQ,
 }
 
-impl Default for PreferredEndpoint {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
 
 impl PreferredEndpoint {
     /// Convert from config string.

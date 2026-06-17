@@ -69,7 +69,7 @@ impl IpFilter {
     pub fn record_request(&self, ip: IpAddr) -> u64 {
         let mut inner = self.inner.write().unwrap();
         let now = Instant::now();
-        let entry = inner.requests.entry(ip).or_insert_with(VecDeque::new);
+        let entry = inner.requests.entry(ip).or_default();
 
         // Evict timestamps outside the window
         while let Some(&front) = entry.front() {

@@ -33,6 +33,7 @@ fn build_config(names: &[String]) -> Config {
         active_provider: Some(providers[0].name.clone()),
         providers,
         model_routes: Vec::new(),
+        model_routes_enabled: true,
         logging: Default::default(),
         fallback: Default::default(),
     }

@@ -1,26 +1,24 @@
 use arc_swap::ArcSwap;
 use reqwest::Client;
 use std::{
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Instant,
 };
 use tokio::sync::Semaphore;
-use tracing::info;
 
-use crate::config::{Config, ConfigError, KiroConfig, ModelRoute, ProviderConfig, ProviderFormat};
+use crate::config::{Config, ConfigError, ModelRoute, ProviderConfig};
 use crate::logging::LogCollector;
 use crate::provider_registry::ProviderRegistry;
+use crate::server::http_client::build_upstream_client;
 use crate::server::ip_filter::IpFilter;
+use crate::server::kiro_state::KiroState;
 use crate::server::site_guard::SiteGuardConfig;
 use crate::RequestCounters;
 
 pub(crate) const ANTHROPIC_BILLING_HEADER_PREFIX: &str = "x-anthropic-billing-header:";
 pub(crate) const MAX_LOG_BODY_BYTES: usize = 4096;
-pub(crate) const UPSTREAM_CONNECT_TIMEOUT_SECS: u64 = 30;
 pub(crate) const NON_STREAM_REQUEST_TIMEOUT_SECS: u64 = 300;
-pub(crate) const UPSTREAM_POOL_IDLE_TIMEOUT_SECS: u64 = 90;
-pub(crate) const UPSTREAM_POOL_MAX_IDLE_PER_HOST: usize = 32;
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn next_request_id() -> String {
@@ -34,6 +32,14 @@ pub(crate) fn next_request_id() -> String {
 
 pub(crate) fn elapsed_ms(start: Instant) -> u128 {
     start.elapsed().as_millis()
+}
+
+/// Get current epoch time in seconds (shared utility).
+pub(crate) fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 pub(crate) struct RequestCompletionGuard {
@@ -75,7 +81,7 @@ impl Drop for RequestCompletionGuard {
             metrics.connection_end();
         }
         if !self.completed {
-            info!(
+            tracing::info!(
                 request_id = self.request_id.as_str(),
                 phase = self.phase,
                 request_total_ms = elapsed_ms(self.request_start),
@@ -110,24 +116,17 @@ pub struct AppState {
     pub active_provider: Arc<ArcSwap<ProviderConfig>>,
     pub registry: Arc<ArcSwap<ProviderRegistry>>,
     pub model_routes: Arc<ArcSwap<Vec<ModelRoute>>>,
+    /// Whether model routing is enabled (can be toggled at runtime).
+    pub model_routes_enabled: Arc<AtomicBool>,
     pub client: Client,
     pub log_collector: Arc<LogCollector>,
     /// Optional request counters for tracking total/failed requests.
     pub counters: Option<RequestCounters>,
     /// Optional semaphore for concurrency limiting.
     pub concurrency_semaphore: Option<Arc<Semaphore>>,
-    /// Shared Kiro auth manager (only initialized when a Kiro provider exists).
-    pub kiro_auth: Option<Arc<tokio::sync::Mutex<crate::convert::kiro::auth::KiroAuthManager>>>,
-    /// Multi-account manager for Kiro failover (when multiple Kiro configs exist).
-    pub kiro_account_manager: Option<Arc<tokio::sync::Mutex<crate::convert::kiro::account::AccountManager>>>,
-    /// Flow monitor for request/response tracking.
-    pub flow_monitor: Option<Arc<tokio::sync::Mutex<crate::convert::kiro::flow_monitor::FlowMonitor>>>,
-    /// Rate limiter for Kiro API requests.
-    pub rate_limiter: Option<Arc<tokio::sync::Mutex<crate::convert::kiro::rate_limiter::RateLimiter>>>,
-    /// Endpoint health tracker for multi-endpoint fallback.
-    pub endpoint_health: Option<crate::convert::kiro::endpoint_health::EndpointHealthTracker>,
-    /// Cached /v1/models response (Instant = last update time, Value = JSON response).
-    pub model_cache: Option<Arc<tokio::sync::Mutex<(Instant, serde_json::Value)>>>,
+    /// Kiro-specific state (auth, accounts, rate limiter, etc.).
+    /// Only initialized when a Kiro provider exists in config.
+    pub kiro: Option<KiroState>,
     /// IP blacklist and request-rate tracker.
     pub ip_filter: IpFilter,
     /// SiteGuard config: maintenance mode and self-use mode toggles.
@@ -136,129 +135,10 @@ pub struct AppState {
     pub metrics: Option<Arc<crate::server::metrics::Metrics>>,
 }
 
-/// Collect Kiro accounts from config and initialize auth managers.
-///
-/// If a Kiro provider has `accounts` with multiple entries, creates an AccountManager.
-/// Otherwise creates a single KiroAuthManager for backward compatibility.
-fn init_kiro_auth(
-    config: &Config,
-    client: &Client,
-) -> (
-    Option<Arc<tokio::sync::Mutex<crate::convert::kiro::auth::KiroAuthManager>>>,
-    Option<Arc<tokio::sync::Mutex<crate::convert::kiro::account::AccountManager>>>,
-) {
-    use crate::convert::kiro::account::{AccountManager, LoadBalancingMode};
-    use crate::convert::kiro::auth::KiroAuthManager;
-
-    // Find the first Kiro provider
-    let kiro_provider = match config.providers.iter().find(|p| p.format == ProviderFormat::Kiro) {
-        Some(p) => p,
-        None => return (None, None),
-    };
-
-    let kiro_config = match kiro_provider.kiro_config.as_ref() {
-        Some(c) => c,
-        None => return (None, None),
-    };
-
-    // Collect all account entries
-    let accounts: Vec<(String, KiroConfig)> =
-        collect_kiro_accounts(kiro_config, &kiro_provider.name);
-
-    if accounts.len() > 1 {
-        let mode = kiro_config
-            .load_balancing_mode
-            .as_deref()
-            .map(LoadBalancingMode::from_str)
-            .unwrap_or(LoadBalancingMode::Priority);
-        let mode_str = mode.as_str().to_string();
-        let mgr = AccountManager::new_with_mode(&accounts, client.clone(), mode);
-        info!(
-            account_count = accounts.len(),
-            mode = mode_str.as_str(),
-            "初始化 Kiro 多账户管理器"
-        );
-        (None, Some(Arc::new(tokio::sync::Mutex::new(mgr))))
-    } else if accounts.len() == 1 {
-        let auth = KiroAuthManager::new(&accounts[0].1, client.clone());
-        (Some(Arc::new(tokio::sync::Mutex::new(auth))), None)
-    } else {
-        // No accounts, create from flat fields (backward compat)
-        let auth = KiroAuthManager::new(kiro_config, client.clone());
-        (Some(Arc::new(tokio::sync::Mutex::new(auth))), None)
-    }
-}
-
-/// Collect all Kiro account entries from config.
-///
-/// If `accounts` is populated, expands each entry into a full KiroConfig.
-/// Otherwise, falls back to the flat top-level fields (single account).
-fn collect_kiro_accounts(kiro_config: &KiroConfig, provider_name: &str) -> Vec<(String, KiroConfig)> {
-    if let Some(ref accounts) = kiro_config.accounts {
-        if accounts.is_empty() {
-            return vec![];
-        }
-        return accounts
-            .iter()
-            .enumerate()
-            .map(|(i, entry)| {
-                let id = format!("{}:{}", provider_name, i);
-                let cfg = KiroConfig {
-                    auth_method: entry
-                        .auth_method
-                        .clone()
-                        .unwrap_or_else(|| kiro_config.auth_method.clone()),
-                    refresh_token: entry.refresh_token.clone(),
-                    client_id: entry.client_id.clone().or_else(|| kiro_config.client_id.clone()),
-                    client_secret: entry
-                        .client_secret
-                        .clone()
-                        .or_else(|| kiro_config.client_secret.clone()),
-                    profile_arn: entry.profile_arn.clone().or_else(|| kiro_config.profile_arn.clone()),
-                    region: entry
-                        .region
-                        .clone()
-                        .unwrap_or_else(|| kiro_config.region.clone()),
-                    api_region: entry
-                        .api_region
-                        .clone()
-                        .or_else(|| kiro_config.api_region.clone()),
-                    model_aliases: kiro_config.model_aliases.clone(),
-                    hidden_models: kiro_config.hidden_models.clone(),
-                    kiro_version: kiro_config.kiro_version.clone(),
-                    proxy_url: entry.proxy_url.clone().or_else(|| kiro_config.proxy_url.clone()),
-                    thinking_mode: kiro_config.thinking_mode.clone(),
-                    web_search_enabled: kiro_config.web_search_enabled,
-                    accounts: None,
-                    load_balancing_mode: None,
-                    agentic_prompt_injection: kiro_config.agentic_prompt_injection,
-                    first_token_timeout: kiro_config.first_token_timeout,
-                    streaming_read_timeout: kiro_config.streaming_read_timeout,
-                    first_token_max_retries: kiro_config.first_token_max_retries,
-                    quota_cooldown_secs: kiro_config.quota_cooldown_secs,
-                    health_score_decay: kiro_config.health_score_decay,
-                    health_score_recovery: kiro_config.health_score_recovery,
-                    preferred_endpoint: kiro_config.preferred_endpoint.clone(),
-                    endpoint_fallback: kiro_config.endpoint_fallback,
-                };
-                (id, cfg)
-            })
-            .collect();
-    }
-    vec![]
-}
-
 impl AppState {
     /// Create a new AppState from a Config (standalone mode, e.g. CLI).
     pub fn new(config: Config) -> Self {
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(UPSTREAM_CONNECT_TIMEOUT_SECS))
-            .pool_idle_timeout(Duration::from_secs(UPSTREAM_POOL_IDLE_TIMEOUT_SECS))
-            .pool_max_idle_per_host(UPSTREAM_POOL_MAX_IDLE_PER_HOST)
-            .tcp_nodelay(true)
-            .tcp_keepalive(Duration::from_secs(60))
-            .build()
-            .expect("构建 HTTP 客户端失败");
+        let client = build_upstream_client();
 
         // Build the provider registry from config.providers
         let registry =
@@ -271,6 +151,7 @@ impl AppState {
 
         let active_provider = Arc::new(ArcSwap::from_pointee(active.clone()));
         let model_routes = Arc::new(ArcSwap::from_pointee(config.model_routes.clone()));
+        let model_routes_enabled = Arc::new(AtomicBool::new(config.model_routes_enabled));
 
         // Create a default LogCollector from the config's logging section
         let log_config = Arc::new(ArcSwap::from_pointee(config.logging.clone()));
@@ -284,29 +165,20 @@ impl AppState {
             None
         };
 
-        // Initialize Kiro auth: multi-account manager or single auth manager
-        let (kiro_auth, kiro_account_manager) =
-            init_kiro_auth(&config, &client);
+        // Initialize Kiro state (returns None if no Kiro provider configured)
+        let kiro = KiroState::from_config(&config, &client);
 
         Self {
             config: Arc::new(config),
             active_provider,
             registry: Arc::new(ArcSwap::from_pointee(registry)),
             model_routes,
+            model_routes_enabled,
             client,
             log_collector,
             counters: None,
             concurrency_semaphore,
-            kiro_auth,
-            kiro_account_manager,
-            flow_monitor: Some(Arc::new(tokio::sync::Mutex::new(
-                crate::convert::kiro::flow_monitor::FlowMonitor::new(1000),
-            ))),
-            rate_limiter: Some(Arc::new(tokio::sync::Mutex::new(
-                crate::convert::kiro::rate_limiter::RateLimiter::new(0, 0, 0),
-            ))),
-            endpoint_health: Some(crate::convert::kiro::endpoint_health::EndpointHealthTracker::new()),
-            model_cache: None,
+            kiro,
             ip_filter: IpFilter::new(),
             site_guard: SiteGuardConfig::default(),
             metrics: Some(Arc::new(crate::server::metrics::Metrics::new())),
@@ -320,16 +192,10 @@ impl AppState {
         active_provider: Arc<ArcSwap<ProviderConfig>>,
         registry: Arc<ArcSwap<ProviderRegistry>>,
         model_routes: Arc<ArcSwap<Vec<ModelRoute>>>,
+        model_routes_enabled: Arc<AtomicBool>,
         log_collector: Arc<LogCollector>,
     ) -> Self {
-        let client = Client::builder()
-            .connect_timeout(Duration::from_secs(UPSTREAM_CONNECT_TIMEOUT_SECS))
-            .pool_idle_timeout(Duration::from_secs(UPSTREAM_POOL_IDLE_TIMEOUT_SECS))
-            .pool_max_idle_per_host(UPSTREAM_POOL_MAX_IDLE_PER_HOST)
-            .tcp_nodelay(true)
-            .tcp_keepalive(Duration::from_secs(60))
-            .build()
-            .expect("构建 HTTP 客户端失败");
+        let client = build_upstream_client();
 
         let concurrency_semaphore = if config.server.max_concurrent_requests > 0 {
             Some(Arc::new(Semaphore::new(
@@ -339,29 +205,20 @@ impl AppState {
             None
         };
 
-        // Initialize Kiro auth: multi-account manager or single auth manager
-        let (kiro_auth, kiro_account_manager) =
-            init_kiro_auth(&config, &client);
+        // Initialize Kiro state
+        let kiro = KiroState::from_config(&config, &client);
 
         Self {
             config: Arc::new(config),
             active_provider,
             registry,
             model_routes,
+            model_routes_enabled,
             client,
             log_collector,
             counters: None,
             concurrency_semaphore,
-            kiro_auth,
-            kiro_account_manager,
-            flow_monitor: Some(Arc::new(tokio::sync::Mutex::new(
-                crate::convert::kiro::flow_monitor::FlowMonitor::new(1000),
-            ))),
-            rate_limiter: Some(Arc::new(tokio::sync::Mutex::new(
-                crate::convert::kiro::rate_limiter::RateLimiter::new(0, 0, 0),
-            ))),
-            endpoint_health: Some(crate::convert::kiro::endpoint_health::EndpointHealthTracker::new()),
-            model_cache: None,
+            kiro,
             ip_filter: IpFilter::new(),
             site_guard: SiteGuardConfig::default(),
             metrics: Some(Arc::new(crate::server::metrics::Metrics::new())),
@@ -398,6 +255,16 @@ impl AppState {
         self.model_routes.load()
     }
 
+    /// 检查模型路由是否已启用
+    pub fn is_model_routes_enabled(&self) -> bool {
+        self.model_routes_enabled.load(Ordering::Relaxed)
+    }
+
+    /// 设置模型路由启用状态
+    pub fn set_model_routes_enabled(&self, enabled: bool) {
+        self.model_routes_enabled.store(enabled, Ordering::Relaxed);
+    }
+
     /// 切换活跃 Provider
     pub fn switch_provider(&self, name: &str) -> Result<(), ConfigError> {
         let registry = self.registry.load();
@@ -410,31 +277,53 @@ impl AppState {
     }
 
     /// Start background scheduler for token pre-refresh and health checks.
-    /// Pre-refreshes tokens 15 minutes before expiry.
-    /// Runs health checks every 10 minutes.
     pub fn start_background_scheduler(&self) {
-        if let Some(ref auth_arc) = self.kiro_auth {
-            let auth = auth_arc.clone();
-            let interval = Duration::from_secs(600); // 10 minutes
-            tokio::spawn(async move {
-                let mut timer = tokio::time::interval(interval);
-                loop {
-                    timer.tick().await;
-                    // Pre-refresh: check if token needs refresh
-                    let needs_refresh = {
-                        let auth_guard = auth.lock().await;
-                        let count = auth_guard.credentials_iter().filter(|c| c.is_expiring_soon()).count();
-                        count > 0
-                    };
-                    if needs_refresh {
-                        info!("后台调度器: 预刷新 Kiro token");
-                        let mut auth_guard = auth.lock().await;
-                        if let Err(e) = auth_guard.get_valid_token().await {
-                            tracing::warn!(error = %e, "后台 token 预刷新失败");
-                        }
-                    }
-                }
-            });
+        if let Some(ref kiro) = self.kiro {
+            kiro.start_background_scheduler();
         }
+    }
+
+    // ---- Kiro convenience accessors (backward-compatible) ----
+
+    /// Access the Kiro single-account auth manager (if available).
+    pub fn kiro_auth(
+        &self,
+    ) -> Option<&Arc<tokio::sync::Mutex<crate::convert::kiro::auth::KiroAuthManager>>> {
+        self.kiro.as_ref().and_then(|k| k.auth.as_ref())
+    }
+
+    /// Access the Kiro multi-account manager (if available).
+    pub fn kiro_account_manager(
+        &self,
+    ) -> Option<&Arc<tokio::sync::Mutex<crate::convert::kiro::account::AccountManager>>> {
+        self.kiro.as_ref().and_then(|k| k.account_manager.as_ref())
+    }
+
+    /// Access the flow monitor (if Kiro is configured).
+    pub fn flow_monitor(
+        &self,
+    ) -> Option<&Arc<tokio::sync::Mutex<crate::convert::kiro::flow_monitor::FlowMonitor>>> {
+        self.kiro.as_ref().map(|k| &k.flow_monitor)
+    }
+
+    /// Access the rate limiter (if Kiro is configured).
+    pub fn rate_limiter(
+        &self,
+    ) -> Option<&Arc<tokio::sync::Mutex<crate::convert::kiro::rate_limiter::RateLimiter>>> {
+        self.kiro.as_ref().map(|k| &k.rate_limiter)
+    }
+
+    /// Access the endpoint health tracker (if Kiro is configured).
+    pub fn endpoint_health(
+        &self,
+    ) -> Option<&crate::convert::kiro::endpoint_health::EndpointHealthTracker> {
+        self.kiro.as_ref().map(|k| &k.endpoint_health)
+    }
+
+    /// Access the model cache (if Kiro is configured).
+    pub fn model_cache(
+        &self,
+    ) -> Option<&Arc<tokio::sync::Mutex<(Instant, serde_json::Value)>>> {
+        self.kiro.as_ref().map(|k| &k.model_cache)
     }
 }

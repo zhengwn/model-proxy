@@ -6,7 +6,7 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::error::{AppError, Result};
 
@@ -83,7 +83,7 @@ pub async fn start_device_flow(
         }))
         .send()
         .await
-        .map_err(|e| AppError::Http(e))?;
+        .map_err(AppError::Http)?;
 
     if !register_resp.status().is_success() {
         let status = register_resp.status().as_u16();
@@ -92,7 +92,7 @@ pub async fn start_device_flow(
         return Err(AppError::Request(format!("OIDC 注册失败: HTTP {}", status)));
     }
 
-    let client_reg: Value = register_resp.json().await.map_err(|e| AppError::Http(e))?;
+    let client_reg: Value = register_resp.json().await.map_err(AppError::Http)?;
     let client_id = client_reg.get("client_id").and_then(|v| v.as_str()).ok_or_else(|| {
         AppError::Request("OIDC 注册响应缺少 client_id".to_string())
     })?;
@@ -109,16 +109,16 @@ pub async fn start_device_flow(
         ))
         .send()
         .await
-        .map_err(|e| AppError::Http(e))?;
+        .map_err(AppError::Http)?;
 
     if !device_resp.status().is_success() {
         let status = device_resp.status().as_u16();
-        let body = device_resp.text().await.unwrap_or_default();
+        let _body = device_resp.text().await.unwrap_or_default();
         return Err(AppError::Request(format!("Device authorization 失败: HTTP {}", status)));
     }
 
     let auth_resp: DeviceAuthorizationResponse =
-        device_resp.json().await.map_err(|e| AppError::Http(e))?;
+        device_resp.json().await.map_err(AppError::Http)?;
 
     info!(
         user_code = auth_resp.user_code.as_str(),
@@ -274,7 +274,7 @@ pub async fn exchange_social_code(
         AppError::Request(format!("{} 未配置", provider.client_secret_env()))
     })?;
 
-    let mut req = client.post(provider.token_url())
+    let req = client.post(provider.token_url())
         .header("Accept", "application/json");
 
     let body = match provider {
@@ -293,7 +293,7 @@ pub async fn exchange_social_code(
         }),
     };
 
-    let resp = req.json(&body).send().await.map_err(|e| AppError::Http(e))?;
+    let resp = req.json(&body).send().await.map_err(AppError::Http)?;
 
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
@@ -301,7 +301,7 @@ pub async fn exchange_social_code(
         return Err(AppError::Request(format!("OAuth token 交换失败: HTTP {} {}", status, text)));
     }
 
-    let token_resp: SocialTokenResponse = resp.json().await.map_err(|e| AppError::Http(e))?;
+    let token_resp: SocialTokenResponse = resp.json().await.map_err(AppError::Http)?;
     Ok(token_resp)
 }
 
@@ -342,7 +342,7 @@ pub async fn exchange_for_kiro_token(
         }))
         .send()
         .await
-        .map_err(|e| AppError::Http(e))?;
+        .map_err(AppError::Http)?;
 
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
@@ -350,7 +350,7 @@ pub async fn exchange_for_kiro_token(
         return Err(AppError::Request(format!("Kiro social exchange 失败: HTTP {} {}", status, body)));
     }
 
-    let data: Value = resp.json().await.map_err(|e| AppError::Http(e))?;
+    let data: Value = resp.json().await.map_err(AppError::Http)?;
 
     let access_token = data.get("accessToken").and_then(|v| v.as_str()).ok_or_else(|| {
         AppError::Request("Social exchange 响应缺少 accessToken".to_string())
@@ -503,10 +503,10 @@ pub async fn complete_iam_sso_login(
         // Clean expired sessions before lookup
         sessions_map.retain(|_, s| s.created_at.elapsed() < IAM_SSO_SESSION_TTL);
 
-        let session = sessions_map
+        
+        sessions_map
             .remove(session_id)
-            .ok_or("Session not found or expired")?;
-        session
+            .ok_or("Session not found or expired")?
     };
 
     // Parse callback URL for code and state

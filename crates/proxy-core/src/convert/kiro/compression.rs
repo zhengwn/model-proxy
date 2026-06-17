@@ -112,8 +112,8 @@ pub fn estimate_tokens(text: &str) -> usize {
     let non_cjk_bytes = byte_len.saturating_sub(cjk_bytes);
 
     // ~2 chars/token for CJK, ~4 chars/token for other text
-    let cjk_tokens = (cjk_count + 1) / 2;
-    let non_cjk_tokens = (non_cjk_bytes + 3) / 4;
+    let cjk_tokens = cjk_count.div_ceil(2);
+    let non_cjk_tokens = non_cjk_bytes.div_ceil(4);
 
     cjk_tokens + non_cjk_tokens
 }
@@ -282,7 +282,7 @@ mod tests {
     fn estimate_tokens_english() {
         // "hello world" is 11 chars, ~3 tokens
         let tokens = estimate_tokens("hello world");
-        assert!(tokens >= 2 && tokens <= 4);
+        assert!((2..=4).contains(&tokens));
     }
 
     #[test]

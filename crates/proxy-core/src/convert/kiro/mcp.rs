@@ -7,7 +7,6 @@
 //! 4. Returning search results wrapped in `<web_search>` XML tags
 
 use serde_json::{json, Value};
-use tracing::{info, warn};
 
 /// Web search tool definition injected into Kiro requests.
 pub fn web_search_tool_definition() -> Value {

@@ -6,7 +6,7 @@
 
 use axum::{
     body::Body,
-    http::{HeaderValue, Request, header},
+    http::{HeaderValue, Request},
     middleware::Next,
     response::Response,
 };
@@ -51,7 +51,7 @@ pub async fn request_id_middleware(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 
     #[test]
     fn request_id_format() {
