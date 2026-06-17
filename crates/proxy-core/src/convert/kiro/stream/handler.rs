@@ -22,6 +22,7 @@ use super::KEEP_ALIVE_BYTES;
 use crate::convert::anthropic_openai::stream::StreamLogContext;
 use crate::convert::kiro::eventstream::{Event, EventStreamDecoder};
 use crate::convert::kiro::thinking_parser::{ThinkingHandlingMode, ThinkingOutput, ThinkingParser};
+use crate::convert::kiro::truncation::{check_tool_call_truncation, TruncationReason, TruncationState};
 use crate::error::{AppError, Result};
 use crate::server::state::elapsed_ms;
 
@@ -39,6 +40,7 @@ pub(crate) async fn handle_stream_anthropic_output(
     thinking_mode: Option<&str>,
     first_token_timeout: Duration,
     streaming_read_timeout: Duration,
+    truncation_state: Option<TruncationState>,
 ) -> Result<Response> {
     info!(
         request_id = request_id.as_str(),
@@ -81,6 +83,7 @@ pub(crate) async fn handle_stream_anthropic_output(
         let stream_start = Instant::now();
         let mut decoder = EventStreamDecoder::new();
         let mut state = AnthropicStreamState::new();
+        let mut truncation_detected = false;
         // Initialize ThinkingParser if thinking_mode is configured
         if let Some(ref mode_str) = thinking_mode_owned {
             let mode = ThinkingHandlingMode::from_str(mode_str);
@@ -296,16 +299,30 @@ pub(crate) async fn handle_stream_anthropic_output(
                 }
             }
 
-            // Emit message_delta with stop_reason and usage
-            if !has_emitted_message_delta {
-                // Truncation detection: if no usage event was received, the stream may be truncated
+            // Detect and store truncation info for recovery on the next request
+            if let Some(ref ts) = truncation_state {
+                // Check for truncated tool calls
+                for (tool_use_id, buffer) in &state.tool_input_buffers {
+                    if let Some(reason) = check_tool_call_truncation(tool_use_id, buffer) {
+                        ts.store_tool_truncation(tool_use_id.clone(), reason).await;
+                        truncation_detected = true;
+                    }
+                }
+                // Check for content truncation (missing usage event)
                 if state.input_tokens == 0 && state.output_tokens > 0 {
+                    ts.store_content_truncation(TruncationReason::MissingUsage).await;
+                    truncation_detected = true;
+                }
+                if truncation_detected {
                     warn!(
                         request_id = request_id.as_str(),
-                        "检测到可能的流截断: 未收到 contextUsage 事件"
+                        "检测到流截断，已存储截断信息用于下次请求恢复"
                     );
                 }
+            }
 
+            // Emit message_delta with stop_reason and usage
+            if !has_emitted_message_delta {
                 let stop_reason = state.get_stop_reason().to_string();
                 let delta = sse_event(
                     "message_delta",
@@ -362,6 +379,7 @@ pub(crate) async fn handle_stream_anthropic_output_buffered(
     thinking_mode: Option<&str>,
     first_token_timeout: Duration,
     streaming_read_timeout: Duration,
+    truncation_state: Option<TruncationState>,
 ) -> Result<Response> {
     info!(
         request_id = request_id.as_str(),
@@ -402,6 +420,7 @@ pub(crate) async fn handle_stream_anthropic_output_buffered(
         let stream_start = Instant::now();
         let mut decoder = EventStreamDecoder::new();
         let mut state = AnthropicStreamState::new();
+        let mut truncation_detected = false;
         if let Some(ref mode_str) = thinking_mode_owned {
             let mode = ThinkingHandlingMode::from_str(mode_str);
             state.thinking_parser = Some(ThinkingParser::new(mode));
@@ -575,6 +594,26 @@ pub(crate) async fn handle_stream_anthropic_output_buffered(
                         }
                         ThinkingOutput::None => {}
                     }
+                }
+            }
+
+            // Detect and store truncation info for recovery on the next request
+            if let Some(ref ts) = truncation_state {
+                for (tool_use_id, buffer) in &state.tool_input_buffers {
+                    if let Some(reason) = check_tool_call_truncation(tool_use_id, buffer) {
+                        ts.store_tool_truncation(tool_use_id.clone(), reason).await;
+                        truncation_detected = true;
+                    }
+                }
+                if state.input_tokens == 0 && state.output_tokens > 0 {
+                    ts.store_content_truncation(TruncationReason::MissingUsage).await;
+                    truncation_detected = true;
+                }
+                if truncation_detected {
+                    warn!(
+                        request_id = request_id.as_str(),
+                        "检测到流截断（缓冲模式），已存储截断信息用于下次请求恢复"
+                    );
                 }
             }
 

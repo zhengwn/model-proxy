@@ -82,10 +82,13 @@ pub async fn proxy_kiro_social_start(
     };
 
     match start_social_auth(oauth_provider, redirect_uri, state_param) {
-        Ok(url) => Ok(axum::response::Response::builder()
+        Ok((url, code_verifier)) => Ok(axum::response::Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(json!({"auth_url": url}).to_string()))
+            .body(Body::from(json!({
+                "auth_url": url,
+                "code_verifier": code_verifier
+            }).to_string()))
             .map_err(|e| AppError::Request(format!("构建响应失败: {}", e)))?),
         Err(e) => Err(e),
     }
@@ -111,9 +114,11 @@ pub async fn proxy_kiro_social_exchange(
 
     let redirect_uri = body.get("redirect_uri").and_then(|v| v.as_str())
         .unwrap_or("http://localhost:19823/callback");
+    let code_verifier = body.get("code_verifier").and_then(|v| v.as_str())
+        .unwrap_or("");
 
     // Exchange OAuth code for social token
-    let social_token = exchange_social_code(&state.client, oauth_provider, code, redirect_uri).await?;
+    let social_token = exchange_social_code(&state.client, oauth_provider, code, redirect_uri, code_verifier).await?;
     let social_access = social_token.access_token.ok_or_else(|| {
         AppError::Request("OAuth token 交换失败: 无 access_token".to_string())
     })?;

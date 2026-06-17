@@ -4,6 +4,8 @@
 //! encounters recoverable errors (403, 429, 402). Uses exponential backoff
 //! with probabilistic retry for broken accounts.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -209,6 +211,23 @@ pub struct AccountSnapshot {
     pub health_score: u32,
 }
 
+/// Persisted circuit breaker state for a single account.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedAccountState {
+    failures: u32,
+    health_score: u32,
+    disabled: bool,
+    total_requests: u64,
+    successful_requests: u64,
+    failed_requests: u64,
+}
+
+/// Top-level persisted state file structure.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PersistedAccountManagerState {
+    accounts: HashMap<String, PersistedAccountState>,
+}
+
 /// Multi-account manager with circuit breaker failover.
 pub struct AccountManager {
     accounts: Vec<ManagedAccount>,
@@ -225,6 +244,10 @@ pub struct AccountManager {
     health_score_decay: u32,
     /// Health score recovery per success
     health_score_recovery: u32,
+    /// Filesystem path for persisted account state
+    state_file_path: String,
+    /// Dirty flag — set when circuit breaker state changes
+    dirty: Arc<AtomicBool>,
 }
 
 impl AccountManager {
@@ -277,7 +300,14 @@ impl AccountManager {
             "初始化 Kiro 多账户管理器"
         );
 
-        Self {
+        let state_file_path = {
+            let home = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_else(|_| ".".to_string());
+            format!("{}/.config/model-proxy/account-state.json", home)
+        };
+
+        let mut mgr = Self {
             accounts,
             current_index: 0,
             probabilistic_retry_chance: 0.1,
@@ -286,7 +316,11 @@ impl AccountManager {
             quota_manager: QuotaManager::new(quota_cooldown_secs),
             health_score_decay,
             health_score_recovery,
-        }
+            state_file_path,
+            dirty: Arc::new(AtomicBool::new(false)),
+        };
+        mgr.load_state();
+        mgr
     }
 
     /// Get the current preferred account's auth manager.
@@ -296,6 +330,103 @@ impl AccountManager {
             .get(self.current_index)
             .filter(|a| !a.disabled && a.circuit.is_available())
             .map(|a| (a.id.as_str(), &a.auth))
+    }
+
+    /// Mark state as dirty (needs persistence).
+    fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Save account state to disk if dirty. Uses atomic tmp-file + rename.
+    pub fn save_state(&self) {
+        if !self.dirty.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let state = PersistedAccountManagerState {
+            accounts: self.accounts.iter().map(|a| {
+                (a.id.clone(), PersistedAccountState {
+                    failures: a.circuit.failures,
+                    health_score: a.circuit.health_score,
+                    disabled: a.disabled,
+                    total_requests: a.circuit.total_requests,
+                    successful_requests: a.circuit.successful_requests,
+                    failed_requests: a.circuit.failed_requests,
+                })
+            }).collect(),
+        };
+
+        match serde_json::to_string_pretty(&state) {
+            Ok(json) => {
+                let tmp_path = format!("{}.tmp", self.state_file_path);
+                // Ensure parent directory exists
+                if let Some(parent) = std::path::Path::new(&self.state_file_path).parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if std::fs::write(&tmp_path, &json).is_ok() {
+                    if std::fs::rename(&tmp_path, &self.state_file_path).is_ok() {
+                        self.dirty.store(false, Ordering::Relaxed);
+                        tracing::debug!("账户状态已持久化");
+                    } else {
+                        let _ = std::fs::remove_file(&tmp_path);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "序列化账户状态失败");
+            }
+        }
+    }
+
+    /// Load persisted account state from disk and apply to current accounts.
+    fn load_state(&mut self) {
+        let data = match std::fs::read_to_string(&self.state_file_path) {
+            Ok(d) => d,
+            Err(_) => return, // No persisted state yet
+        };
+        let persisted: PersistedAccountManagerState = match serde_json::from_str(&data) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "解析账户状态文件失败");
+                return;
+            }
+        };
+
+        for account in &mut self.accounts {
+            if let Some(saved) = persisted.accounts.get(&account.id) {
+                account.circuit.failures = saved.failures;
+                account.circuit.health_score = saved.health_score;
+                account.disabled = saved.disabled;
+                account.circuit.total_requests = saved.total_requests;
+                account.circuit.successful_requests = saved.successful_requests;
+                account.circuit.failed_requests = saved.failed_requests;
+                // If the account had failures before shutdown, set to HalfOpen
+                // so it gets a fair probe on next startup
+                if saved.failures > 0 {
+                    account.circuit.state = CircuitState::HalfOpen;
+                }
+                info!(
+                    account_id = account.id.as_str(),
+                    failures = saved.failures,
+                    health_score = saved.health_score,
+                    "从持久化文件恢复账户状态"
+                );
+            }
+        }
+    }
+
+    /// Start a background periodic save task.
+    /// Call this after wrapping the AccountManager in an Arc<Mutex<>>.
+    pub fn start_periodic_save(mgr: Arc<Mutex<Self>>) {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let guard = mgr.lock().await;
+                guard.save_state();
+            }
+        });
     }
 
     /// Get an available account, skipping excluded accounts.
@@ -529,6 +660,7 @@ impl AccountManager {
             account.circuit.record_success(recovery);
             account.last_success_at = Some(Instant::now());
         }
+        self.mark_dirty();
     }
 
     /// Check if a broken account should be probabilistically retried.
@@ -568,6 +700,7 @@ impl AccountManager {
                 "账户 circuit breaker 触发"
             );
         }
+        self.mark_dirty();
     }
 
     /// Record success for a specific account by index (session-safe).
@@ -581,6 +714,7 @@ impl AccountManager {
                 self.current_index = idx;
             }
         }
+        self.mark_dirty();
     }
 
     /// Record failure for a specific account by index (session-safe).
@@ -597,6 +731,7 @@ impl AccountManager {
                 "账户 circuit breaker 触发 (at)"
             );
         }
+        self.mark_dirty();
     }
 
     /// Increment inflight count for a specific account by index.
@@ -671,6 +806,9 @@ impl AccountManager {
                     // Don't heal suspended or fatal errors
                 }
             }
+        }
+        if healed {
+            self.mark_dirty();
         }
         healed
     }
@@ -794,6 +932,7 @@ impl AccountManager {
         if let Some(account) = self.accounts.iter_mut().find(|a| a.id == id) {
             account.disabled = disabled;
             info!(account_id = id, disabled, "设置 Kiro 账户状态");
+            self.mark_dirty();
             true
         } else {
             false
@@ -836,6 +975,7 @@ impl AccountManager {
             account.circuit.state = CircuitState::Active;
             account.circuit.last_failure = None;
             info!(account_id = id, "重置 Kiro 账户失败计数");
+            self.mark_dirty();
             true
         } else {
             false

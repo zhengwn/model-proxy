@@ -221,12 +221,12 @@ impl OAuthProvider {
 }
 
 /// Start Social OAuth flow.
-/// Returns the authorization URL the user should visit.
+/// Returns (authorization_url, code_verifier) — the verifier must be passed to `exchange_social_code`.
 pub fn start_social_auth(
     provider: OAuthProvider,
     redirect_uri: &str,
     state: &str,
-) -> Result<String> {
+) -> Result<(String, String)> {
     let client_id = std::env::var(provider.client_id_env()).map_err(|_| {
         AppError::Request(format!("{} 未配置", provider.client_id_env()))
     })?;
@@ -236,16 +236,20 @@ pub fn start_social_auth(
         OAuthProvider::GitHub => "read:user",
     };
 
+    let code_verifier = generate_pkce_verifier();
+    let code_challenge = generate_pkce_challenge(&code_verifier);
+
     let url = format!(
-        "{}?client_id={}&redirect_uri={}&scope={}&state={}&response_type=code&code_challenge_method=S256",
+        "{}?client_id={}&redirect_uri={}&scope={}&state={}&response_type=code&code_challenge={}&code_challenge_method=S256",
         provider.auth_url(),
         client_id,
         percent_encode(redirect_uri),
         percent_encode(scopes),
-        state
+        state,
+        percent_encode(&code_challenge),
     );
 
-    Ok(url)
+    Ok((url, code_verifier))
 }
 
 /// Simple percent-encoding for URLs.
@@ -266,6 +270,7 @@ pub async fn exchange_social_code(
     provider: OAuthProvider,
     code: &str,
     redirect_uri: &str,
+    code_verifier: &str,
 ) -> Result<SocialTokenResponse> {
     let client_id = std::env::var(provider.client_id_env()).map_err(|_| {
         AppError::Request(format!("{} 未配置", provider.client_id_env()))
@@ -283,13 +288,15 @@ pub async fn exchange_social_code(
             "client_secret": client_secret,
             "code": code,
             "grant_type": "authorization_code",
-            "redirect_uri": redirect_uri
+            "redirect_uri": redirect_uri,
+            "code_verifier": code_verifier
         }),
         OAuthProvider::GitHub => json!({
             "client_id": client_id,
             "client_secret": client_secret,
             "code": code,
-            "redirect_uri": redirect_uri
+            "redirect_uri": redirect_uri,
+            "code_verifier": code_verifier
         }),
     };
 

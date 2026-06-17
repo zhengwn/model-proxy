@@ -335,6 +335,7 @@ pub async fn proxy_responses(
             kiro_config.thinking_mode.as_deref(),
             std::time::Duration::from_secs(kiro_config.first_token_timeout.unwrap_or(15)),
             std::time::Duration::from_secs(kiro_config.streaming_read_timeout.unwrap_or(300)),
+            state.kiro.as_ref().map(|k| k.truncation_state.clone()),
         )
         .await
     } else {

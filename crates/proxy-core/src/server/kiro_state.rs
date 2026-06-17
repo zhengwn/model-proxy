@@ -17,6 +17,7 @@ use crate::convert::kiro::auth::KiroAuthManager;
 use crate::convert::kiro::endpoint_health::EndpointHealthTracker;
 use crate::convert::kiro::flow_monitor::FlowMonitor;
 use crate::convert::kiro::rate_limiter::RateLimiter;
+use crate::convert::kiro::truncation::TruncationState;
 
 /// All Kiro-specific runtime state, only initialized when a Kiro provider exists.
 #[derive(Clone)]
@@ -31,6 +32,8 @@ pub struct KiroState {
     pub rate_limiter: Arc<Mutex<RateLimiter>>,
     /// Endpoint health scoring for multi-endpoint fallback.
     pub endpoint_health: EndpointHealthTracker,
+    /// Truncation recovery state — stores truncation info between requests.
+    pub truncation_state: TruncationState,
     /// Cached /v1/models response (last_update, response_json).
     pub model_cache: Arc<Mutex<(Instant, serde_json::Value)>>,
     /// Default upstream client (no proxy), reused across requests for connection pooling.
@@ -60,6 +63,7 @@ impl KiroState {
             flow_monitor: Arc::new(Mutex::new(FlowMonitor::new(1000))),
             rate_limiter: Arc::new(Mutex::new(RateLimiter::new(0, 0, 0))),
             endpoint_health: EndpointHealthTracker::new(),
+            truncation_state: TruncationState::new(),
             model_cache: Arc::new(Mutex::new((Instant::now(), serde_json::Value::Null))),
             default_client: client.clone(),
             proxied_clients: Arc::new(Mutex::new(HashMap::new())),
@@ -156,7 +160,9 @@ fn init_kiro_auth(
             mode = mode_str.as_str(),
             "初始化 Kiro 多账户管理器"
         );
-        (None, Some(Arc::new(Mutex::new(mgr))))
+        let mgr_arc = Arc::new(Mutex::new(mgr));
+        AccountManager::start_periodic_save(mgr_arc.clone());
+        (None, Some(mgr_arc))
     } else if accounts.len() == 1 {
         let auth = KiroAuthManager::new(&accounts[0].1, client.clone());
         (Some(Arc::new(Mutex::new(auth))), None)

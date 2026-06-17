@@ -181,6 +181,82 @@ pub fn check_tool_call_truncation(tool_name: &str, input_json: &str) -> Option<T
     }
 }
 
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+/// Shared state for storing truncation info between requests.
+/// When a stream is truncated, the info is stored here.
+/// On the next request, it is popped and injected as recovery messages.
+#[derive(Debug, Clone)]
+pub struct TruncationState {
+    /// Tool truncations keyed by tool_use_id
+    tool_truncations: Arc<Mutex<HashMap<String, TruncationReason>>>,
+    /// Content-level truncations (missing usage events, etc.)
+    content_truncations: Arc<Mutex<Vec<TruncationReason>>>,
+}
+
+impl Default for TruncationState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TruncationState {
+    pub fn new() -> Self {
+        Self {
+            tool_truncations: Arc::new(Mutex::new(HashMap::new())),
+            content_truncations: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Store a tool truncation for recovery on the next request.
+    pub async fn store_tool_truncation(&self, tool_use_id: String, reason: TruncationReason) {
+        self.tool_truncations.lock().await.insert(tool_use_id, reason);
+    }
+
+    /// Store a content-level truncation (e.g., missing usage).
+    pub async fn store_content_truncation(&self, reason: TruncationReason) {
+        self.content_truncations.lock().await.push(reason);
+    }
+
+    /// Pop all stored truncation info for injection into the next request.
+    /// Returns (tool_truncations, content_truncations).
+    /// Entries are consumed (one-time retrieval) to prevent double-injection.
+    pub async fn pop_all_truncations(
+        &self,
+    ) -> (HashMap<String, TruncationReason>, Vec<TruncationReason>) {
+        let mut tools = self.tool_truncations.lock().await;
+        let mut content = self.content_truncations.lock().await;
+        let t = std::mem::take(&mut *tools);
+        let c = std::mem::take(&mut *content);
+        (t, c)
+    }
+
+    /// Check if there are any pending truncations.
+    pub async fn has_pending(&self) -> bool {
+        !self.tool_truncations.lock().await.is_empty()
+            || !self.content_truncations.lock().await.is_empty()
+    }
+}
+
+/// Build recovery messages to inject before the next Kiro request.
+/// Consumes stored truncation info (one-time retrieval).
+pub async fn build_recovery_messages(state: &TruncationState) -> Vec<Value> {
+    let (tool_truncations, content_truncations) = state.pop_all_truncations().await;
+    let mut messages = Vec::new();
+
+    for (tool_use_id, reason) in &tool_truncations {
+        messages.push(generate_truncation_tool_result(tool_use_id, reason));
+    }
+
+    for reason in &content_truncations {
+        messages.push(generate_truncation_user_message(reason));
+    }
+
+    messages
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

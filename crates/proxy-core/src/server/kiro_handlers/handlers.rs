@@ -44,6 +44,26 @@ pub(crate) async fn handle_kiro_messages(
     // Convert Anthropic request to Kiro payload
     let (mut kiro_payload, tool_name_map) = anthropic_to_kiro(&body_json, &provider, global_routes)?;
 
+    // Inject truncation recovery messages if any pending
+    if let Some(ref kiro) = state.kiro {
+        let recovery_msgs = crate::convert::kiro::truncation::build_recovery_messages(&kiro.truncation_state).await;
+        if !recovery_msgs.is_empty() {
+            if let Some(history) = kiro_payload
+                .pointer_mut("/conversationState/history")
+                .and_then(|v| v.as_array_mut())
+            {
+                for msg in recovery_msgs {
+                    history.push(msg);
+                }
+                info!(
+                    request_id = request_id.as_str(),
+                    count = history.len(),
+                    "注入截断恢复消息到 Kiro 历史"
+                );
+            }
+        }
+    }
+
     let kiro_model = kiro_payload
         .pointer("/conversationState/currentMessage/userInputMessage/modelId")
         .and_then(|v| v.as_str())
@@ -147,6 +167,7 @@ pub(crate) async fn handle_kiro_messages(
                 thinking_mode,
                 first_token_timeout,
                 streaming_read_timeout,
+                state.kiro.as_ref().map(|k| k.truncation_state.clone()),
             ).await
         } else {
             handle_stream_anthropic_output(
@@ -161,6 +182,7 @@ pub(crate) async fn handle_kiro_messages(
                 thinking_mode,
                 first_token_timeout,
                 streaming_read_timeout,
+                state.kiro.as_ref().map(|k| k.truncation_state.clone()),
             ).await
         };
         request_guard.complete();

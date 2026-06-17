@@ -254,7 +254,7 @@ fn sqlite_quote_literal(s: &str) -> String {
 }
 
 /// Try to write refreshed token back to kiro-cli SQLite database.
-fn write_back_to_sqlite(_cred: &KiroCredential, new_refresh_token: &str) {
+fn write_back_to_sqlite(cred: &KiroCredential, new_refresh_token: &str) {
     use std::io::Write;
 
     let home = match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
@@ -286,18 +286,34 @@ fn write_back_to_sqlite(_cred: &KiroCredential, new_refresh_token: &str) {
         return;
     }
 
-    // The kiro-cli stores tokens as base64-encoded JSON in the 'value' column.
-    // We update only the refreshToken JSON field via json_set(), which performs
-    // its own JSON encoding of the value. The token is embedded as a SQL string
-    // literal escaped via `sqlite_quote_literal` (single-quote doubling only).
+    // Validate and prepare additional fields to write back atomically.
+    let access_token_literal = cred.access_token.as_ref()
+        .filter(|t| !t.is_empty() && t.len() <= 8192 && !t.chars().any(|c| c.is_control()))
+        .map(|t| sqlite_quote_literal(t));
+
+    let profile_arn_literal = cred.profile_arn.as_ref()
+        .filter(|a| !a.is_empty() && a.len() <= 2048 && !a.chars().any(|c| c.is_control()))
+        .map(|a| sqlite_quote_literal(a));
+
+    // Build a chained json_set() SQL to update refreshToken + accessToken + profileArn atomically.
     let token_literal = sqlite_quote_literal(new_refresh_token);
+
+    // SQLite json_set() supports multiple path-value pairs in a single call:
+    //   json_set(value, '$.refreshToken', '<rt>', '$.accessToken', '<at>', ...)
+    let mut paths = format!("'$.refreshToken', '{}'", token_literal);
+    if let Some(ref at) = access_token_literal {
+        paths.push_str(&format!(", '$.accessToken', '{}'", at));
+    }
+    if let Some(ref arn) = profile_arn_literal {
+        paths.push_str(&format!(", '$.profileArn', '{}'", arn));
+    }
 
     // Note: key_prefix values below are hardcoded constants (not user input),
     // so they are safe to embed directly.
     for key_prefix in &["kirocli:social:token", "kirocli:oidc:token"] {
         let sql = format!(
-            "UPDATE auth_kv SET value = json_set(value, '$.refreshToken', '{}') WHERE key = '{}';",
-            token_literal, key_prefix
+            "UPDATE auth_kv SET value = json_set(value, {}) WHERE key = '{}';",
+            paths, key_prefix
         );
 
         // Feed the SQL (which contains the secret) via stdin rather than argv so
@@ -653,13 +669,52 @@ impl KiroAuthManager {
         // Token is expired or missing — refresh it
         info!("Kiro token 已过期或缺失，正在刷新...");
         let original_rt = self.credentials[idx].refresh_token.clone().unwrap_or_default();
-        Self::refresh_token(&mut self.credentials[idx], &self.client).await?;
+        let old_access_token = self.credentials[idx].access_token.clone();
 
-        // Persist refreshed token
-        persist_token(&self.credentials[idx]);
+        match Self::refresh_token(&mut self.credentials[idx], &self.client).await {
+            Ok(()) => {
+                // Success — persist and write back
+                persist_token(&self.credentials[idx]);
+                write_back_to_source(&self.credentials[idx], &original_rt);
+            }
+            Err(refresh_err) => {
+                tracing::warn!(error = %refresh_err, "Kiro token 刷新失败，尝试降级策略");
 
-        // Write back to original credential source (e.g., kiro-cli SQLite)
-        write_back_to_source(&self.credentials[idx], &original_rt);
+                // Fallback 1: Try reloading from persisted file
+                if let Some(record) = load_persisted_token(&self.credentials[idx].region) {
+                    if !record.access_token.is_empty() && !record.access_token.starts_with("dummy") {
+                        tracing::warn!("降级: 使用持久化文件中的 token");
+                        self.credentials[idx].access_token = Some(record.access_token.clone());
+                        self.credentials[idx].refresh_token = record.refresh_token;
+                        self.credentials[idx].profile_arn = record.profile_arn;
+                        if !self.credentials[idx].is_expired() {
+                            return Ok(record.access_token);
+                        }
+                    }
+                }
+
+                // Fallback 2: Try reloading from SQLite and retry refresh
+                if let Some((token, _region)) = load_from_sqlite() {
+                    tracing::warn!("降级: 使用 SQLite 中的 refresh token 重新尝试");
+                    self.credentials[idx].refresh_token = Some(token);
+                    if Self::refresh_token(&mut self.credentials[idx], &self.client).await.is_ok() {
+                        persist_token(&self.credentials[idx]);
+                        return self.credentials[idx].access_token.clone().ok_or_else(|| {
+                            crate::error::AppError::Request("Kiro token 刷新后仍为空".to_string())
+                        });
+                    }
+                }
+
+                // Fallback 3: Return old access token if it exists (with warning)
+                if let Some(ref old_token) = old_access_token {
+                    tracing::warn!("降级: 使用旧的 access_token（可能已过期）");
+                    return Ok(old_token.clone());
+                }
+
+                // All fallbacks exhausted
+                return Err(refresh_err);
+            }
+        }
 
         self.credentials[idx].access_token.clone().ok_or_else(|| {
             crate::error::AppError::Request("Kiro token 刷新后仍为空".to_string())
@@ -685,13 +740,42 @@ impl KiroAuthManager {
 
         info!("Kiro 强制刷新 token（403 触发）");
         let original_rt = self.credentials[idx].refresh_token.clone().unwrap_or_default();
-        Self::refresh_token(&mut self.credentials[idx], &self.client).await?;
 
-        // Persist refreshed token
-        persist_token(&self.credentials[idx]);
+        match Self::refresh_token(&mut self.credentials[idx], &self.client).await {
+            Ok(()) => {
+                persist_token(&self.credentials[idx]);
+                write_back_to_source(&self.credentials[idx], &original_rt);
+            }
+            Err(refresh_err) => {
+                tracing::warn!(error = %refresh_err, "强制刷新失败，尝试备用来源");
 
-        // Write back to original credential source (e.g., kiro-cli SQLite)
-        write_back_to_source(&self.credentials[idx], &original_rt);
+                // Fallback 1: Try persisted file
+                if let Some(record) = load_persisted_token(&self.credentials[idx].region) {
+                    if !record.access_token.is_empty() && !record.access_token.starts_with("dummy") {
+                        self.credentials[idx].access_token = Some(record.access_token.clone());
+                        self.credentials[idx].refresh_token = record.refresh_token;
+                        if !self.credentials[idx].is_expired() {
+                            tracing::warn!("降级: 使用持久化文件中的 token（强制刷新）");
+                            persist_token(&self.credentials[idx]);
+                            return Ok(record.access_token);
+                        }
+                    }
+                }
+
+                // Fallback 2: Try SQLite
+                if let Some((token, _region)) = load_from_sqlite() {
+                    self.credentials[idx].refresh_token = Some(token);
+                    if Self::refresh_token(&mut self.credentials[idx], &self.client).await.is_ok() {
+                        persist_token(&self.credentials[idx]);
+                        return self.credentials[idx].access_token.clone().ok_or_else(|| {
+                            crate::error::AppError::Request("Kiro token 强制刷新后仍为空".to_string())
+                        });
+                    }
+                }
+
+                return Err(refresh_err);
+            }
+        }
 
         self.credentials[idx].access_token.clone().ok_or_else(|| {
             crate::error::AppError::Request("Kiro token 强制刷新后仍为空".to_string())

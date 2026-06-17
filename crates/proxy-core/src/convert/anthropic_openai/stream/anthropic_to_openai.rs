@@ -27,6 +27,9 @@ pub(crate) struct OpenAiStreamOutputState {
     pub(crate) started: bool,
     pub(crate) current_block_type: Option<String>,
     pub(crate) tool_call_counter: usize,
+    /// Maps Anthropic content_block index → OpenAI tool_call index,
+    /// so `input_json_delta` events route to the correct tool.
+    pub(crate) block_to_tool_index: std::collections::HashMap<usize, usize>,
     pub(crate) ended: bool,
     pub(crate) output_tokens: usize,
     pub(crate) input_tokens: u64,
@@ -41,6 +44,7 @@ impl OpenAiStreamOutputState {
             started: false,
             current_block_type: None,
             tool_call_counter: 0,
+            block_to_tool_index: std::collections::HashMap::new(),
             ended: false,
             output_tokens: 0,
             input_tokens: 0,
@@ -136,8 +140,14 @@ pub(crate) fn convert_anthropic_stream_chunk(
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
                     let openai_id = anthropic_id_to_openai(tool_id);
-                    let index = state.tool_call_counter;
+                    let openai_index = state.tool_call_counter;
                     state.tool_call_counter += 1;
+
+                    // Record the mapping from Anthropic block index to OpenAI tool index
+                    let anthropic_block_index = data.get("index")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(openai_index as u64) as usize;
+                    state.block_to_tool_index.insert(anthropic_block_index, openai_index);
 
                     events.push(openai_sse_chunk(&json!({
                         "id": state.stream_id,
@@ -148,7 +158,7 @@ pub(crate) fn convert_anthropic_stream_chunk(
                             "index": 0,
                             "delta": {
                                 "tool_calls": [{
-                                    "index": index,
+                                    "index": openai_index,
                                     "id": openai_id,
                                     "type": "function",
                                     "function": {
@@ -220,8 +230,14 @@ pub(crate) fn convert_anthropic_stream_chunk(
                         .and_then(|v| v.as_str())
                     {
                         if !partial_json.is_empty() {
-                            // Use the last tool call index (most recently started)
-                            let index = state.tool_call_counter.saturating_sub(1);
+                            // Look up the correct OpenAI tool_call index from the Anthropic block index
+                            let anthropic_block_index = data.get("index")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0) as usize;
+                            let index = state.block_to_tool_index
+                                .get(&anthropic_block_index)
+                                .copied()
+                                .unwrap_or_else(|| state.tool_call_counter.saturating_sub(1));
                             events.push(openai_sse_chunk(&json!({
                                 "id": state.stream_id,
                                 "object": "chat.completion.chunk",
