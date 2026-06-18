@@ -144,6 +144,41 @@ fn responses_to_anthropic(body: &Value) -> Value {
                         ]
                     }));
                 }
+                "local_shell_call" => {
+                    let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                    let action = item.get("action").cloned().unwrap_or(json!({}));
+                    pending_tool_calls.insert(call_id.to_string(), ("local_shell".to_string(), action.to_string()));
+                }
+                "tool_search_call" => {
+                    let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                    let arguments = item.get("arguments")
+                        .map(|v| if v.is_string() { v.as_str().unwrap_or("{}").to_string() } else { v.to_string() })
+                        .unwrap_or_else(|| "{}".to_string());
+                    pending_tool_calls.insert(call_id.to_string(), ("tool_search".to_string(), arguments));
+                }
+                "tool_search_output" | "mcp_tool_call_output" => {
+                    let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                    let output_text = item.get("output")
+                        .and_then(|v| v.as_str()).map(String::from)
+                        .unwrap_or_else(|| {
+                            let mut synthetic = serde_json::Map::new();
+                            if let Some(s) = item.get("status") { synthetic.insert("status".to_string(), s.clone()); }
+                            if let Some(e) = item.get("execution") { synthetic.insert("execution".to_string(), e.clone()); }
+                            if let Some(t) = item.get("tools") { synthetic.insert("tools".to_string(), t.clone()); }
+                            if synthetic.is_empty() { "{}".to_string() } else { Value::Object(synthetic).to_string() }
+                        });
+                    if let Some((name, args)) = pending_tool_calls.remove(call_id) {
+                        let input: Value = serde_json::from_str(&args).unwrap_or(json!({}));
+                        messages.push(json!({
+                            "role": "assistant",
+                            "content": [{"type": "tool_use", "id": call_id, "name": name, "input": input}]
+                        }));
+                    }
+                    messages.push(json!({
+                        "role": "user",
+                        "content": [{"type": "tool_result", "tool_use_id": call_id, "content": output_text}]
+                    }));
+                }
                 "web_search_call" | "image_generation_call" => {
                     // Summarize as text
                     let summary = format!("[{} completed]", item_type);
@@ -159,19 +194,46 @@ fn responses_to_anthropic(body: &Value) -> Value {
         }
     }
 
-    // Convert tools
+    // Convert tools — handle special types (local_shell, tool_search) and standard functions
     let tools: Vec<Value> = body.get("tools")
         .and_then(|v| v.as_array())
         .map(|arr| {
-            arr.iter().map(|tool| {
-                let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let description = tool.get("description").and_then(|v| v.as_str()).unwrap_or("");
-                let parameters = tool.get("parameters").cloned().unwrap_or(json!({}));
-                json!({
-                    "name": name,
-                    "description": description,
-                    "input_schema": parameters
-                })
+            arr.iter().filter_map(|tool| {
+                let tool_type = tool.get("type").and_then(|v| v.as_str()).unwrap_or("function");
+                match tool_type {
+                    "local_shell" => Some(json!({
+                        "name": "local_shell",
+                        "description": "Execute shell commands",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {
+                                "command": {"type": "array", "items": {"type": "string"}},
+                                "workdir": {"type": "string"},
+                                "timeout_ms": {"type": "integer"}
+                            },
+                            "required": ["command"]
+                        }
+                    })),
+                    "tool_search" => Some(json!({
+                        "name": "tool_search",
+                        "description": "Search for available tools",
+                        "input_schema": tool.get("parameters").cloned().unwrap_or(json!({
+                            "type": "object",
+                            "properties": {"query": {"type": "string"}}
+                        }))
+                    })),
+                    "web_search" | "web_search_preview" => None, // Handled separately by mcp.rs
+                    _ => {
+                        let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let description = tool.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                        let parameters = tool.get("parameters").cloned().unwrap_or(json!({}));
+                        Some(json!({
+                            "name": name,
+                            "description": description,
+                            "input_schema": parameters
+                        }))
+                    }
+                }
             }).collect()
         })
         .unwrap_or_default();
@@ -410,5 +472,100 @@ mod tests {
         let result = responses_to_anthropic(&body);
         assert!(result["tools"].as_array().unwrap().len() == 1);
         assert_eq!(result["tools"][0]["name"], "search");
+    }
+
+    #[test]
+    fn local_shell_call_roundtrip() {
+        let body = json!({
+            "model": "test",
+            "input": [
+                {"type": "message", "role": "user", "content": "Run ls"},
+                {"type": "local_shell_call", "call_id": "call_ls", "action": {"command": ["ls", "-la"], "workdir": "/tmp"}},
+                {"type": "function_call_output", "call_id": "call_ls", "output": "total 0\n"}
+            ]
+        });
+
+        let result = responses_to_anthropic(&body);
+        let msgs = result["messages"].as_array().unwrap();
+        // Should have: user, assistant(tool_use for local_shell), user(tool_result)
+        assert!(msgs.len() >= 3);
+        let tool_use = &msgs[1]["content"][0];
+        assert_eq!(tool_use["type"], "tool_use");
+        assert_eq!(tool_use["name"], "local_shell");
+        assert_eq!(tool_use["id"], "call_ls");
+    }
+
+    #[test]
+    fn tool_search_call_roundtrip() {
+        let body = json!({
+            "model": "test",
+            "input": [
+                {"type": "message", "role": "user", "content": "Find tools"},
+                {"type": "tool_search_call", "call_id": "call_ts", "arguments": {"query": "file operations"}},
+                {"type": "tool_search_output", "call_id": "call_ts", "status": "success", "tools": [{"name": "Read"}, {"name": "Write"}]}
+            ]
+        });
+
+        let result = responses_to_anthropic(&body);
+        let msgs = result["messages"].as_array().unwrap();
+        assert!(msgs.len() >= 3);
+        let tool_use = &msgs[1]["content"][0];
+        assert_eq!(tool_use["type"], "tool_use");
+        assert_eq!(tool_use["name"], "tool_search");
+    }
+
+    #[test]
+    fn mcp_tool_call_output_handled() {
+        let body = json!({
+            "model": "test",
+            "input": [
+                {"type": "custom_tool_call", "call_id": "call_mcp", "name": "mcp_tool", "input": {"action": "list"}},
+                {"type": "mcp_tool_call_output", "call_id": "call_mcp", "output": "tool result"}
+            ]
+        });
+
+        let result = responses_to_anthropic(&body);
+        let msgs = result["messages"].as_array().unwrap();
+        assert!(msgs.len() >= 2);
+        // Should have assistant tool_use + user tool_result
+        assert_eq!(msgs[0]["content"][0]["type"], "tool_use");
+        assert_eq!(msgs[1]["content"][0]["type"], "tool_result");
+    }
+
+    #[test]
+    fn local_shell_tool_definition() {
+        let body = json!({
+            "model": "test",
+            "input": [],
+            "tools": [
+                {"type": "local_shell"},
+                {"name": "search", "description": "Search", "parameters": {"type": "object"}}
+            ]
+        });
+
+        let result = responses_to_anthropic(&body);
+        let tools = result["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["name"], "local_shell");
+        assert_eq!(tools[0]["input_schema"]["required"][0], "command");
+        assert_eq!(tools[1]["name"], "search");
+    }
+
+    #[test]
+    fn web_search_tool_filtered() {
+        let body = json!({
+            "model": "test",
+            "input": [],
+            "tools": [
+                {"type": "web_search"},
+                {"name": "search", "description": "Search", "parameters": {"type": "object"}}
+            ]
+        });
+
+        let result = responses_to_anthropic(&body);
+        let tools = result["tools"].as_array().unwrap();
+        // web_search should be filtered out (handled by mcp.rs)
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "search");
     }
 }

@@ -57,6 +57,7 @@ pub mod stream_openai;
 // ---- Message Processing ----
 pub mod history;
 pub mod sanitize;
+pub mod smart_summary;
 pub mod thinking_parser;
 pub mod truncation;
 

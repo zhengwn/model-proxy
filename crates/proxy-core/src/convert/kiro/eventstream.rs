@@ -10,6 +10,8 @@
 use bytes::{Buf, BytesMut};
 use crc::{Crc, CRC_32_ISO_HDLC};
 use serde::de::DeserializeOwned;
+use serde::Deserialize;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
 use tracing::{error, warn};
@@ -737,6 +739,69 @@ impl Event {
     }
 }
 
+// ---- Text fallback for corrupted binary framing ----
+
+/// Try to parse raw bytes as plain JSON objects when binary EventStream framing
+/// is broken (e.g., by an intermediary proxy that strips/corrupts the binary headers).
+///
+/// Scans the byte stream for JSON objects and attempts to extract Kiro events from them.
+pub fn try_parse_text_events(data: &[u8]) -> Vec<Event> {
+    let text = match std::str::from_utf8(data) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+
+    let mut events = Vec::new();
+    let mut de = serde_json::Deserializer::from_str(text);
+
+    loop {
+        match Value::deserialize(&mut de) {
+            Ok(val) => {
+                if let Some(event) = value_to_event(&val) {
+                    events.push(event);
+                }
+            }
+            Err(_) => {
+                // Advance past the error position and try next JSON object
+                // serde_json Deserializer handles this internally; break on EOF
+                break;
+            }
+        }
+    }
+
+    events
+}
+
+/// Extract a Kiro Event from a JSON value found in a text fallback scan.
+fn value_to_event(val: &Value) -> Option<Event> {
+    // Kiro wraps events in { "assistantResponseEvent": { "content": "..." } }
+    if let Some(assistant) = val.get("assistantResponseEvent") {
+        let content = assistant.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if !content.is_empty() {
+            return Some(Event::AssistantResponse {
+                content: content.to_string(),
+            });
+        }
+    }
+
+    // { "toolUseEvent": { "toolUseId": "...", "name": "...", "input": "...", "stop": true } }
+    if let Some(tool) = val.get("toolUseEvent") {
+        let tool_use_id = tool.get("toolUseId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let input = tool.get("input").map(|v| v.to_string()).unwrap_or_else(|| "{}".to_string());
+        let stop = tool.get("stop").and_then(|v| v.as_bool()).unwrap_or(false);
+        return Some(Event::ToolUse { tool_use_id, name, input, stop });
+    }
+
+    // { "contextUsageEvent": { "contextUsagePercentage": 42.5 } }
+    if let Some(usage) = val.get("contextUsageEvent") {
+        let percentage = usage.get("contextUsagePercentage").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        return Some(Event::ContextUsage { percentage });
+    }
+
+    None
+}
+
 // ---- Tests ----
 
 #[cfg(test)]
@@ -869,5 +934,49 @@ mod tests {
             }
             _ => panic!("Expected AssistantResponse"),
         }
+    }
+
+    #[test]
+    fn text_fallback_parses_assistant_response() {
+        // Simulate corrupted binary framing — just JSON objects in a byte stream
+        let json_data = r#"{"assistantResponseEvent":{"content":"Hello from text fallback"}}"#;
+        let events = try_parse_text_events(json_data.as_bytes());
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::AssistantResponse { content } => assert_eq!(content, "Hello from text fallback"),
+            _ => panic!("Expected AssistantResponse"),
+        }
+    }
+
+    #[test]
+    fn text_fallback_parses_tool_use() {
+        let json_data = r#"{"toolUseEvent":{"toolUseId":"toolu_123","name":"bash","input":"{\"cmd\":\"ls\"}","stop":true}}"#;
+        let events = try_parse_text_events(json_data.as_bytes());
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::ToolUse { tool_use_id, name, stop, .. } => {
+                assert_eq!(tool_use_id, "toolu_123");
+                assert_eq!(name, "bash");
+                assert!(*stop);
+            }
+            _ => panic!("Expected ToolUse"),
+        }
+    }
+
+    #[test]
+    fn text_fallback_empty_on_binary_garbage() {
+        let garbage = vec![0xFF, 0xFE, 0xFD, 0x00, 0x01, 0x02];
+        let events = try_parse_text_events(&garbage);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn text_fallback_multiple_events() {
+        let json_data = concat!(
+            r#"{"assistantResponseEvent":{"content":"Part 1"}}"#,
+            r#"{"assistantResponseEvent":{"content":"Part 2"}}"#,
+        );
+        let events = try_parse_text_events(json_data.as_bytes());
+        assert_eq!(events.len(), 2);
     }
 }

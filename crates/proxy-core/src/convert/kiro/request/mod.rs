@@ -188,6 +188,17 @@ pub fn anthropic_to_kiro(
         }
     }
 
+    // 7d. Strip empty toolUses arrays (Kiro API rejects them with "Improperly formed request")
+    for entry in history.iter_mut() {
+        if let Some(tool_uses) = entry.pointer("/assistantResponseMessage/toolUses") {
+            if tool_uses.as_array().map(|a| a.is_empty()).unwrap_or(false) {
+                if let Some(obj) = entry.pointer_mut("/assistantResponseMessage").and_then(|v| v.as_object_mut()) {
+                    obj.remove("toolUses");
+                }
+            }
+        }
+    }
+
     // 8. Build currentMessage
     let mut user_input_message = json!({
         "content": current_content,
@@ -482,5 +493,43 @@ mod tests {
         assert_eq!(id.chars().filter(|c| *c == '-').count(), 4);
         // Check version nibble
         assert_eq!(id.as_bytes()[14], b'4');
+    }
+
+    #[test]
+    fn empty_tool_uses_stripped_from_history() {
+        // Simulate a Kiro payload with an empty toolUses array in history
+        // This can happen when Claude Code sends tool_use blocks that get consumed
+        // but the enclosing assistant message retains the empty array.
+        let body = json!({
+            "model": "claude-sonnet-4.5",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "Sure"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "test_tool", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "done"}
+                ]},
+                {"role": "user", "content": "Continue"}
+            ],
+            "tools": [{"name": "test_tool", "description": "A tool", "input_schema": {"type": "object", "properties": {}}}]
+        });
+        let provider = test_provider();
+        let (payload, _) = anthropic_to_kiro(&body, &provider, &[]).unwrap();
+
+        // Verify no history entry has empty toolUses
+        if let Some(history) = payload["conversationState"]["history"].as_array() {
+            for entry in history {
+                if let Some(tool_uses) = entry.pointer("/assistantResponseMessage/toolUses") {
+                    assert!(
+                        !tool_uses.as_array().map(|a| a.is_empty()).unwrap_or(false),
+                        "Found empty toolUses in history: {}",
+                        serde_json::to_string(entry).unwrap_or_default()
+                    );
+                }
+            }
+        }
     }
 }

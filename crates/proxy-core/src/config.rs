@@ -330,6 +330,12 @@ pub struct KiroConfig {
     /// 429 时是否降级到其他端点，默认 true
     #[serde(default)]
     pub endpoint_fallback: Option<bool>,
+    /// 是否保存调试请求 JSON（保存到 MODEL_PROXY_DEBUG_DIR/debug_requests/ 目录），默认 false
+    #[serde(default)]
+    pub debug_save_requests: Option<bool>,
+    /// 是否启用 LLM Smart Summary（CONTENT_TOO_LONG 时用 Haiku 摘要再重试），默认 false
+    #[serde(default)]
+    pub smart_summary_enabled: Option<bool>,
 }
 
 impl ProviderConfig {
@@ -853,6 +859,8 @@ mod config_tests {
             health_score_recovery: None,
             preferred_endpoint: None,
             endpoint_fallback: None,
+            debug_save_requests: None,
+            smart_summary_enabled: None,
         });
         let config = make_config(vec![p]);
 

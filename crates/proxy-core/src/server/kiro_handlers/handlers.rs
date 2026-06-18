@@ -11,9 +11,9 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::Instant;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use super::dispatch::{acquire_kiro_auth, dispatch_kiro_request};
+use super::dispatch::{acquire_kiro_auth, dispatch_kiro_request, KiroDispatchResult};
 use crate::convert::anthropic_openai::stream::StreamLogContext;
 use crate::server::state::{elapsed_ms, next_request_id, RequestCompletionGuard};
 use crate::error::{AppError, Result};
@@ -185,6 +185,25 @@ pub(crate) async fn handle_kiro_messages(
     request_guard.set_phase("kiro_request");
     let payload_bytes = serde_json::to_vec(&kiro_payload)?;
 
+    // Debug: save request payloads to disk for protocol troubleshooting
+    if kiro_config.debug_save_requests.unwrap_or(false) {
+        if let Ok(debug_dir) = std::env::var("MODEL_PROXY_DEBUG_DIR") {
+            let dir = std::path::PathBuf::from(debug_dir).join("debug_requests");
+            let _ = std::fs::create_dir_all(&dir);
+            let filename = format!("{}.json", request_id);
+            let debug_data = json!({
+                "request_id": request_id,
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "original_request": body_json,
+                "kiro_payload": kiro_payload,
+            });
+            let _ = std::fs::write(
+                dir.join(filename),
+                serde_json::to_string_pretty(&debug_data).unwrap_or_default(),
+            );
+        }
+    }
+
     // Dispatch to Kiro with endpoint fallback
     request_guard.set_phase("kiro_send");
     let first_token_timeout = std::time::Duration::from_secs(kiro_config.first_token_timeout.unwrap_or(15));
@@ -272,11 +291,85 @@ pub(crate) async fn handle_kiro_messages(
         request_guard.complete();
         response
     } else {
-        // Non-streaming: simple dispatch without first-token retry
+        // Non-streaming: dispatch with CONTENT_TOO_LONG retry support
+        let mut kiro_payload = kiro_payload; // make mutable for retry
+        let mut payload_bytes = payload_bytes;
         let dispatch_result = match dispatch_kiro_request(
             &state, &kiro_payload, &payload_bytes, &auth_info, kiro_config, &request_id, false,
         ).await {
             Ok(r) => r,
+            Err(AppError::UpstreamStatus(status, body))
+                if status == 400 && crate::convert::kiro::truncation::is_content_length_exceeded(&body) =>
+            {
+                // CONTENT_TOO_LONG: try Smart Summary + tiered truncation retry
+                warn!(request_id = request_id, "Kiro API CONTENT_LENGTH_EXCEEDS，尝试 Smart Summary 重试");
+
+                let mut retry_result: Option<KiroDispatchResult> = None;
+
+                // Step 1: Try LLM Smart Summary (if enabled)
+                if kiro_config.smart_summary_enabled.unwrap_or(false) {
+                    if let Some(ref kiro_state) = state.kiro {
+                        let region = kiro_config.api_region.as_deref().unwrap_or(&kiro_config.region);
+                        let client = kiro_state.client_for_proxy(kiro_config.proxy_url.as_deref()).await.unwrap_or_else(|_| state.client.clone());
+                        match crate::convert::kiro::smart_summary::summarize_and_replace_history(
+                            &mut kiro_payload,
+                            &auth_info.token,
+                            &auth_info.amz_user_agent,
+                            &auth_info.user_agent,
+                            region,
+                            &client,
+                            &kiro_state.summary_cache,
+                        ).await {
+                            Ok(true) => {
+                                info!(request_id = request_id, "Smart Summary 成功，重试请求");
+                                payload_bytes = serde_json::to_vec(&kiro_payload)?;
+                                match dispatch_kiro_request(&state, &kiro_payload, &payload_bytes, &auth_info, kiro_config, &request_id, false).await {
+                                    Ok(r) => retry_result = Some(r),
+                                    Err(e) => warn!(error = %e, "Smart Summary 重试仍失败"),
+                                }
+                            }
+                            Ok(false) => debug!("History too short for summary"),
+                            Err(e) => warn!(error = %e, "Smart Summary 失败，降级到 tiered truncation"),
+                        }
+                    }
+                }
+
+                // Step 2: Tiered truncation fallback (if summary didn't work or disabled)
+                if retry_result.is_none() {
+                    for tier in 0..crate::convert::kiro::truncation::TRUNCATION_TIERS.len() {
+                        crate::convert::kiro::smart_summary::apply_tiered_truncation(&mut kiro_payload, tier);
+                        payload_bytes = serde_json::to_vec(&kiro_payload)?;
+                        match dispatch_kiro_request(&state, &kiro_payload, &payload_bytes, &auth_info, kiro_config, &request_id, false).await {
+                            Ok(r) => {
+                                retry_result = Some(r);
+                                break;
+                            }
+                            Err(AppError::UpstreamStatus(_s, b)) if crate::convert::kiro::truncation::is_content_length_exceeded(&b) => {
+                                warn!(request_id = request_id, tier, "Tier {} truncation 仍超限，继续", tier);
+                                continue;
+                            }
+                            Err(e) => {
+                                request_guard.complete();
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+
+                match retry_result {
+                    Some(r) => r,
+                    None => {
+                        request_guard.complete();
+                        return Ok((
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "type": "error",
+                                "error": { "type": "content_too_long", "message": "Payload too large even after truncation" }
+                            })),
+                        ).into_response());
+                    }
+                }
+            }
             Err(AppError::UpstreamStatus(status, body)) => {
                 request_guard.complete();
                 return Ok((
@@ -367,6 +460,29 @@ pub(crate) async fn handle_kiro_non_stream(
                     break;
                 }
             }
+        }
+    }
+
+    // Build Anthropic response
+    // If binary decoder produced nothing, try text fallback (proxy chain may have corrupted framing)
+    if text_parts.is_empty() && thinking_parts.is_empty() && tool_uses.is_empty() && input_tokens == 0 {
+        warn!(request_id = request_id, "Binary EventStream 解析无结果，尝试 JSON text 回退");
+        let fallback_events = crate::convert::kiro::eventstream::try_parse_text_events(&body_bytes);
+        for event in fallback_events {
+            match event {
+                crate::convert::kiro::eventstream::Event::AssistantResponse { content } => {
+                    text_parts.push(content);
+                }
+                crate::convert::kiro::eventstream::Event::ToolUse { name, tool_use_id, input, stop } if stop => {
+                    let original_name = tool_name_map.get(name.as_str()).map(|s| s.as_str()).unwrap_or(name.as_str());
+                    let input_val: Value = serde_json::from_str(&input).unwrap_or(json!({}));
+                    tool_uses.push(json!({"type": "tool_use", "id": tool_use_id, "name": original_name, "input": input_val}));
+                }
+                _ => {}
+            }
+        }
+        if !text_parts.is_empty() || !tool_uses.is_empty() {
+            info!(request_id = request_id, "Text fallback 成功恢复内容");
         }
     }
 

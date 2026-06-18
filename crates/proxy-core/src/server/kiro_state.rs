@@ -17,6 +17,7 @@ use crate::convert::kiro::auth::KiroAuthManager;
 use crate::convert::kiro::endpoint_health::EndpointHealthTracker;
 use crate::convert::kiro::flow_monitor::FlowMonitor;
 use crate::convert::kiro::rate_limiter::RateLimiter;
+use crate::convert::kiro::smart_summary::SummaryCache;
 use crate::convert::kiro::truncation::TruncationState;
 
 /// All Kiro-specific runtime state, only initialized when a Kiro provider exists.
@@ -36,6 +37,8 @@ pub struct KiroState {
     pub endpoint_health: EndpointHealthTracker,
     /// Truncation recovery state — stores truncation info between requests.
     pub truncation_state: TruncationState,
+    /// LLM Smart Summary cache for CONTENT_TOO_LONG retry.
+    pub summary_cache: Arc<SummaryCache>,
     /// Cached /v1/models response (last_update, response_json).
     pub model_cache: Arc<Mutex<(Instant, serde_json::Value)>>,
     /// Default upstream client (no proxy), reused across requests for connection pooling.
@@ -73,6 +76,7 @@ impl KiroState {
             rate_limiter: Arc::new(Mutex::new(RateLimiter::new(0, 0, 0))),
             endpoint_health: EndpointHealthTracker::new(),
             truncation_state: TruncationState::new(),
+            summary_cache: Arc::new(SummaryCache::new()),
             model_cache: Arc::new(Mutex::new((Instant::now(), serde_json::Value::Null))),
             default_client: client.clone(),
             proxied_clients: Arc::new(Mutex::new(HashMap::new())),
@@ -239,6 +243,8 @@ fn collect_kiro_accounts(kiro_config: &KiroConfig, provider_name: &str) -> Vec<(
                 health_score_recovery: kiro_config.health_score_recovery,
                 preferred_endpoint: kiro_config.preferred_endpoint.clone(),
                 endpoint_fallback: kiro_config.endpoint_fallback,
+                debug_save_requests: kiro_config.debug_save_requests,
+                smart_summary_enabled: kiro_config.smart_summary_enabled,
             };
             (id, cfg)
         })

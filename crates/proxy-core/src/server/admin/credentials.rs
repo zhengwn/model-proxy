@@ -170,6 +170,8 @@ pub(super) async fn admin_add_credential(
         health_score_recovery: None,
         preferred_endpoint: None,
         endpoint_fallback: None,
+        debug_save_requests: None,
+        smart_summary_enabled: None,
     };
 
     let id = {
