@@ -253,9 +253,8 @@ pub async fn proxy_messages(
                 global_routes,
                 request_id: &request_id,
                 request_start,
-                upstream_start,
-                upstream_headers_ms,
                 input_format: InputFormat::Anthropic,
+                req_log: &mut req_log,
             };
 
             if let Some(response) = try_fallback(
@@ -267,6 +266,7 @@ pub async fn proxy_messages(
             )
             .await
             {
+                super::record_result_metrics(state.metrics.as_ref(), &response, request_start);
                 request_guard.complete();
                 return response;
             }
@@ -339,12 +339,13 @@ pub async fn proxy_messages(
         )
         .await;
 
-    if !is_stream {
+    if !is_stream && response.is_ok() {
         req_log.emit_success(upstream_headers_ms);
     }
 
     // Record metrics at handler exit
     super::record_result_metrics(state.metrics.as_ref(), &response, request_start);
+    request_guard.complete();
 
     response
 }

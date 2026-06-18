@@ -108,7 +108,7 @@ async fn health_endpoint_returns_ok() {
     let config = make_config(port, &format!("http://{}", mock_addr));
 
     let token = CancellationToken::new();
-    let handle = proxy_core::start_server(config, token.clone());
+    let handle = proxy_core::start_server(config, token.clone()).await.unwrap();
 
     // Wait for server to start
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -136,7 +136,7 @@ async fn auth_rejects_missing_key() {
     let config = make_config(port, &format!("http://{}", mock_addr));
 
     let token = CancellationToken::new();
-    let handle = proxy_core::start_server(config, token.clone());
+    let handle = proxy_core::start_server(config, token.clone()).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let client = Client::new();
@@ -167,7 +167,7 @@ async fn auth_accepts_valid_x_api_key() {
     let config = make_config(port, &format!("http://{}", mock_addr));
 
     let token = CancellationToken::new();
-    let handle = proxy_core::start_server(config, token.clone());
+    let handle = proxy_core::start_server(config, token.clone()).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let client = Client::new();
@@ -202,7 +202,7 @@ async fn auth_accepts_bearer_token() {
     let config = make_config(port, &format!("http://{}", mock_addr));
 
     let token = CancellationToken::new();
-    let handle = proxy_core::start_server(config, token.clone());
+    let handle = proxy_core::start_server(config, token.clone()).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let client = Client::new();
@@ -230,7 +230,7 @@ async fn admin_routes_use_admin_key_not_client_key() {
     config.server.admin_api_key = Some("admin-key".to_string());
 
     let token = CancellationToken::new();
-    let handle = proxy_core::start_server(config, token.clone());
+    let handle = proxy_core::start_server(config, token.clone()).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let client = Client::new();
@@ -285,7 +285,7 @@ async fn proxy_converts_anthropic_to_openai_and_back() {
     let config = make_config(port, &format!("http://{}", mock_addr));
 
     let token = CancellationToken::new();
-    let handle = proxy_core::start_server(config, token.clone());
+    let handle = proxy_core::start_server(config, token.clone()).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let client = Client::new();
@@ -336,7 +336,7 @@ async fn model_routing_applies_to_requests() {
     }];
 
     let token = CancellationToken::new();
-    let handle = proxy_core::start_server(config, token.clone());
+    let handle = proxy_core::start_server(config, token.clone()).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let client = Client::new();
@@ -393,7 +393,7 @@ async fn concurrency_limit_rejects_excess_requests() {
     config.server.max_concurrent_requests = 1; // Only allow 1 concurrent request
 
     let token = CancellationToken::new();
-    let handle = proxy_core::start_server(config, token.clone());
+    let handle = proxy_core::start_server(config, token.clone()).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let client = Client::new();
@@ -449,7 +449,7 @@ async fn chat_completions_endpoint_forwards_openai_format() {
     let config = make_config(port, &format!("http://{}", mock_addr));
 
     let token = CancellationToken::new();
-    let handle = proxy_core::start_server(config, token.clone());
+    let handle = proxy_core::start_server(config, token.clone()).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let client = Client::new();
@@ -487,7 +487,7 @@ async fn openai_provider_base_url_with_v1_does_not_duplicate_path() {
     let config = make_config(port, &format!("http://{}/v1", mock_addr));
 
     let token = CancellationToken::new();
-    let handle = proxy_core::start_server(config, token.clone());
+    let handle = proxy_core::start_server(config, token.clone()).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let client = Client::new();
@@ -572,7 +572,7 @@ async fn fallback_tries_next_provider_on_error() {
     };
 
     let token = CancellationToken::new();
-    let handle = proxy_core::start_server(config, token.clone());
+    let handle = proxy_core::start_server(config, token.clone()).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let client = Client::new();
@@ -609,7 +609,7 @@ async fn fallback_disabled_returns_original_error() {
     config.fallback.enabled = false; // Fallback disabled
 
     let token = CancellationToken::new();
-    let handle = proxy_core::start_server(config, token.clone());
+    let handle = proxy_core::start_server(config, token.clone()).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let client = Client::new();
@@ -642,7 +642,7 @@ async fn upstream_error_returns_proper_error_format() {
     config.fallback.enabled = false;
 
     let token = CancellationToken::new();
-    let handle = proxy_core::start_server(config, token.clone());
+    let handle = proxy_core::start_server(config, token.clone()).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let client = Client::new();
@@ -721,7 +721,7 @@ async fn streaming_response_converts_openai_to_anthropic_sse() {
     let config = make_config(port, &format!("http://{}", mock_addr));
 
     let token = CancellationToken::new();
-    let handle = proxy_core::start_server(config, token.clone());
+    let handle = proxy_core::start_server(config, token.clone()).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let client = Client::new();
@@ -810,6 +810,62 @@ async fn streaming_response_converts_openai_to_anthropic_sse() {
 }
 
 #[tokio::test]
+async fn streaming_response_eof_after_finish_emits_final_delta_with_usage() {
+    let port = find_available_port();
+
+    let sse_chunks = vec![
+        "data: {\"id\":\"chatcmpl_eof\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n".to_string(),
+        "data: {\"id\":\"chatcmpl_eof\",\"choices\":[{\"delta\":{\"content\":\"Done\"},\"finish_reason\":null}]}\n\n".to_string(),
+        "data: {\"id\":\"chatcmpl_eof\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":9}}\n\n".to_string(),
+    ];
+
+    let (mock_addr, mock_token) = start_mock_streaming_server(sse_chunks).await;
+    let config = make_config(port, &format!("http://{}", mock_addr));
+
+    let token = CancellationToken::new();
+    let handle = proxy_core::start_server(config, token.clone())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client = Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{}/v1/messages", port))
+        .header("content-type", "application/json")
+        .header("x-api-key", "test-key")
+        .json(&json!({
+            "model": "test",
+            "max_tokens": 1024,
+            "stream": true,
+            "messages": [{"role": "user", "content": "Hello"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+
+    assert!(
+        body.contains("event: message_delta"),
+        "missing message_delta"
+    );
+    assert!(body.contains("event: message_stop"), "missing message_stop");
+    assert!(
+        body.contains(r#""input_tokens":7"#),
+        "missing actual input_tokens"
+    );
+    assert!(
+        body.contains(r#""output_tokens":9"#),
+        "missing actual output_tokens"
+    );
+
+    token.cancel();
+    let _ = handle.await;
+    mock_token.cancel();
+}
+
+#[tokio::test]
 async fn streaming_response_with_tool_calls() {
     let port = find_available_port();
 
@@ -827,7 +883,7 @@ async fn streaming_response_with_tool_calls() {
     let config = make_config(port, &format!("http://{}", mock_addr));
 
     let token = CancellationToken::new();
-    let handle = proxy_core::start_server(config, token.clone());
+    let handle = proxy_core::start_server(config, token.clone()).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let client = Client::new();
@@ -887,7 +943,7 @@ async fn streaming_response_with_thinking() {
     let config = make_config(port, &format!("http://{}", mock_addr));
 
     let token = CancellationToken::new();
-    let handle = proxy_core::start_server(config, token.clone());
+    let handle = proxy_core::start_server(config, token.clone()).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let client = Client::new();

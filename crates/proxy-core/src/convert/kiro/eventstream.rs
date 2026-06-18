@@ -822,18 +822,9 @@ pub fn try_parse_text_events(data: &[u8]) -> Vec<Event> {
     let mut events = Vec::new();
     let mut de = serde_json::Deserializer::from_str(text);
 
-    loop {
-        match Value::deserialize(&mut de) {
-            Ok(val) => {
-                if let Some(event) = value_to_event(&val) {
-                    events.push(event);
-                }
-            }
-            Err(_) => {
-                // Advance past the error position and try next JSON object
-                // serde_json Deserializer handles this internally; break on EOF
-                break;
-            }
+    while let Ok(val) = Value::deserialize(&mut de) {
+        if let Some(event) = value_to_event(&val) {
+            events.push(event);
         }
     }
 

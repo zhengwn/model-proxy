@@ -85,7 +85,9 @@ async fn main() {
         shutdown_token.cancel();
     });
 
-    let handle = proxy_core::start_server(config, token.clone());
+    let handle = proxy_core::start_server(config, token.clone())
+        .await
+        .expect("启动代理服务失败");
 
     // Wait for the server to finish
     let _ = handle.await;

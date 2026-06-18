@@ -257,7 +257,7 @@ pub struct KiroAccountEntry {
 }
 
 /// Kiro (Amazon Q Developer) 专用配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct KiroConfig {
     /// 认证方式: "social" | "idc" | "api_key"
     pub auth_method: String,

@@ -331,7 +331,7 @@ pub(crate) async fn handle_stream(
         let mut buffer = String::with_capacity(16384);
         let mut utf8_remainder: Vec<u8> = Vec::new();
         let mut conv_state = StreamConversionState::new();
-        let mut has_emitted_message_delta = false;
+
         let mut actual_usage = UsageParts::default();
         let mut upstream_chunks: u64 = 0;
         let mut emitted_events: u64 = 0;
@@ -520,10 +520,6 @@ pub(crate) async fn handle_stream(
                                         }
                                     }
                                 }
-
-                                if conv_state.ended {
-                                    has_emitted_message_delta = true;
-                                }
                             }
                         }
 
@@ -574,15 +570,33 @@ pub(crate) async fn handle_stream(
                 conv_state.stop_reason_value.as_deref(),
             );
         } else if conv_state.started && conv_state.ended {
-            if !has_emitted_message_delta {
-                if let Some(delta) = conv_state.pending_message_delta.take() {
-                    if tx.send(Ok(Bytes::from(delta))).await.is_ok() {
-                        emitted_events += 1;
-                    }
-                }
-                if send_message_stop(&tx).await {
+            if actual_usage.has_any() {
+                let sr = conv_state
+                    .stop_reason_value
+                    .as_deref()
+                    .unwrap_or("end_turn");
+                let usage = build_anthropic_usage(actual_usage, conv_state.output_tokens as u64);
+                let delta = sse_event(
+                    "message_delta",
+                    &json!({
+                        "type": "message_delta",
+                        "delta": {
+                            "stop_reason": sr,
+                            "stop_sequence": null
+                        },
+                        "usage": usage
+                    }),
+                );
+                if tx.send(Ok(Bytes::from(delta))).await.is_ok() {
                     emitted_events += 1;
                 }
+            } else if let Some(delta) = conv_state.pending_message_delta.take() {
+                if tx.send(Ok(Bytes::from(delta))).await.is_ok() {
+                    emitted_events += 1;
+                }
+            }
+            if send_message_stop(&tx).await {
+                emitted_events += 1;
             }
             log_stream_end(
                 "eof_after_finish",

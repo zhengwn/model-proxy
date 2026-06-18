@@ -28,9 +28,8 @@ pub(crate) struct FallbackContext<'a> {
     pub(crate) global_routes: &'a [ModelRoute],
     pub(crate) request_id: &'a str,
     pub(crate) request_start: Instant,
-    pub(crate) upstream_start: Instant,
-    pub(crate) upstream_headers_ms: u128,
     pub(crate) input_format: InputFormat,
+    pub(crate) req_log: &'a mut crate::server::request_log::RequestLog,
 }
 
 /// Attempt fallback to other providers in the registry.
@@ -70,9 +69,8 @@ pub(crate) async fn try_fallback(
             ctx.global_routes,
             ctx.request_id,
             ctx.request_start,
-            ctx.upstream_start,
-            ctx.upstream_headers_ms,
             ctx.input_format,
+            ctx.req_log,
         )
         .await;
 
@@ -99,9 +97,8 @@ async fn try_single_provider(
     global_routes: &[ModelRoute],
     request_id: &str,
     request_start: Instant,
-    upstream_start: Instant,
-    upstream_headers_ms: u128,
     input_format: InputFormat,
+    req_log: &mut crate::server::request_log::RequestLog,
 ) -> Option<Result<Response>> {
     // Kiro is not dispatchable through the generic path.
     let Some(dispatch) = get_dispatch(&provider.format) else {
@@ -141,6 +138,8 @@ async fn try_single_provider(
         fallback_req = fallback_req.timeout(Duration::from_secs(NON_STREAM_REQUEST_TIMEOUT_SECS));
     }
 
+    let fallback_upstream_start = Instant::now();
+
     let fallback_resp = match fallback_req.send().await {
         Ok(resp) => resp,
         Err(e) => {
@@ -153,6 +152,8 @@ async fn try_single_provider(
             return None;
         }
     };
+
+    let fallback_headers_ms = fallback_upstream_start.elapsed().as_millis();
 
     if !fallback_resp.status().is_success() {
         warn!(
@@ -170,12 +171,22 @@ async fn try_single_provider(
         "Fallback 成功"
     );
 
+    req_log.provider = provider.name.clone();
+    req_log.model = prepared.provider_model.clone();
+    req_log.upstream_start = fallback_upstream_start;
+
+    let stream_log_ctx = if is_stream {
+        Some(req_log.to_stream_log_ctx())
+    } else {
+        None
+    };
+
     let ctx = ResponseContext {
         request_id: request_id.to_string(),
         request_start,
-        upstream_start,
-        upstream_headers_ms,
-        log_ctx: None,
+        upstream_start: fallback_upstream_start,
+        upstream_headers_ms: fallback_headers_ms,
+        log_ctx: stream_log_ctx,
     };
 
     let response = match input_format {
@@ -190,6 +201,10 @@ async fn try_single_provider(
                 .await
         }
     };
+
+    if !is_stream && response.is_ok() {
+        req_log.emit_success(fallback_headers_ms);
+    }
 
     Some(response)
 }

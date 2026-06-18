@@ -704,7 +704,11 @@ pub async fn test_provider(provider: ProviderConfig) -> Result<TestProviderResul
     } else {
         let error_text = resp.text().await.unwrap_or_default();
         let error_msg = if error_text.len() > 200 {
-            format!("HTTP {} - {}", status.as_u16(), &error_text[..200])
+            let mut end = 200;
+            while !error_text.is_char_boundary(end) && end > 0 {
+                end -= 1;
+            }
+            format!("HTTP {} - {}...", status.as_u16(), &error_text[..end])
         } else {
             format!("HTTP {} - {}", status.as_u16(), error_text)
         };
@@ -950,6 +954,7 @@ mod tests {
             health_score_recovery: None,
             preferred_endpoint: None,
             endpoint_fallback: None,
+            ..Default::default()
         });
 
         assert!(validate_provider_fields(&provider).is_ok());

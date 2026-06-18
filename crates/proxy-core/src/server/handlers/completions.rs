@@ -132,7 +132,7 @@ pub async fn proxy_chat_completions(
     let log_model = prepared.provider_model.clone();
 
     // Construct RequestLog for this handler
-    let req_log = RequestLog {
+    let mut req_log = RequestLog {
         collector: state.log_collector.clone(),
         request_id: request_id.clone(),
         method: "POST",
@@ -195,9 +195,8 @@ pub async fn proxy_chat_completions(
                 global_routes,
                 request_id: &request_id,
                 request_start,
-                upstream_start,
-                upstream_headers_ms,
                 input_format: InputFormat::OpenAI,
+                req_log: &mut req_log,
             };
             if let Some(response) = try_fallback(
                 ctx,
@@ -208,6 +207,8 @@ pub async fn proxy_chat_completions(
             )
             .await
             {
+                super::record_result_metrics(state.metrics.as_ref(), &response, request_start);
+                request_guard.complete();
                 return response;
             }
         }
@@ -254,11 +255,12 @@ pub async fn proxy_chat_completions(
         )
         .await;
 
-    if !is_stream {
+    if !is_stream && response.is_ok() {
         req_log.emit_success(upstream_headers_ms);
     }
 
     // Record metrics at handler exit
     super::record_result_metrics(state.metrics.as_ref(), &response, request_start);
+    request_guard.complete();
     response
 }

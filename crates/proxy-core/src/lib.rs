@@ -75,29 +75,34 @@ async fn metrics_handler(
 /// The server listens on `{config.server.host}:{config.server.port}`
 /// (host defaults to `127.0.0.1`) and will gracefully shut down when the
 /// cancellation token is cancelled.
-pub fn start_server(config: Config, token: CancellationToken) -> JoinHandle<()> {
+pub async fn start_server(
+    config: Config,
+    token: CancellationToken,
+) -> Result<JoinHandle<()>, std::io::Error> {
     let port = config.server.port;
     let state = AppState::new(config);
-    state.start_background_scheduler();
 
-    start_server_with_state(state, port, token)
+    start_server_with_state(state, port, token).await
 }
 
 /// Start the proxy server with a pre-built AppState (shared mode for Tauri).
-pub fn start_server_shared(
+pub async fn start_server_shared(
     mut state: AppState,
     port: u16,
     token: CancellationToken,
     counters: Option<RequestCounters>,
-) -> JoinHandle<()> {
+) -> Result<JoinHandle<()>, std::io::Error> {
     if let Some(c) = counters {
         state.set_counters(c);
     }
-    state.start_background_scheduler();
-    start_server_with_state(state, port, token)
+    start_server_with_state(state, port, token).await
 }
 
-fn start_server_with_state(state: AppState, port: u16, token: CancellationToken) -> JoinHandle<()> {
+async fn start_server_with_state(
+    state: AppState,
+    port: u16,
+    token: CancellationToken,
+) -> Result<JoinHandle<()>, std::io::Error> {
     // Resolve bind address from config (secure default: 127.0.0.1).
     let host = state.config.server.host.clone();
     let api_key_set = state.config.server.api_key.is_some();
@@ -120,6 +125,8 @@ fn start_server_with_state(state: AppState, port: u16, token: CancellationToken)
 
     // Build admin routes (has its own auth middleware)
     let admin_routes = server::admin::admin_router(state.clone());
+
+    let scheduler_state = state.clone();
 
     let app = Router::new()
         .route("/health", get(health))
@@ -161,17 +168,11 @@ fn start_server_with_state(state: AppState, port: u16, token: CancellationToken)
         .with_state(state);
 
     let addr = SocketAddr::new(bind_ip, port);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    scheduler_state.start_background_scheduler();
 
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         info!("监听地址: http://{}", addr);
-
-        let listener = match tokio::net::TcpListener::bind(addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!("绑定端口 {} 失败: {}", port, e);
-                return;
-            }
-        };
 
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
@@ -184,7 +185,8 @@ fn start_server_with_state(state: AppState, port: u16, token: CancellationToken)
             });
 
         info!("代理服务已关闭");
-    })
+    });
+    Ok(handle)
 }
 
 /// Stop the proxy server by cancelling the token and awaiting the handle.

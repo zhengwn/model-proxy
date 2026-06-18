@@ -263,7 +263,9 @@ pub(crate) async fn handle_kiro_messages(
 
         // Build a synthetic reqwest::Response from the remaining byte stream
         let remaining_body = reqwest::Body::wrap_stream(
-            first_chunk_result.remaining_bytes_stream.map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)))
+            first_chunk_result
+                .remaining_bytes_stream
+                .map(|r| r.map_err(std::io::Error::other))
         );
         let fake_resp = reqwest::Response::from(
             http::Response::builder()
@@ -391,7 +393,7 @@ pub(crate) async fn handle_kiro_messages(
                                 request_guard.complete();
                                 return response;
                             }
-                            Err(AppError::UpstreamStatus(s2, _)) if s2 == 400 => {
+                            Err(AppError::UpstreamStatus(400, _)) => {
                                 debug!("deep_sanitize 重试仍返回 400，降级到 aggressive_sanitize");
                             }
                             Err(e) => { request_guard.complete(); return Err(e); }
@@ -692,7 +694,9 @@ pub(crate) async fn handle_kiro_chat_completions(
             Some(first_chunk_result.initial_bytes)
         };
         let remaining_body = reqwest::Body::wrap_stream(
-            first_chunk_result.remaining_bytes_stream.map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)))
+            first_chunk_result
+                .remaining_bytes_stream
+                .map(|r| r.map_err(std::io::Error::other))
         );
         let fake_resp = reqwest::Response::from(
             http::Response::builder()

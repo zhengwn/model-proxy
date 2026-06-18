@@ -94,7 +94,9 @@ impl ServiceManager {
         let port = config.server.port;
         let host = config.server.host.clone();
         let token = CancellationToken::new();
-        let handle = proxy_core::start_server(config, token.clone());
+        let handle = proxy_core::start_server(config, token.clone())
+            .await
+            .map_err(|e| format!("端口占用或启动失败: {}", e))?;
 
         let listen_addr = format!("{}:{}", host, port);
         let started_at = iso_now();
@@ -133,7 +135,9 @@ impl ServiceManager {
         let host = state.config.server.host.clone();
         let token = cancel_token.unwrap_or_default();
         let handle =
-            proxy_core::start_server_shared(state, port, token.clone(), Some(counters.clone()));
+            proxy_core::start_server_shared(state, port, token.clone(), Some(counters.clone()))
+                .await
+                .map_err(|e| format!("端口占用或启动失败: {}", e))?;
 
         let listen_addr = format!("{}:{}", host, port);
         let started_at = iso_now();
