@@ -4,6 +4,15 @@
   box-sizing: border-box;
 }
 
+/* Theme variables */
+[data-theme="dark"] {
+  --border-color: #434343;
+}
+
+[data-theme="light"] {
+  --border-color: #d9d9d9;
+}
+
 html,
 body {
   height: 100%;
@@ -14,22 +23,7 @@ body {
   height: 100%;
 }
 
-/* Ant Design Layout overrides */
-.ant-layout {
-  background: #141414;
-}
-
-.ant-layout-header {
-  background: #1f1f1f;
-  border-bottom: 1px solid #303030;
-}
-
-.ant-tabs-content {
-  height: calc(100vh - 64px - 48px - 46px);
-  overflow-y: auto;
-}
-
-/* Scrollbar styling */
+/* Scrollbar styling — dark (default) */
 ::-webkit-scrollbar {
   width: 6px;
 }
@@ -45,4 +39,13 @@ body {
 
 ::-webkit-scrollbar-thumb:hover {
   background: #595959;
+}
+
+/* Scrollbar styling — light */
+[data-theme="light"] ::-webkit-scrollbar-thumb {
+  background: #c1c1c1;
+}
+
+[data-theme="light"] ::-webkit-scrollbar-thumb:hover {
+  background: #a8a8a8;
 }

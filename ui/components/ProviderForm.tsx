@@ -16,6 +16,7 @@ import {
 import { ThunderboltOutlined } from "@ant-design/icons";
 import { invoke } from "@tauri-apps/api/core";
 import type { KiroConfig, ProviderConfig, ProviderFormat, TestProviderResult } from "../types";
+import { useLocale } from "../i18n";
 
 const { Text } = Typography;
 
@@ -110,7 +111,7 @@ const PROVIDER_TEMPLATES: ProviderTemplate[] = [
     kiro_config: defaultKiroConfig,
   },
   {
-    label: "自定义",
+    label: "custom",
     name: "",
     base_url: "",
     model: "",
@@ -127,13 +128,14 @@ export function ProviderForm({
   onCancel,
   defaultTemplate,
 }: ProviderFormProps) {
+  const { t } = useLocale();
   const [form] = Form.useForm<ProviderConfig>();
 
   // Compute the initial form values with useMemo to avoid recalculation on every render
   const computedInitialValues = useMemo(() => {
     if (initialValues) return initialValues;
     if (defaultTemplate) {
-      const template = PROVIDER_TEMPLATES.find((t) => t.label === defaultTemplate);
+      const template = PROVIDER_TEMPLATES.find((t) => t.name === defaultTemplate);
       if (template) {
         return {
           name: existingNames.includes(template.name) ? "" : template.name,
@@ -197,8 +199,8 @@ export function ProviderForm({
     await onSubmit(config);
   };
 
-  const handleTemplateSelect = (templateLabel: string) => {
-    const template = PROVIDER_TEMPLATES.find((t) => t.label === templateLabel);
+  const handleTemplateSelect = (templateName: string) => {
+    const template = PROVIDER_TEMPLATES.find((t) => t.name === templateName);
     if (template) {
       form.setFieldsValue({
         name: existingNames.includes(template.name) ? "" : template.name,
@@ -233,51 +235,51 @@ export function ProviderForm({
       style={{ maxWidth: 640 }}
       initialValues={computedInitialValues}
     >
-      <Card title="基本信息" size="small" style={{ marginBottom: 16 }}>
+      <Card title={t("providerForm.basicInfo")} size="small" style={{ marginBottom: 16 }}>
         {mode === "add" && (
-          <Form.Item label="从模板创建">
+          <Form.Item label={t("providerForm.fromTemplate")}>
             <Select
-              placeholder="选择 Provider 模板快速填充"
+              placeholder={t("providerForm.templatePlaceholder")}
               defaultValue={defaultTemplate}
               allowClear
               onChange={handleTemplateSelect}
-              options={PROVIDER_TEMPLATES.map((t) => ({
-                value: t.label,
-                label: t.label,
+              options={PROVIDER_TEMPLATES.map((tpl) => ({
+                value: tpl.name,
+                label: tpl.name === "" ? t("template.custom") : tpl.label,
               }))}
               style={{ width: 240 }}
             />
             <div style={{ marginTop: 4 }}>
               <Text type="secondary" style={{ fontSize: 12 }}>
-                选择模板后只需填写 API Key 即可
+                {t("providerForm.templateHint")}
               </Text>
             </div>
           </Form.Item>
         )}
         <Form.Item
-          label="名称"
+          label={t("providerForm.name")}
           name="name"
           rules={[
-            { required: true, message: "请输入 Provider 名称" },
-            { max: 64, message: "名称不能超过 64 个字符" },
+            { required: true, message: t("providerForm.nameRequired") },
+            { max: 64, message: t("providerForm.nameMaxLen") },
             {
               validator: (_, value) => {
                 if (value && existingNames.includes(value) && value !== initialValues?.name) {
-                  return Promise.reject(new Error("该名称已存在"));
+                  return Promise.reject(new Error(t("providerForm.nameExists")));
                 }
                 return Promise.resolve();
               },
             },
           ]}
         >
-          <Input placeholder="例如: openai, anthropic, deepseek" />
+          <Input placeholder={t("providerForm.namePlaceholder")} />
         </Form.Item>
 
         <Form.Item
           label="Base URL"
           name="base_url"
-          rules={[{ required: true, message: "请输入 Base URL" }]}
-          tooltip="Provider 的 API 地址，不含具体路径"
+          rules={[{ required: true, message: t("providerForm.baseUrlRequired") }]}
+          tooltip={t("providerForm.baseUrlTooltip")}
         >
           <Input placeholder="https://api.openai.com/v1" />
         </Form.Item>
@@ -290,33 +292,33 @@ export function ProviderForm({
             ({ getFieldValue }) => ({
               validator: (_, value) => {
                 if (getFieldValue("format") !== "kiro" && !value) {
-                  return Promise.reject(new Error("请输入 API Key"));
+                  return Promise.reject(new Error(t("providerForm.apiKeyRequired")));
                 }
                 return Promise.resolve();
               },
             }),
           ]}
         >
-          <Input.Password placeholder={isKiro ? "Kiro 认证信息在下方填写" : "sk-..."} />
+          <Input.Password placeholder={isKiro ? t("providerForm.kiroAuthPlaceholder") : "sk-..."} />
         </Form.Item>
 
         <Form.Item
-          label="默认模型"
+          label={t("providerForm.defaultModel")}
           name="model"
-          rules={[{ required: true, message: "请输入模型名称" }]}
-          tooltip="未匹配任何模型路由时使用的模型"
+          rules={[{ required: true, message: t("providerForm.modelRequired") }]}
+          tooltip={t("providerForm.modelTooltip")}
         >
           <Input placeholder="gpt-4o" />
         </Form.Item>
 
         <Form.Item
-          label="API 格式"
+          label={t("providerForm.format")}
           name="format"
-          rules={[{ required: true, message: "请选择格式" }]}
-          tooltip="决定代理如何与此 Provider 通信"
+          rules={[{ required: true, message: t("providerForm.formatRequired") }]}
+          tooltip={t("providerForm.formatTooltip")}
         >
           <Select
-            placeholder="选择格式"
+            placeholder={t("providerForm.formatPlaceholder")}
             options={[
               { value: "openai", label: "OpenAI" },
               { value: "anthropic", label: "Anthropic" },
@@ -330,8 +332,9 @@ export function ProviderForm({
           style={{ marginTop: -8 }}
           message={
             <Text type="secondary" style={{ fontSize: 12 }}>
-              大多数 Provider（OpenAI、DeepSeek、Gemini、Azure 等）都使用 OpenAI 格式。
-              直连 Anthropic 官方 API 时选 Anthropic 格式；Kiro 使用独立认证设置。
+              {t("providerForm.formatHint1")}
+              <br />
+              {t("providerForm.formatHint2")}
             </Text>
           }
         />
@@ -344,13 +347,13 @@ export function ProviderForm({
           items={[
             {
               key: "kiro",
-              label: "Kiro 设置",
+              label: t("providerForm.kiroSettings"),
               children: (
                 <>
                   <Form.Item
-                    label="认证方式"
+                    label={t("providerForm.kiroAuthMethod")}
                     name={["kiro_config", "auth_method"]}
-                    rules={[{ required: true, message: "请选择认证方式" }]}
+                    rules={[{ required: true, message: t("providerForm.kiroAuthMethodRequired") }]}
                   >
                     <Select
                       style={{ width: 220 }}
@@ -365,7 +368,7 @@ export function ProviderForm({
                   <Form.Item
                     label={kiroAuthMethod === "api_key" ? "Access Token / API Key" : "Refresh Token"}
                     name={["kiro_config", "refresh_token"]}
-                    tooltip={kiroAuthMethod === "api_key" ? "api_key 模式下会作为 Bearer token 使用" : undefined}
+                    tooltip={kiroAuthMethod === "api_key" ? t("providerForm.bearerTokenHint") : undefined}
                   >
                     <Input.Password placeholder={kiroAuthMethod === "api_key" ? "eyJ..." : "refresh token"} />
                   </Form.Item>
@@ -388,12 +391,12 @@ export function ProviderForm({
                     <Form.Item
                       label="Region"
                       name={["kiro_config", "region"]}
-                      rules={[{ required: true, message: "请输入 Region" }]}
+                      rules={[{ required: true, message: t("providerForm.regionRequired") }]}
                     >
                       <Input placeholder="us-east-1" style={{ width: 180 }} />
                     </Form.Item>
                     <Form.Item label="API Region" name={["kiro_config", "api_region"]}>
-                      <Input placeholder="默认同 Region" style={{ width: 180 }} />
+                      <Input placeholder={t("providerForm.apiRegionPlaceholder")} style={{ width: 180 }} />
                     </Form.Item>
                     <Form.Item label="Kiro Version" name={["kiro_config", "kiro_version"]}>
                       <Input placeholder="0.11.107" style={{ width: 180 }} />
@@ -401,22 +404,22 @@ export function ProviderForm({
                   </Space>
 
                   <Form.Item label="Proxy URL" name={["kiro_config", "proxy_url"]}>
-                    <Input placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:7890" />
+                    <Input placeholder={t("providerForm.proxyPlaceholder")} />
                   </Form.Item>
 
                   <Space size="middle" wrap>
-                    <Form.Item label="Thinking 模式" name={["kiro_config", "thinking_mode"]}>
+                    <Form.Item label={t("providerForm.thinkingMode")} name={["kiro_config", "thinking_mode"]}>
                       <Select
                         style={{ width: 220 }}
                         options={[
                           { value: "as_reasoning_content", label: "Reasoning Content" },
-                          { value: "remove", label: "移除" },
-                          { value: "pass", label: "保留标签" },
-                          { value: "strip_tags", label: "去标签保留内容" },
+                          { value: "remove", label: t("providerForm.thinkingRemove") },
+                          { value: "pass", label: t("providerForm.thinkingPass") },
+                          { value: "strip_tags", label: t("providerForm.thinkingStrip") },
                         ]}
                       />
                     </Form.Item>
-                    <Form.Item label="首选端点" name={["kiro_config", "preferred_endpoint"]}>
+                    <Form.Item label={t("providerForm.preferredEndpoint")} name={["kiro_config", "preferred_endpoint"]}>
                       <Select
                         style={{ width: 180 }}
                         options={[
@@ -428,7 +431,7 @@ export function ProviderForm({
                       />
                     </Form.Item>
                     <Form.Item
-                      label="429 降级"
+                      label={t("providerForm.fallback429")}
                       name={["kiro_config", "endpoint_fallback"]}
                       valuePropName="checked"
                     >
@@ -454,17 +457,17 @@ export function ProviderForm({
                   </Space>
 
                   <Space size="middle" wrap>
-                    <Form.Item label="首 Token 超时" name={["kiro_config", "first_token_timeout"]}>
-                      <InputNumber min={1} addonAfter="秒" style={{ width: 140 }} />
+                    <Form.Item label={t("providerForm.firstTokenTimeout")} name={["kiro_config", "first_token_timeout"]}>
+                      <InputNumber min={1} addonAfter={t("providerForm.seconds")} style={{ width: 140 }} />
                     </Form.Item>
-                    <Form.Item label="流式读取超时" name={["kiro_config", "streaming_read_timeout"]}>
-                      <InputNumber min={1} addonAfter="秒" style={{ width: 140 }} />
+                    <Form.Item label={t("providerForm.streamTimeout")} name={["kiro_config", "streaming_read_timeout"]}>
+                      <InputNumber min={1} addonAfter={t("providerForm.seconds")} style={{ width: 140 }} />
                     </Form.Item>
-                    <Form.Item label="首 Token 重试" name={["kiro_config", "first_token_max_retries"]}>
+                    <Form.Item label={t("providerForm.firstTokenRetry")} name={["kiro_config", "first_token_max_retries"]}>
                       <InputNumber min={0} style={{ width: 120 }} />
                     </Form.Item>
-                    <Form.Item label="配额冷却" name={["kiro_config", "quota_cooldown_secs"]}>
-                      <InputNumber min={0} addonAfter="秒" style={{ width: 140 }} />
+                    <Form.Item label={t("providerForm.quotaCooldown")} name={["kiro_config", "quota_cooldown_secs"]}>
+                      <InputNumber min={0} addonAfter={t("providerForm.seconds")} style={{ width: 140 }} />
                     </Form.Item>
                   </Space>
                 </>
@@ -479,7 +482,7 @@ export function ProviderForm({
         items={[
           {
             key: "quirks",
-            label: "高级设置（Provider 兼容性）",
+            label: t("providerForm.advancedSettings"),
             children: (
               <>
                 <Alert
@@ -488,38 +491,38 @@ export function ProviderForm({
                   style={{ marginBottom: 16 }}
                   message={
                     <Text type="secondary" style={{ fontSize: 12 }}>
-                      这些选项用于处理不同 Provider 的 API 差异。使用模板创建时会自动配置，通常不需要手动修改。
+                      {t("providerForm.advancedSettingsHint")}
                     </Text>
                   }
                 />
                 <Form.Item
-                  label="推理内容必须完整"
+                  label={t("providerForm.reasoningAllOrNothing")}
                   name={["quirks", "reasoning_all_or_nothing"]}
                   valuePropName="checked"
-                  tooltip="开启后，历史消息中的 assistant 消息必须全部包含推理内容，否则全部去除。适用于 DeepSeek 等模型。"
+                  tooltip={t("providerForm.reasoningAllOrNothingTip")}
                 >
                   <Switch />
                 </Form.Item>
                 <Form.Item
-                  label="禁用 JSON Schema 响应"
+                  label={t("providerForm.noJsonSchema")}
                   name={["quirks", "no_json_schema"]}
                   valuePropName="checked"
-                  tooltip="开启后，将 json_schema 响应格式降级为 json_object。适用于不支持结构化输出的 Provider。"
+                  tooltip={t("providerForm.noJsonSchemaTip")}
                 >
                   <Switch />
                 </Form.Item>
                 <Form.Item
-                  label="转发推理强度参数"
+                  label={t("providerForm.supportsReasoningEffort")}
                   name={["quirks", "supports_reasoning_effort"]}
                   valuePropName="checked"
-                  tooltip="开启后，将 thinking/reasoning 配置转换为 reasoning_effort 参数发送给 Provider。适用于 DeepSeek 等支持此参数的模型。"
+                  tooltip={t("providerForm.supportsReasoningEffortTip")}
                 >
                   <Switch />
                 </Form.Item>
                 <Form.Item
-                  label="最大推理强度映射值"
+                  label={t("providerForm.maxReasoningEffort")}
                   name={["quirks", "max_reasoning_effort"]}
-                  tooltip="Anthropic 的 'max' 或 'adaptive' 推理强度映射到此值。例如 DeepSeek 支持 'max'，OpenAI 最高为 'high'。"
+                  tooltip={t("providerForm.maxReasoningEffortTip")}
                 >
                   <Select
                     style={{ width: 120 }}
@@ -538,10 +541,10 @@ export function ProviderForm({
       <Form.Item>
         <Space>
           <Button type="primary" htmlType="submit">
-            {mode === "add" ? "添加" : "保存"}
+            {mode === "add" ? t("common.add") : t("common.save")}
           </Button>
           <TestConnectionButton form={form} />
-          <Button onClick={onCancel}>取消</Button>
+          <Button onClick={onCancel}>{t("common.cancel")}</Button>
         </Space>
       </Form.Item>
     </Form>
@@ -550,6 +553,7 @@ export function ProviderForm({
 
 /** Inline test button that validates form fields and tests the provider. */
 function TestConnectionButton({ form }: { form: ReturnType<typeof Form.useForm<ProviderConfig>>[0] }) {
+  const { t } = useLocale();
   const [testing, setTesting] = useState(false);
   const providerFormat = Form.useWatch("format", form);
 
@@ -574,18 +578,18 @@ function TestConnectionButton({ form }: { form: ReturnType<typeof Form.useForm<P
       const result = await invoke<TestProviderResult>("test_provider", { provider });
       if (result.success) {
         message.success(
-          `连接成功 (${result.latency_ms}ms)${result.model ? ` - 模型: ${result.model}` : ""}`,
+          t("providerForm.connectSuccess", { latency: result.latency_ms, model: result.model ? ` - ${t("provider.model", { model: result.model })}` : "" }),
           5
         );
       } else {
-        message.error({ content: `连接失败: ${result.error}`, duration: 8 });
+        message.error({ content: t("providerForm.connectFailed", { error: result.error ?? "" }), duration: 8 });
       }
     } catch (e) {
       // If validation failed, the form will show errors
       if (e && typeof e === "object" && "errorFields" in e) {
         return;
       }
-      message.error(`测试失败: ${typeof e === "string" ? e : String(e)}`);
+      message.error(t("providerForm.testFailed", { error: typeof e === "string" ? e : String(e) }));
     } finally {
       setTesting(false);
     }
@@ -598,7 +602,7 @@ function TestConnectionButton({ form }: { form: ReturnType<typeof Form.useForm<P
       onClick={handleTest}
       disabled={providerFormat === "kiro"}
     >
-      {providerFormat === "kiro" ? "在 Kiro 面板测试" : "测试连接"}
+      {providerFormat === "kiro" ? t("provider.testInKiro") : t("provider.testConnection")}
     </Button>
   );
 }

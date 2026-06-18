@@ -1,5 +1,6 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
 import { Alert, Button } from "antd";
+import { useLocale } from "../i18n";
 
 interface Props {
   children: ReactNode;
@@ -10,10 +11,27 @@ interface State {
   error: Error | null;
 }
 
-/**
- * Global error boundary that catches unhandled React rendering errors
- * and displays a user-friendly fallback UI instead of a white screen.
- */
+function ErrorFallback({ error, onReset }: { error: Error | null; onReset: () => void }) {
+  const { t } = useLocale();
+  return (
+    <div style={{ padding: 48 }}>
+      <Alert
+        message={t("error.appError")}
+        description={
+          <div>
+            <p>{error?.message || t("error.unknown")}</p>
+            <Button type="primary" onClick={onReset}>
+              {t("common.retry")}
+            </Button>
+          </div>
+        }
+        type="error"
+        showIcon
+      />
+    </div>
+  );
+}
+
 export class ErrorBoundary extends Component<Props, State> {
   constructor(props: Props) {
     super(props);
@@ -34,25 +52,8 @@ export class ErrorBoundary extends Component<Props, State> {
 
   render() {
     if (this.state.hasError) {
-      return (
-        <div style={{ padding: 48 }}>
-          <Alert
-            message="应用发生错误"
-            description={
-              <div>
-                <p>{this.state.error?.message || "未知错误"}</p>
-                <Button type="primary" onClick={this.handleReset}>
-                  重试
-                </Button>
-              </div>
-            }
-            type="error"
-            showIcon
-          />
-        </div>
-      );
+      return <ErrorFallback error={this.state.error} onReset={this.handleReset} />;
     }
-
     return this.props.children;
   }
 }

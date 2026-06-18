@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { render, screen, waitFor, fireEvent, act } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ProviderForm } from "../ProviderForm";
+import { LocaleProvider } from "../../i18n";
 import type { ProviderConfig } from "../../types";
 
 const existingNames = ["openai", "anthropic"];
@@ -29,7 +30,7 @@ describe("ProviderForm", () => {
   };
 
   it("in add mode, name field is editable", () => {
-    render(<ProviderForm {...defaultProps} />);
+    render(<LocaleProvider><ProviderForm {...defaultProps} /></LocaleProvider>);
 
     const nameInput = document.querySelector("input#name") as HTMLInputElement;
     expect(nameInput).not.toBeNull();
@@ -38,11 +39,11 @@ describe("ProviderForm", () => {
 
   it("in edit mode, name field is editable", () => {
     render(
-      <ProviderForm
+      <LocaleProvider><ProviderForm
         {...defaultProps}
         mode="edit"
         initialValues={mockInitialValues}
-      />
+      /></LocaleProvider>
     );
 
     const nameInput = document.querySelector("input#name") as HTMLInputElement;
@@ -51,7 +52,7 @@ describe("ProviderForm", () => {
   });
 
   it("required field validation shows error on submit attempt", async () => {
-    render(<ProviderForm {...defaultProps} />);
+    render(<LocaleProvider><ProviderForm {...defaultProps} /></LocaleProvider>);
 
     // Submit the form using fireEvent on the form element
     const form = document.querySelector("form") as HTMLFormElement;
@@ -74,7 +75,7 @@ describe("ProviderForm", () => {
 
   it("name uniqueness validation shows error for duplicate names", async () => {
     const user = userEvent.setup();
-    render(<ProviderForm {...defaultProps} />);
+    render(<LocaleProvider><ProviderForm {...defaultProps} /></LocaleProvider>);
 
     const nameInput = document.querySelector("input#name") as HTMLInputElement;
     await user.type(nameInput, "openai");
@@ -87,7 +88,7 @@ describe("ProviderForm", () => {
 
     await waitFor(
       () => {
-        expect(screen.getByText("该名称已存在")).toBeInTheDocument();
+        expect(screen.getByText("This name already exists")).toBeInTheDocument();
       },
       { timeout: 3000 }
     );
@@ -97,7 +98,7 @@ describe("ProviderForm", () => {
     const user = userEvent.setup();
     const onSubmit = vi.fn().mockResolvedValue(undefined);
     render(
-      <ProviderForm {...defaultProps} onSubmit={onSubmit} existingNames={[]} />
+      <LocaleProvider><ProviderForm {...defaultProps} onSubmit={onSubmit} existingNames={[]} /></LocaleProvider>
     );
 
     // Fill in all required fields
@@ -168,9 +169,9 @@ describe("ProviderForm", () => {
   it("cancel button calls onCancel", async () => {
     const user = userEvent.setup();
     const onCancel = vi.fn();
-    render(<ProviderForm {...defaultProps} onCancel={onCancel} />);
+    render(<LocaleProvider><ProviderForm {...defaultProps} onCancel={onCancel} /></LocaleProvider>);
 
-    const cancelButton = screen.getByRole("button", { name: /取.*消/ });
+    const cancelButton = screen.getByRole("button", { name: /Cancel/ });
     await user.click(cancelButton);
 
     expect(onCancel).toHaveBeenCalled();

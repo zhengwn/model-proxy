@@ -25,6 +25,8 @@ import {
   RETENTION_DAYS_MIN,
   RETENTION_DAYS_MAX,
 } from "../utils/loggingValidation";
+import { useLocale } from "../i18n";
+import type { Messages } from "../i18n/zh";
 
 const MAX_LOG_ENTRIES = 100;
 
@@ -49,126 +51,130 @@ function summarizeErrorMessage(message?: string): string {
   return cleaned.length > 180 ? `${cleaned.slice(0, 177)}...` : cleaned;
 }
 
-const columns: ColumnsType<LogEntry> = [
-  {
-    title: "时间",
-    dataIndex: "timestamp",
-    key: "timestamp",
-    width: 118,
-    render: (val: string) => {
-      try {
-        return new Date(val).toLocaleTimeString();
-      } catch {
-        return val;
-      }
+function getColumns(t: (key: keyof Messages, params?: Record<string, string | number>) => string): ColumnsType<LogEntry> {
+  return [
+    {
+      title: t("log.time"),
+      dataIndex: "timestamp",
+      key: "timestamp",
+      width: 118,
+      render: (val: string) => {
+        try {
+          return new Date(val).toLocaleTimeString();
+        } catch {
+          return val;
+        }
+      },
     },
-  },
-  {
-    title: "方法",
-    dataIndex: "method",
-    key: "method",
-    width: 82,
-    render: (method: string) => {
-      const color = method === "POST" ? "blue" : method === "GET" ? "green" : "default";
-      return <Tag color={color}>{method}</Tag>;
+    {
+      title: t("log.method"),
+      dataIndex: "method",
+      key: "method",
+      width: 82,
+      render: (method: string) => {
+        const color = method === "POST" ? "blue" : method === "GET" ? "green" : "default";
+        return <Tag color={color}>{method}</Tag>;
+      },
     },
-  },
-  {
-    title: "路径",
-    dataIndex: "path",
-    key: "path",
-    width: 132,
-    ellipsis: true,
-  },
-  {
-    title: "Provider",
-    dataIndex: "provider",
-    key: "provider",
-    width: 170,
-    ellipsis: true,
-  },
-  {
-    title: "模型",
-    dataIndex: "model",
-    key: "model",
-    width: 360,
-    ellipsis: true,
-    render: (_: string, record: LogEntry) => {
-      const requested = record.requested_model;
-      const actual = record.model;
-      if (requested && requested !== actual && actual) {
+    {
+      title: t("log.path"),
+      dataIndex: "path",
+      key: "path",
+      width: 132,
+      ellipsis: true,
+    },
+    {
+      title: "Provider",
+      dataIndex: "provider",
+      key: "provider",
+      width: 170,
+      ellipsis: true,
+    },
+    {
+      title: t("log.model"),
+      dataIndex: "model",
+      key: "model",
+      width: 360,
+      ellipsis: true,
+      render: (_: string, record: LogEntry) => {
+        const requested = record.requested_model;
+        const actual = record.model;
+        if (requested && requested !== actual && actual) {
+          return (
+            <span>
+              <span style={{ opacity: 0.6 }}>{requested}</span>
+              <span style={{ margin: "0 4px" }}>→</span>
+              <span>{actual}</span>
+            </span>
+          );
+        }
+        return actual || requested || "-";
+      },
+    },
+    {
+      title: t("log.statusCode"),
+      dataIndex: "status",
+      key: "status",
+      width: 92,
+      render: (status: number) => {
+        const color = status >= 500 ? "red" : status >= 400 ? "orange" : "green";
+        return <Tag color={color}>{status}</Tag>;
+      },
+    },
+    {
+      title: t("log.proxy"),
+      dataIndex: "proxy_overhead_ms",
+      key: "proxy_overhead_ms",
+      width: 82,
+      render: (ms?: number) => ms != null ? `${ms}ms` : "-",
+    },
+    {
+      title: t("log.firstToken"),
+      dataIndex: "ttft_ms",
+      key: "ttft_ms",
+      width: 96,
+      render: (ms?: number) => ms != null ? `${ms}ms` : "-",
+    },
+    {
+      title: t("log.transfer"),
+      dataIndex: "duration_ms",
+      key: "transfer_ms",
+      width: 112,
+      render: (_: number, record: LogEntry) => {
+        if (record.ttft_ms != null && record.proxy_overhead_ms != null) {
+          const transfer = record.duration_ms - record.proxy_overhead_ms - record.ttft_ms;
+          return transfer >= 0 ? `${transfer}ms` : "-";
+        }
+        return "-";
+      },
+    },
+    {
+      title: t("log.error"),
+      dataIndex: "error_message",
+      key: "error_message",
+      width: 280,
+      ellipsis: true,
+      render: (message?: string) => {
+        if (!message) return "-";
+        const summary = summarizeErrorMessage(message);
         return (
-          <span>
-            <span style={{ opacity: 0.6 }}>{requested}</span>
-            <span style={{ margin: "0 4px" }}>→</span>
-            <span>{actual}</span>
-          </span>
+          <Tooltip title={message}>
+            <span style={{ color: "#faad14" }}>{summary}</span>
+          </Tooltip>
         );
-      }
-      return actual || requested || "-";
+      },
     },
-  },
-  {
-    title: "状态码",
-    dataIndex: "status",
-    key: "status",
-    width: 92,
-    render: (status: number) => {
-      const color = status >= 500 ? "red" : status >= 400 ? "orange" : "green";
-      return <Tag color={color}>{status}</Tag>;
-    },
-  },
-  {
-    title: "代理",
-    dataIndex: "proxy_overhead_ms",
-    key: "proxy_overhead_ms",
-    width: 82,
-    render: (ms?: number) => ms != null ? `${ms}ms` : "-",
-  },
-  {
-    title: "首token",
-    dataIndex: "ttft_ms",
-    key: "ttft_ms",
-    width: 96,
-    render: (ms?: number) => ms != null ? `${ms}ms` : "-",
-  },
-  {
-    title: "传输",
-    dataIndex: "duration_ms",
-    key: "transfer_ms",
-    width: 112,
-    render: (_: number, record: LogEntry) => {
-      if (record.ttft_ms != null && record.proxy_overhead_ms != null) {
-        const transfer = record.duration_ms - record.proxy_overhead_ms - record.ttft_ms;
-        return transfer >= 0 ? `${transfer}ms` : "-";
-      }
-      return "-";
-    },
-  },
-  {
-    title: "错误",
-    dataIndex: "error_message",
-    key: "error_message",
-    width: 280,
-    ellipsis: true,
-    render: (message?: string) => {
-      if (!message) return "-";
-      const summary = summarizeErrorMessage(message);
-      return (
-        <Tooltip title={message}>
-          <span style={{ color: "#faad14" }}>{summary}</span>
-        </Tooltip>
-      );
-    },
-  },
-];
+  ];
+}
 
-const statusFilterOptions = [
-  { label: "全部", value: "all" },
-  { label: "2xx", value: "2xx" },
-  { label: "4xx", value: "4xx" },
-  { label: "5xx", value: "5xx" },
-];
+function getStatusFilterOptions(t: (key: keyof Messages, params?: Record<string, string | number>) => string) {
+  return [
+    { label: t("log.all"), value: "all" as const },
+    { label: "2xx", value: "2xx" as const },
+    { label: "4xx", value: "4xx" as const },
+    { label: "5xx", value: "5xx" as const },
+  ];
+}
 
 const DEFAULT_LOGGING: LoggingConfig = {
   enabled: true,
@@ -181,6 +187,7 @@ const DEFAULT_LOGGING: LoggingConfig = {
 function LogSettings() {
   const [form] = Form.useForm<LoggingConfig>();
   const [loading, setLoading] = useState(true);
+  const { t } = useLocale();
 
   useEffect(() => {
     (async () => {
@@ -203,12 +210,12 @@ function LogSettings() {
       await invoke<void>("save_config", {
         config: { ...config, logging: values },
       });
-      message.success("日志设置已保存");
+      message.success(t("log.settingsSaved"));
     } catch (e) {
       if (e && typeof e === "object" && "errorFields" in e) {
-        message.error("请检查表单中的错误");
+        message.error(t("log.formError"));
       } else {
-        message.error(`保存失败: ${typeof e === "string" ? e : String(e)}`);
+        message.error(t("common.saveFailed", { error: typeof e === "string" ? e : String(e) }));
       }
     }
   };
@@ -217,24 +224,24 @@ function LogSettings() {
 
   return (
     <Form form={form} layout="inline" size="small" style={{ marginBottom: 8 }}>
-      <Form.Item name="enabled" valuePropName="checked" label="启用">
+      <Form.Item name="enabled" valuePropName="checked" label={t("log.enabled")}>
         <Switch size="small" />
       </Form.Item>
-      <Form.Item name="level" label="级别">
+      <Form.Item name="level" label={t("log.level")}>
         <Select
           style={{ width: 110 }}
           options={[
-            { value: "all", label: "全部请求" },
-            { value: "errors_only", label: "仅错误" },
+            { value: "all", label: t("log.allRequests") },
+            { value: "errors_only", label: t("log.errorsOnly") },
           ]}
         />
       </Form.Item>
-      <Form.Item name="record_body" valuePropName="checked" label="记录请求体">
+      <Form.Item name="record_body" valuePropName="checked" label={t("log.recordBody")}>
         <Switch size="small" />
       </Form.Item>
       <Form.Item
         name="max_body_bytes"
-        label="最大字节"
+        label={t("log.maxBytes")}
         rules={[
           {
             type: "number",
@@ -252,7 +259,7 @@ function LogSettings() {
       </Form.Item>
       <Form.Item
         name="retention_days"
-        label="保留天数"
+        label={t("log.retentionDays")}
         rules={[
           {
             type: "number",
@@ -269,7 +276,7 @@ function LogSettings() {
       </Form.Item>
       <Form.Item>
         <Button type="primary" size="small" onClick={handleSave}>
-          保存
+          {t("common.save")}
         </Button>
       </Form.Item>
     </Form>
@@ -282,6 +289,10 @@ function LogViewer() {
   const [providerFilter, setProviderFilter] = useState<string | undefined>(undefined);
   const [keyword, setKeyword] = useState<string>("");
   const tableRef = useRef<HTMLDivElement>(null);
+  const { t } = useLocale();
+
+  const columns = useMemo(() => getColumns(t), [t]);
+  const statusFilterOptions = useMemo(() => getStatusFilterOptions(t), [t]);
 
   useEffect(() => {
     const unlisten = listen<LogEntry>("proxy-log", (event) => {
@@ -334,7 +345,7 @@ function LogViewer() {
             label: (
               <span>
                 <SettingOutlined style={{ marginRight: 8 }} />
-                日志设置
+                {t("log.settings")}
               </span>
             ),
             children: <LogSettings />,
@@ -343,7 +354,7 @@ function LogViewer() {
       />
       <Space style={{ marginBottom: 16 }} wrap>
         <Button icon={<DeleteOutlined />} onClick={handleClear} disabled={logs.length === 0}>
-          清空日志
+          {t("log.clearLogs")}
         </Button>
         <Select
           value={statusFilter}
@@ -363,7 +374,7 @@ function LogViewer() {
         />
         <Input
           prefix={<SearchOutlined />}
-          placeholder="搜索路径/模型/错误"
+          placeholder={t("log.searchPlaceholder")}
           value={keyword}
           onChange={(e) => setKeyword(e.target.value)}
           allowClear
@@ -371,7 +382,7 @@ function LogViewer() {
           size="small"
         />
         <span style={{ color: "#999", fontSize: 12 }}>
-          显示 {filteredLogs.length}/{logs.length} 条（最多 {MAX_LOG_ENTRIES} 条）
+          {t("log.displayCount", { filtered: filteredLogs.length, total: logs.length, max: MAX_LOG_ENTRIES })}
         </span>
       </Space>
       <Table
@@ -382,7 +393,7 @@ function LogViewer() {
         pagination={false}
         tableLayout="fixed"
         scroll={{ x: 1524, y: 400 }}
-        locale={{ emptyText: "暂无请求日志" }}
+        locale={{ emptyText: t("log.noLogs") }}
       />
     </div>
   );

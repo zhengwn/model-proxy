@@ -19,6 +19,7 @@ import {
 } from "@ant-design/icons";
 import { invoke } from "@tauri-apps/api/core";
 import type { ModelRoute } from "../types";
+import { useLocale } from "../i18n";
 
 const { Text, Paragraph } = Typography;
 
@@ -61,15 +62,14 @@ const ROUTE_TEMPLATES: RouteTemplate[] = [
   },
 ];
 
-const REASONING_OPTIONS = [
-  { value: "", label: "不设置" },
-  { value: "low", label: "low" },
-  { value: "medium", label: "medium" },
-  { value: "high", label: "high" },
-  { value: "max", label: "max" },
-];
+const REASONING_VALUES = ["", "low", "medium", "high", "max"];
 
 export function ModelRoutesEditor() {
+  const { t } = useLocale();
+  const REASONING_OPTIONS = [
+    { value: "", label: t("routes.notSet") },
+    ...REASONING_VALUES.filter((v) => v !== "").map((v) => ({ value: v, label: v })),
+  ];
   const [routes, setRoutes] = useState<ModelRoute[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -121,9 +121,9 @@ export function ModelRoutesEditor() {
         })),
       });
       setRoutes(validRoutes);
-      message.success("模型路由保存成功");
+      message.success(t("routes.saved"));
     } catch (e) {
-      message.error(`保存失败: ${typeof e === "string" ? e : String(e)}`);
+      message.error(t("common.saveFailed", { error: typeof e === "string" ? e : String(e) }));
     }
   };
 
@@ -158,7 +158,7 @@ export function ModelRoutesEditor() {
 
   if (loading) {
     return (
-      <Spin tip="加载模型路由..." style={{ display: "block", marginTop: 48 }} />
+      <Spin tip={t("routes.loading")} style={{ display: "block", marginTop: 48 }} />
     );
   }
 
@@ -166,13 +166,13 @@ export function ModelRoutesEditor() {
     return (
       <Card>
         <Alert
-          message="加载失败"
+          message={t("routes.loadFailed")}
           description={error}
           type="error"
           showIcon
           action={
             <Button size="small" onClick={loadRoutes}>
-              重试
+              {t("common.retry")}
             </Button>
           }
         />
@@ -190,16 +190,10 @@ export function ModelRoutesEditor() {
         message={
           <div>
             <Paragraph style={{ margin: 0 }}>
-              <strong>模型路由的作用：</strong>IDE 发来的请求中会带一个模型名（如{" "}
-              <Text code>claude-sonnet-4</Text>
-              ），路由规则可以把它映射到你实际想用的模型。
+              <strong>{t("routes.explanation")}</strong>{t("routes.explanationDesc")}
             </Paragraph>
             <Paragraph style={{ margin: "8px 0 0 0" }}>
-              <strong>匹配方式：</strong>只要请求的模型名
-              <Text strong>包含</Text>「匹配关键词」就会命中（不区分大小写）。
-              例如关键词填 <Text code>sonnet</Text>，则{" "}
-              <Text code>claude-sonnet-4</Text>、
-              <Text code>claude-3-5-sonnet</Text> 都会匹配。
+              <strong>{t("routes.matchMethod")}</strong>{t("routes.matchDesc")}
             </Paragraph>
           </div>
         }
@@ -208,17 +202,17 @@ export function ModelRoutesEditor() {
       {/* Route list */}
       <Card
         size="small"
-        title="路由规则"
+        title={t("routes.routeRules")}
         style={{ marginBottom: 16 }}
         extra={
-          <Tooltip title="规则按顺序匹配，第一条命中的生效">
+          <Tooltip title={t("routes.routeOrderTip")}>
             <QuestionCircleOutlined />
           </Tooltip>
         }
       >
         {routes.length === 0 && (
           <Text type="secondary" style={{ display: "block", marginBottom: 12 }}>
-            暂无路由规则。未配置路由时，所有请求都使用当前 Provider 的默认模型。
+            {t("routes.noRules")}
           </Text>
         )}
 
@@ -231,13 +225,13 @@ export function ModelRoutesEditor() {
               gap: 8,
               marginBottom: 10,
               padding: "8px 12px",
-              border: "1px solid #d9d9d9",
+              border: "1px solid var(--border-color, #434343)",
               borderRadius: 6,
             }}
           >
-            <Tooltip title="当请求的模型名包含此关键词时触发路由">
+            <Tooltip title={t("routes.matchTooltip")}>
               <Input
-                addonBefore="包含"
+                addonBefore={t("routes.contains")}
                 placeholder="sonnet"
                 value={route.match}
                 onChange={(e) => handleChange(index, "match", e.target.value)}
@@ -247,9 +241,9 @@ export function ModelRoutesEditor() {
 
             <ArrowRightOutlined style={{ color: "#999", flexShrink: 0 }} />
 
-            <Tooltip title="实际发送给 Provider 的模型名">
+            <Tooltip title={t("routes.forwardTooltip")}>
               <Input
-                addonBefore="转发到"
+                addonBefore={t("routes.forwardTo")}
                 placeholder="deepseek-chat"
                 value={route.target}
                 onChange={(e) => handleChange(index, "target", e.target.value)}
@@ -257,9 +251,9 @@ export function ModelRoutesEditor() {
               />
             </Tooltip>
 
-            <Tooltip title="覆盖推理强度（仅对支持的 Provider 生效）">
+            <Tooltip title={t("routes.effortTooltip")}>
               <Select
-                placeholder="推理强度"
+                placeholder={t("routes.reasoningEffort")}
                 value={route.reasoning_effort || ""}
                 onChange={(v) => handleChange(index, "reasoning_effort", v)}
                 options={REASONING_OPTIONS}
@@ -285,12 +279,12 @@ export function ModelRoutesEditor() {
           icon={<PlusOutlined />}
           style={{ marginTop: 4 }}
         >
-          添加规则
+          {t("routes.addRule")}
         </Button>
       </Card>
 
       {/* Quick templates */}
-      <Card size="small" title="快速添加" style={{ marginBottom: 16 }}>
+      <Card size="small" title={t("routes.quickAdd")} style={{ marginBottom: 16 }}>
         <Space wrap>
           {ROUTE_TEMPLATES.map((tpl) => (
             <Button
@@ -305,7 +299,7 @@ export function ModelRoutesEditor() {
       </Card>
 
       <Button type="primary" onClick={handleSave}>
-        保存路由
+        {t("routes.saveRoutes")}
       </Button>
     </div>
   );

@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ProviderList } from "../ProviderList";
+import { LocaleProvider } from "../../i18n";
 import type { ProviderConfig } from "../../types";
 
 // Mock antd message to avoid act() warnings
@@ -69,7 +70,7 @@ describe("ProviderList", () => {
   };
 
   it("renders all providers with their names", () => {
-    render(<ProviderList {...defaultProps} />);
+    render(<LocaleProvider><ProviderList {...defaultProps} /></LocaleProvider>);
 
     // Provider names may also appear in format tags (e.g. "openai" is both a name and format)
     expect(screen.getAllByText("openai").length).toBeGreaterThanOrEqual(1);
@@ -78,23 +79,23 @@ describe("ProviderList", () => {
   });
 
   it("active provider has the '活跃' tag", () => {
-    render(<ProviderList {...defaultProps} />);
+    render(<LocaleProvider><ProviderList {...defaultProps} /></LocaleProvider>);
 
-    expect(screen.getByText("活跃")).toBeInTheDocument();
+    expect(screen.getByText("Active")).toBeInTheDocument();
   });
 
   it("non-active providers have a '切换' button", () => {
-    render(<ProviderList {...defaultProps} />);
+    render(<LocaleProvider><ProviderList {...defaultProps} /></LocaleProvider>);
 
-    const switchButtons = screen.getAllByText("切换");
+    const switchButtons = screen.getAllByText("Switch");
     // Two non-active providers should have switch buttons
     expect(switchButtons).toHaveLength(2);
   });
 
   it("switch button is disabled when switching is true", () => {
-    render(<ProviderList {...defaultProps} switching={true} />);
+    render(<LocaleProvider><ProviderList {...defaultProps} switching={true} /></LocaleProvider>);
 
-    const switchButtons = screen.getAllByText("切换");
+    const switchButtons = screen.getAllByText("Switch");
     switchButtons.forEach((btn) => {
       expect(btn.closest("button")).toBeDisabled();
     });
@@ -103,20 +104,20 @@ describe("ProviderList", () => {
   it("clicking switch button calls onSwitch with the provider name", async () => {
     const user = userEvent.setup();
     const onSwitch = vi.fn().mockResolvedValue(undefined);
-    render(<ProviderList {...defaultProps} onSwitch={onSwitch} />);
+    render(<LocaleProvider><ProviderList {...defaultProps} onSwitch={onSwitch} /></LocaleProvider>);
 
-    const switchButtons = screen.getAllByText("切换");
+    const switchButtons = screen.getAllByText("Switch");
     await user.click(switchButtons[0]);
 
     expect(onSwitch).toHaveBeenCalledWith("anthropic");
   });
 
   it("active provider does not have a switch button", () => {
-    render(<ProviderList {...defaultProps} />);
+    render(<LocaleProvider><ProviderList {...defaultProps} /></LocaleProvider>);
 
     // The active provider "openai" should not have a switch button in its row
     // We have 3 providers but only 2 switch buttons
-    const switchButtons = screen.getAllByText("切换");
+    const switchButtons = screen.getAllByText("Switch");
     expect(switchButtons).toHaveLength(2);
   });
 });

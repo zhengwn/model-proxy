@@ -11,11 +11,13 @@ import {
   Typography,
 } from "antd";
 import { useConfig } from "../hooks/useConfig";
+import { useLocale } from "../i18n";
 import type { Config } from "../types";
 
 const { Text } = Typography;
 
 export function ConfigEditor() {
+  const { t } = useLocale();
   const { config, loading, error, configPath, isNew, saveConfig, loadConfig } =
     useConfig();
   const [form] = Form.useForm<Config>();
@@ -29,7 +31,6 @@ export function ConfigEditor() {
   const handleSave = async () => {
     try {
       const rawValues = await form.validateFields();
-      // Preserve existing providers when saving server config
       const values = { ...rawValues };
       if (config) {
         values.providers = config.providers;
@@ -38,18 +39,18 @@ export function ConfigEditor() {
         values.logging = config.logging;
       }
       await saveConfig(values);
-      message.success("配置保存成功");
+      message.success(t("config.saved"));
     } catch (e) {
       if (e && typeof e === "object" && "errorFields" in e) {
-        message.error("请检查表单中的错误");
+        message.error(t("config.formError"));
       } else {
-        message.error(`保存失败: ${typeof e === "string" ? e : String(e)}`);
+        message.error(t("common.saveFailed", { error: typeof e === "string" ? e : String(e) }));
       }
     }
   };
 
   if (loading) {
-    return <Spin tip="加载配置中..." style={{ display: "block", marginTop: 48 }} />;
+    return <Spin tip={t("config.loading")} style={{ display: "block", marginTop: 48 }} />;
   }
 
   if (error && !config) {
@@ -58,7 +59,7 @@ export function ConfigEditor() {
         <Text type="danger">{error}</Text>
         <br />
         <Button onClick={loadConfig} style={{ marginTop: 12 }}>
-          重试
+          {t("common.retry")}
         </Button>
       </Card>
     );
@@ -73,36 +74,36 @@ export function ConfigEditor() {
     >
       {configPath && (
         <Text type="secondary" style={{ display: "block", marginBottom: 16 }}>
-          配置文件路径: {configPath}
+          {t("config.configPath", { path: configPath })}
         </Text>
       )}
 
       {isNew && (
         <Alert
-          message="首次使用"
-          description="配置文件尚未创建，请填写以下配置后点击保存。"
+          message={t("config.firstUse")}
+          description={t("config.firstUseDesc")}
           type="info"
           showIcon
           style={{ marginBottom: 16 }}
         />
       )}
 
-      <Card title="服务器设置" size="small" style={{ marginBottom: 16 }}>
+      <Card title={t("config.serverSettings")} size="small" style={{ marginBottom: 16 }}>
         <Form.Item
-          label="端口"
+          label={t("config.port")}
           name={["server", "port"]}
-          rules={[{ required: true, message: "请输入端口号" }]}
+          rules={[{ required: true, message: t("config.portRequired") }]}
         >
           <InputNumber min={1} max={65535} style={{ width: "100%" }} />
         </Form.Item>
-        <Form.Item label="API Key (可选)" name={["server", "api_key"]}>
-          <Input.Password placeholder="留空则不启用鉴权" />
+        <Form.Item label={t("config.apiKeyOptional")} name={["server", "api_key"]}>
+          <Input.Password placeholder={t("config.apiKeyPlaceholder")} />
         </Form.Item>
       </Card>
 
       <Form.Item>
         <Button type="primary" onClick={handleSave}>
-          保存配置
+          {t("config.saveConfig")}
         </Button>
       </Form.Item>
     </Form>

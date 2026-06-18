@@ -10,7 +10,7 @@ import {
   Input,
   Select,
   Switch,
-  Tabs,
+  Collapse,
   Statistic,
   Row,
   Col,
@@ -33,20 +33,28 @@ import {
   ApiOutlined,
 } from "@ant-design/icons";
 import { useKiroAdmin } from "../hooks/useKiroAdmin";
+import { useLocale } from "../i18n";
 import type { KiroCredential, KiroEndpointHealth, KiroThinkingConfig, KiroSettings } from "../types";
 
 const { Text } = Typography;
 
 export default function KiroPanel() {
+  const { t } = useLocale();
   return (
-    <Tabs
-      items={[
-        { key: "creds", label: "账户管理", children: <CredentialManager /> },
-        { key: "endpoints", label: "端点健康", children: <EndpointDashboard /> },
-        { key: "settings", label: "配置", children: <SettingsPanel /> },
-        { key: "auth", label: "SSO 登录", children: <AuthFlows /> },
-      ]}
-    />
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <CredentialManager />
+      <EndpointDashboard />
+      <SettingsPanel />
+      <Collapse
+        items={[
+          {
+            key: "auth",
+            label: t("kiro.ssoLogin"),
+            children: <AuthFlows />,
+          },
+        ]}
+      />
+    </div>
   );
 }
 
@@ -54,6 +62,7 @@ export default function KiroPanel() {
 
 function CredentialManager() {
   const kiro = useKiroAdmin();
+  const { t } = useLocale();
   const [creds, setCreds] = useState<KiroCredential[]>([]);
   const [addOpen, setAddOpen] = useState(false);
   const [detailId, setDetailId] = useState<string | null>(null);
@@ -78,9 +87,9 @@ function CredentialManager() {
     try {
       const result = (await kiro.testCredential(id)) as unknown as Record<string, unknown>;
       if (result?.success) {
-        message.success(`测试通过 (${result.latency_ms}ms)`);
+        message.success(t("kiro.testPassed", { latency: result.latency_ms as number }));
       } else {
-        message.error(`测试失败: ${result?.error ?? "未知错误"}`);
+        message.error(t("kiro.testFailed", { error: (result?.error as string) ?? t("error.unknown") }));
       }
     } catch {
       // handled
@@ -90,7 +99,7 @@ function CredentialManager() {
   const handleDelete = async (id: string) => {
     try {
       await kiro.deleteCredential(id);
-      message.success("已删除");
+      message.success(t("kiro.deleted"));
       refresh();
     } catch {
       // handled
@@ -100,7 +109,7 @@ function CredentialManager() {
   const handleToggle = async (id: string, disabled: boolean) => {
     try {
       await kiro.setDisabled(id, disabled);
-      message.success(disabled ? "已禁用" : "已启用");
+      message.success(disabled ? t("kiro.disabled") : t("kiro.enabled"));
       refresh();
     } catch {
       // handled
@@ -109,12 +118,12 @@ function CredentialManager() {
 
   const handleBatch = async (action: string) => {
     if (selectedIds.length === 0) {
-      message.warning("请先选择账户");
+      message.warning(t("kiro.selectAccountsFirst"));
       return;
     }
     try {
       const result = (await kiro.batchCredentials(selectedIds, action)) as unknown as Record<string, unknown>;
-      message.success(`批量操作完成: ${(result?.results as string[])?.length ?? 0} 项`);
+      message.success(t("kiro.batchDone", { count: ((result?.results as string[])?.length ?? 0) as number }));
       setSelectedIds([]);
       refresh();
     } catch {
@@ -144,36 +153,36 @@ function CredentialManager() {
       ),
     },
     {
-      title: "状态",
+      title: t("kiro.status"),
       key: "status",
       render: (_: unknown, record: KiroCredential) => (
         <Space>
           {record.disabled ? (
-            <Tag color="red">已禁用</Tag>
+            <Tag color="red">{t("kiro.disabled")}</Tag>
           ) : record.is_available ? (
-            <Tag color="green">可用</Tag>
+            <Tag color="green">{t("kiro.available")}</Tag>
           ) : (
-            <Tag color="orange">不可用</Tag>
+            <Tag color="orange">{t("kiro.unavailable")}</Tag>
           )}
-          {record.is_current && <Tag color="blue">当前</Tag>}
+          {record.is_current && <Tag color="blue">{t("kiro.current")}</Tag>}
         </Space>
       ),
     },
     {
-      title: "区域",
+      title: t("kiro.region"),
       dataIndex: "region",
       key: "region",
       width: 100,
     },
     {
-      title: "优先级",
+      title: t("kiro.priority"),
       dataIndex: "priority",
       key: "priority",
       width: 70,
       sorter: (a: KiroCredential, b: KiroCredential) => a.priority - b.priority,
     },
     {
-      title: "健康分",
+      title: t("kiro.healthScore"),
       dataIndex: "health_score",
       key: "health_score",
       width: 100,
@@ -187,23 +196,23 @@ function CredentialManager() {
       ),
     },
     {
-      title: "请求",
+      title: t("kiro.requests"),
       key: "requests",
       width: 100,
       render: (_: unknown, r: KiroCredential) => (
-        <Tooltip title={`成功: ${r.successful_requests} 失败: ${r.failed_requests}`}>
+        <Tooltip title={t("kiro.successFail", { s: r.successful_requests, f: r.failed_requests })}>
           <Text>{r.total_requests}</Text>
         </Tooltip>
       ),
     },
     {
-      title: "操作",
+      title: t("kiro.actions"),
       key: "actions",
       width: 250,
       render: (_: unknown, record: KiroCredential) => (
         <Space size="small">
           <Button size="small" icon={<ExperimentOutlined />} onClick={() => handleTest(record.id)}>
-            测试
+            {t("kiro.test")}
           </Button>
           <Button
             size="small"
@@ -211,20 +220,20 @@ function CredentialManager() {
             onClick={async () => {
               try {
                 await kiro.refreshCredential(record.id);
-                message.success("已刷新");
+                message.success(t("kiro.refreshed"));
                 refresh();
               } catch {}
             }}
           >
-            刷新
+            {t("common.refresh")}
           </Button>
           <Button
             size="small"
             onClick={() => handleToggle(record.id, !record.disabled)}
           >
-            {record.disabled ? "启用" : "禁用"}
+            {record.disabled ? t("common.enable") : t("common.disable")}
           </Button>
-          <Popconfirm title="确认删除?" onConfirm={() => handleDelete(record.id)}>
+          <Popconfirm title={t("kiro.confirmDelete")} onConfirm={() => handleDelete(record.id)}>
             <Button size="small" danger icon={<DeleteOutlined />} />
           </Popconfirm>
         </Space>
@@ -234,21 +243,21 @@ function CredentialManager() {
 
   return (
     <Card
-      title="Kiro 账户管理"
+      title={t("kiro.accountManager")}
       extra={
         <Space>
           {selectedIds.length > 0 && (
             <>
-              <Button onClick={() => handleBatch("enable")}>批量启用</Button>
-              <Button onClick={() => handleBatch("disable")}>批量禁用</Button>
-              <Button onClick={() => handleBatch("refresh")}>批量刷新</Button>
+              <Button onClick={() => handleBatch("enable")}>{t("kiro.batchEnable")}</Button>
+              <Button onClick={() => handleBatch("disable")}>{t("kiro.batchDisable")}</Button>
+              <Button onClick={() => handleBatch("refresh")}>{t("kiro.batchRefresh")}</Button>
             </>
           )}
           <Button icon={<ReloadOutlined />} onClick={refresh}>
-            刷新
+            {t("common.refresh")}
           </Button>
           <Button type="primary" icon={<PlusOutlined />} onClick={() => setAddOpen(true)}>
-            添加账户
+            {t("kiro.addAccount")}
           </Button>
         </Space>
       }
@@ -260,7 +269,7 @@ function CredentialManager() {
           closable
           onClose={() => kiro.setError(null)}
           style={{ marginBottom: 16 }}
-          description="请确认代理服务已启动，且已配置 admin_api_key"
+          description={t("kiro.startServiceHint")}
         />
       )}
 
@@ -288,7 +297,7 @@ function CredentialManager() {
       />
 
       <Modal
-        title={`账户详情: ${detailId}`}
+        title={t("kiro.accountDetail", { id: detailId ?? "" })}
         open={!!detailId}
         onCancel={() => {
           setDetailId(null);
@@ -298,7 +307,7 @@ function CredentialManager() {
         width={600}
       >
         <pre style={{ maxHeight: 400, overflow: "auto", fontSize: 12 }}>
-          {detail ? JSON.stringify(detail, null, 2) : "加载中..."}
+          {detail ? JSON.stringify(detail, null, 2) : t("common.loading")}
         </pre>
       </Modal>
     </Card>
@@ -317,6 +326,7 @@ function AddCredentialModal({
   kiro: ReturnType<typeof useKiroAdmin>;
 }) {
   const [form] = Form.useForm();
+  const { t } = useLocale();
 
   const handleOk = async () => {
     try {
@@ -327,7 +337,7 @@ function AddCredentialModal({
         values.region,
         values.priority
       );
-      message.success("账户已添加");
+      message.success(t("kiro.accountAdded"));
       form.resetFields();
       onAdded();
     } catch {
@@ -337,7 +347,7 @@ function AddCredentialModal({
 
   return (
     <Modal
-      title="添加 Kiro 账户"
+      title={t("kiro.addAccountTitle")}
       open={open}
       onCancel={onClose}
       onOk={handleOk}
@@ -347,11 +357,11 @@ function AddCredentialModal({
         <Form.Item
           name="refresh_token"
           label="Refresh Token"
-          rules={[{ required: true, message: "请输入 refresh token" }]}
+          rules={[{ required: true, message: t("kiro.refreshTokenRequired") }]}
         >
-          <Input.TextArea rows={3} placeholder="粘贴 refresh token" />
+          <Input.TextArea rows={3} placeholder={t("kiro.refreshTokenPlaceholder")} />
         </Form.Item>
-        <Form.Item name="auth_method" label="认证方式" initialValue="social">
+        <Form.Item name="auth_method" label={t("kiro.authMethod")} initialValue="social">
           <Select
             options={[
               { label: "Social (Kiro Desktop)", value: "social" },
@@ -360,7 +370,7 @@ function AddCredentialModal({
             ]}
           />
         </Form.Item>
-        <Form.Item name="region" label="区域" initialValue="us-east-1">
+        <Form.Item name="region" label={t("kiro.regionLabel")} initialValue="us-east-1">
           <Select
             options={[
               { label: "us-east-1", value: "us-east-1" },
@@ -370,8 +380,8 @@ function AddCredentialModal({
             ]}
           />
         </Form.Item>
-        <Form.Item name="priority" label="优先级" initialValue={0}>
-          <Input type="number" placeholder="0 = 最高" />
+        <Form.Item name="priority" label={t("kiro.priorityLabel")} initialValue={0}>
+          <Input type="number" placeholder={t("kiro.priorityPlaceholder")} />
         </Form.Item>
       </Form>
     </Modal>
@@ -382,6 +392,7 @@ function AddCredentialModal({
 
 function EndpointDashboard() {
   const kiro = useKiroAdmin();
+  const { t } = useLocale();
   const [health, setHealth] = useState<KiroEndpointHealth | null>(null);
 
   const refresh = useCallback(async () => {
@@ -401,10 +412,10 @@ function EndpointDashboard() {
 
   return (
     <Card
-      title="端点健康状态"
+      title={t("kiro.endpointHealth")}
       extra={
         <Button icon={<ReloadOutlined />} onClick={refresh}>
-          刷新
+          {t("common.refresh")}
         </Button>
       }
     >
@@ -431,9 +442,9 @@ function EndpointDashboard() {
                 }
               />
               <div style={{ marginTop: 8, fontSize: 12, color: "#888" }}>
-                <div>成功: {ep.success_count} | 失败: {ep.fail_count}</div>
-                <div>延迟 EMA: {ep.latency_ema_ms.toFixed(1)}ms</div>
-                <div>连续错误: {ep.consecutive_errors}</div>
+                <div>{t("kiro.endpointSuccessFail", { s: ep.success_count, f: ep.fail_count })}</div>
+                <div>{t("kiro.latencyEma", { ms: ep.latency_ema_ms.toFixed(1) })}</div>
+                <div>{t("kiro.consecutiveErrors", { n: ep.consecutive_errors })}</div>
               </div>
             </Card>
           </Col>
@@ -441,7 +452,7 @@ function EndpointDashboard() {
 
         {(!health?.endpoints || health.endpoints.length === 0) && (
           <Col span={24}>
-            <Text type="secondary">暂无端点数据。代理服务启动后将自动记录端点健康状态。</Text>
+            <Text type="secondary">{t("kiro.noEndpointData")}</Text>
           </Col>
         )}
       </Row>
@@ -453,13 +464,14 @@ function EndpointDashboard() {
 
 function SettingsPanel() {
   const kiro = useKiroAdmin();
+  const { t } = useLocale();
   const [thinking, setThinkingState] = useState<KiroThinkingConfig | null>(null);
   const [settings, setSettingsState] = useState<KiroSettings | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const [t, s] = await Promise.all([kiro.getThinking(), kiro.getSettings()]);
-      setThinkingState(t);
+      const [thinkingData, s] = await Promise.all([kiro.getThinking(), kiro.getSettings()]);
+      setThinkingState(thinkingData);
       setSettingsState(s);
     } catch {
       // handled
@@ -473,7 +485,7 @@ function SettingsPanel() {
   const handleThinkingChange = async (mode: string) => {
     try {
       await kiro.setThinking(mode);
-      message.success("Thinking 模式已更新");
+      message.success(t("kiro.thinkingUpdated"));
       setThinkingState({ mode });
     } catch {
       // handled
@@ -486,7 +498,7 @@ function SettingsPanel() {
         field === "preferred_endpoint" ? (value as string) : settings?.preferred_endpoint,
         field === "endpoint_fallback" ? (value as boolean) : settings?.endpoint_fallback
       );
-      message.success("设置已更新");
+      message.success(t("kiro.settingsUpdated"));
       refresh();
     } catch {
       // handled
@@ -499,40 +511,40 @@ function SettingsPanel() {
         <Alert type="error" message={kiro.error} closable onClose={() => kiro.setError(null)} />
       )}
 
-      <Card title="Thinking 模式" size="small">
+      <Card title={t("kiro.thinkingMode")} size="small">
         <Form layout="inline">
-          <Form.Item label="模式">
+          <Form.Item label={t("kiro.mode")}>
             <Select
               value={thinking?.mode ?? "as_reasoning_content"}
               onChange={handleThinkingChange}
               style={{ width: 220 }}
               options={[
-                { label: "Reasoning Content (默认)", value: "as_reasoning_content" },
-                { label: "移除 Thinking", value: "remove" },
-                { label: "保留标签", value: "pass" },
-                { label: "去除标签保留内容", value: "strip_tags" },
+                { label: t("kiro.modeReasoningContent"), value: "as_reasoning_content" },
+                { label: t("kiro.modeRemove"), value: "remove" },
+                { label: t("kiro.modePass"), value: "pass" },
+                { label: t("kiro.modeStripTags"), value: "strip_tags" },
               ]}
             />
           </Form.Item>
         </Form>
       </Card>
 
-      <Card title="端点配置" size="small">
+      <Card title={t("kiro.endpointConfig")} size="small">
         <Form layout="inline">
-          <Form.Item label="首选端点">
+          <Form.Item label={t("kiro.preferredEndpoint")}>
             <Select
               value={settings?.preferred_endpoint ?? "auto"}
               onChange={(v) => handleSettingsChange("preferred_endpoint", v)}
               style={{ width: 180 }}
               options={[
-                { label: "Auto (自动降级)", value: "auto" },
+                { label: t("kiro.autoDowngrade"), value: "auto" },
                 { label: "Kiro IDE", value: "kiro" },
                 { label: "CodeWhisperer", value: "codewhisperer" },
                 { label: "AmazonQ", value: "amazonq" },
               ]}
             />
           </Form.Item>
-          <Form.Item label="429 降级">
+          <Form.Item label={t("kiro.fallback429")}>
             <Switch
               checked={settings?.endpoint_fallback !== false}
               onChange={(v) => handleSettingsChange("endpoint_fallback", v)}
@@ -541,7 +553,7 @@ function SettingsPanel() {
         </Form>
       </Card>
 
-      <Card title="负载均衡" size="small">
+      <Card title={t("kiro.loadBalance")} size="small">
         <LoadBalanceConfig kiro={kiro} />
       </Card>
     </Space>
@@ -549,6 +561,7 @@ function SettingsPanel() {
 }
 
 function LoadBalanceConfig({ kiro }: { kiro: ReturnType<typeof useKiroAdmin> }) {
+  const { t } = useLocale();
   const [mode, setMode] = useState<string>("priority");
 
   useEffect(() => {
@@ -562,7 +575,7 @@ function LoadBalanceConfig({ kiro }: { kiro: ReturnType<typeof useKiroAdmin> }) 
     try {
       await kiro.setLbConfig(newMode);
       setMode(newMode);
-      message.success("负载均衡模式已更新");
+      message.success(t("kiro.lbUpdated"));
     } catch {
       // handled
     }
@@ -570,15 +583,15 @@ function LoadBalanceConfig({ kiro }: { kiro: ReturnType<typeof useKiroAdmin> }) 
 
   return (
     <Form layout="inline">
-      <Form.Item label="模式">
+      <Form.Item label={t("kiro.mode")}>
         <Select
           value={mode}
           onChange={handleChange}
           style={{ width: 180 }}
           options={[
-            { label: "Priority (按优先级)", value: "priority" },
-            { label: "Balanced (轮询)", value: "balanced" },
-            { label: "Smart (智能评分)", value: "smart" },
+            { label: t("kiro.lbPriority"), value: "priority" },
+            { label: t("kiro.lbBalanced"), value: "balanced" },
+            { label: t("kiro.lbSmart"), value: "smart" },
           ]}
         />
       </Form.Item>
@@ -590,6 +603,7 @@ function LoadBalanceConfig({ kiro }: { kiro: ReturnType<typeof useKiroAdmin> }) 
 
 function AuthFlows() {
   const kiro = useKiroAdmin();
+  const { t } = useLocale();
   const [ssoTokens, setSsoTokens] = useState("");
   const [ssoRegion, setSsoRegion] = useState("us-east-1");
   const [iamStartUrl, setIamStartUrl] = useState("");
@@ -599,13 +613,13 @@ function AuthFlows() {
 
   const handleSsoImport = async () => {
     if (!ssoTokens.trim()) {
-      message.warning("请输入 SSO token");
+      message.warning(t("kiro.ssoTokenRequired"));
       return;
     }
     try {
       const result = await kiro.importSsoTokens(ssoTokens, ssoRegion) as Record<string, unknown>;
       const count = (result?.imported as unknown[])?.length ?? 0;
-      message.success(`成功导入 ${count} 个账户`);
+      message.success(t("kiro.ssoImported", { count }));
       setSsoTokens("");
     } catch {
       // handled
@@ -614,7 +628,7 @@ function AuthFlows() {
 
   const handleIamStart = async () => {
     if (!iamStartUrl.trim()) {
-      message.warning("请输入 IAM Identity Center Start URL");
+      message.warning(t("kiro.iamStartUrlRequired"));
       return;
     }
     try {
@@ -623,12 +637,12 @@ function AuthFlows() {
       const url = result?.authorize_url as string;
       if (url) {
         Modal.info({
-          title: "请在浏览器中完成登录",
+          title: t("kiro.iamLoginBrowser"),
           content: (
             <div>
-              <p>请在浏览器中打开以下链接完成登录：</p>
+              <p>{t("kiro.iamLoginOpenLink")}</p>
               <Input.TextArea value={url} readOnly rows={3} />
-              <p style={{ marginTop: 8 }}>登录完成后，将回调 URL 粘贴到下方。</p>
+              <p style={{ marginTop: 8 }}>{t("kiro.iamLoginPasteCallback")}</p>
             </div>
           ),
           width: 600,
@@ -641,12 +655,12 @@ function AuthFlows() {
 
   const handleIamComplete = async () => {
     if (!iamSession || !iamCallbackUrl.trim()) {
-      message.warning("请先启动登录流程，并输入回调 URL");
+      message.warning(t("kiro.iamStartFirst"));
       return;
     }
     try {
       await kiro.completeIamSso(iamSession, iamCallbackUrl);
-      message.success("IAM IdC 登录成功，账户已添加");
+      message.success(t("kiro.iamLoginSuccess"));
       setIamSession(null);
       setIamCallbackUrl("");
     } catch {
@@ -660,9 +674,9 @@ function AuthFlows() {
         <Alert type="error" message={kiro.error} closable onClose={() => kiro.setError(null)} />
       )}
 
-      <Card title="SSO Token 导入" size="small" extra={<SafetyOutlined />}>
+      <Card title={t("kiro.ssoImport")} size="small" extra={<SafetyOutlined />}>
         <Text type="secondary" style={{ display: "block", marginBottom: 12 }}>
-          粘贴 SSO Bearer Token（多个用换行分隔），系统将自动完成设备授权流程。
+          {t("kiro.ssoImportDesc")}
         </Text>
         <Form layout="vertical">
           <Form.Item label="SSO Token(s)">
@@ -673,7 +687,7 @@ function AuthFlows() {
               placeholder={"token1\ntoken2\ntoken3"}
             />
           </Form.Item>
-          <Form.Item label="区域">
+          <Form.Item label={t("kiro.regionLabel")}>
             <Select
               value={ssoRegion}
               onChange={setSsoRegion}
@@ -692,15 +706,15 @@ function AuthFlows() {
               onClick={handleSsoImport}
               loading={kiro.loading}
             >
-              导入
+              {t("kiro.import")}
             </Button>
           </Form.Item>
         </Form>
       </Card>
 
-      <Card title="IAM Identity Center 登录" size="small" extra={<SafetyOutlined />}>
+      <Card title={t("kiro.iamLogin")} size="small" extra={<SafetyOutlined />}>
         <Text type="secondary" style={{ display: "block", marginBottom: 12 }}>
-          适用于企业 AWS SSO (IdC) 用户，通过 PKCE 授权码流程登录。
+          {t("kiro.iamLoginDesc")}
         </Text>
         <Form layout="vertical">
           <Form.Item label="Start URL">
@@ -710,7 +724,7 @@ function AuthFlows() {
               placeholder="https://your-sso-portal.awsapps.com/start"
             />
           </Form.Item>
-          <Form.Item label="区域">
+          <Form.Item label={t("kiro.regionLabel")}>
             <Select
               value={iamRegion}
               onChange={setIamRegion}
@@ -730,13 +744,13 @@ function AuthFlows() {
               loading={kiro.loading}
               disabled={!!iamSession}
             >
-              {iamSession ? "已启动" : "启动登录"}
+              {iamSession ? t("kiro.started") : t("kiro.startLogin")}
             </Button>
           </Form.Item>
 
           {iamSession && (
             <>
-              <Form.Item label="回调 URL">
+              <Form.Item label={t("kiro.callbackUrl")}>
                 <Input
                   value={iamCallbackUrl}
                   onChange={(e) => setIamCallbackUrl(e.target.value)}
@@ -745,7 +759,7 @@ function AuthFlows() {
               </Form.Item>
               <Form.Item>
                 <Button onClick={handleIamComplete} loading={kiro.loading}>
-                  完成登录
+                  {t("kiro.completeLogin")}
                 </Button>
               </Form.Item>
             </>

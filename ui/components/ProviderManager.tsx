@@ -1,14 +1,14 @@
 import { useState } from "react";
-import { Card, Spin, Alert, Button, Modal, message } from "antd";
+import { Spin, Alert, Button, Modal, Drawer, message } from "antd";
 import { PlusOutlined } from "@ant-design/icons";
 import { useProviders } from "../hooks/useProviders";
 import { ProviderList } from "./ProviderList";
 import { ProviderForm } from "./ProviderForm";
 import type { ProviderConfig } from "../types";
-
-type View = "list" | "add" | "edit";
+import { useLocale } from "../i18n";
 
 export function ProviderManager() {
+  const { t } = useLocale();
   const {
     providers,
     activeProvider,
@@ -22,15 +22,12 @@ export function ProviderManager() {
     loadProviders,
   } = useProviders();
 
-  const [view, setView] = useState<View>("list");
+  const [drawerOpen, setDrawerOpen] = useState(false);
   const [editingProvider, setEditingProvider] = useState<ProviderConfig | undefined>();
-
-  // When providers finish loading and list is empty, auto-show add form
-  const effectiveView = !loading && providers.length === 0 && view === "list" && !error ? "add" : view;
 
   const handleEdit = (provider: ProviderConfig) => {
     setEditingProvider(provider);
-    setView("edit");
+    setDrawerOpen(true);
   };
 
   const handleDelete = (name: string) => {
@@ -38,23 +35,23 @@ export function ProviderManager() {
 
     if (isActive && providers.length > 1) {
       Modal.warning({
-        title: "无法删除",
-        content: "不能删除当前活跃的 Provider，请先切换到其他 Provider。",
-        okText: "知道了",
+        title: t("provider.cannotDelete"),
+        content: t("provider.cannotDeleteActive"),
+        okText: t("common.ok"),
       });
       return;
     }
 
     Modal.confirm({
-      title: "确认删除",
-      content: `确定要删除 Provider "${name}" 吗？`,
-      okText: "删除",
+      title: t("common.confirmDelete"),
+      content: t("provider.confirmDeleteMsg", { name }),
+      okText: t("common.delete"),
       okType: "danger",
-      cancelText: "取消",
+      cancelText: t("common.cancel"),
       onOk: async () => {
         try {
           await deleteProvider(name);
-          message.success(`已删除 Provider: ${name}`);
+          message.success(t("provider.deleted", { name }));
         } catch {
           // Error is already set in the hook
         }
@@ -64,68 +61,44 @@ export function ProviderManager() {
 
   const handleAdd = async (config: ProviderConfig) => {
     await addProvider(config);
-    message.success(`已添加 Provider: ${config.name}`);
-    setView("list");
+    message.success(t("provider.added", { name: config.name }));
+    closeDrawer();
   };
 
   const handleUpdate = async (config: ProviderConfig) => {
-    // Pass original name so backend can handle rename
     await updateProvider(config, editingProvider?.name);
-    message.success(`已更新 Provider: ${config.name}`);
-    setView("list");
-    setEditingProvider(undefined);
+    message.success(t("provider.updated", { name: config.name }));
+    closeDrawer();
   };
 
-  const handleCancel = () => {
-    setView("list");
+  const closeDrawer = () => {
+    setDrawerOpen(false);
     setEditingProvider(undefined);
   };
 
   if (loading) {
-    return <Spin tip="加载 Provider 列表..." style={{ display: "block", marginTop: 48 }} />;
+    return <Spin tip={t("provider.loading")} style={{ display: "block", marginTop: 48 }} />;
   }
 
   if (error && providers.length === 0) {
     return (
-      <Card>
+      <div>
         <Alert
-          message="加载失败"
+          message={t("provider.loadFailed")}
           description={error}
           type="error"
           showIcon
           action={
             <Button size="small" onClick={loadProviders}>
-              重试
+              {t("common.retry")}
             </Button>
           }
         />
-      </Card>
+      </div>
     );
   }
 
-  if (effectiveView === "add") {
-    return (
-      <ProviderForm
-        mode="add"
-        existingNames={providers.map((p) => p.name)}
-        onSubmit={handleAdd}
-        onCancel={handleCancel}
-        defaultTemplate="DeepSeek"
-      />
-    );
-  }
-
-  if (effectiveView === "edit" && editingProvider) {
-    return (
-      <ProviderForm
-        mode="edit"
-        initialValues={editingProvider}
-        existingNames={providers.map((p) => p.name)}
-        onSubmit={handleUpdate}
-        onCancel={handleCancel}
-      />
-    );
-  }
+  const isEditing = !!editingProvider;
 
   return (
     <div>
@@ -142,15 +115,18 @@ export function ProviderManager() {
         <Button
           type="primary"
           icon={<PlusOutlined />}
-          onClick={() => setView("add")}
+          onClick={() => {
+            setEditingProvider(undefined);
+            setDrawerOpen(true);
+          }}
         >
-          添加 Provider
+          {t("provider.addProvider")}
         </Button>
       </div>
       {providers.length === 0 && !error ? (
         <Alert
-          message="尚未配置 Provider"
-          description="请点击上方按钮添加第一个 Provider。"
+          message={t("provider.notConfigured")}
+          description={t("provider.notConfiguredDesc")}
           type="info"
           showIcon
         />
@@ -164,6 +140,23 @@ export function ProviderManager() {
           onDelete={handleDelete}
         />
       )}
+
+      <Drawer
+        title={isEditing ? t("provider.editProvider") : t("provider.addProvider")}
+        width={640}
+        open={drawerOpen}
+        onClose={closeDrawer}
+        destroyOnClose
+      >
+        <ProviderForm
+          mode={isEditing ? "edit" : "add"}
+          initialValues={editingProvider}
+          existingNames={providers.map((p) => p.name)}
+          onSubmit={isEditing ? handleUpdate : handleAdd}
+          onCancel={closeDrawer}
+          defaultTemplate={isEditing ? undefined : "deepseek"}
+        />
+      </Drawer>
     </div>
   );
 }

@@ -9,6 +9,7 @@ import {
 } from "@ant-design/icons";
 import { invoke } from "@tauri-apps/api/core";
 import type { ProviderConfig, TestProviderResult } from "../types";
+import { useLocale } from "../i18n";
 
 const { Text } = Typography;
 
@@ -29,15 +30,16 @@ export function ProviderList({
   onEdit,
   onDelete,
 }: ProviderListProps) {
+  const { t } = useLocale();
   const [testing, setTesting] = useState<string | null>(null);
 
   const handleSwitch = async (name: string) => {
     try {
       await onSwitch(name);
-      message.success(`已切换到 Provider: ${name}`, 3);
+      message.success(t("provider.switchSuccess", { name }), 3);
     } catch (e) {
       const errMsg = typeof e === "string" ? e : String(e);
-      message.error({ content: `切换失败: ${errMsg}`, duration: 0 });
+      message.error({ content: t("provider.switchFailed", { error: errMsg }), duration: 0 });
     }
   };
 
@@ -47,17 +49,21 @@ export function ProviderList({
       const result = await invoke<TestProviderResult>("test_provider", { provider });
       if (result.success) {
         message.success(
-          `${provider.name} 连接成功 (${result.latency_ms}ms)${result.model ? ` - 模型: ${result.model}` : ""}`,
+          t("provider.testSuccess", {
+            name: provider.name,
+            latency: result.latency_ms,
+            model: result.model ? ` - Model: ${result.model}` : "",
+          }),
           5
         );
       } else {
         message.error({
-          content: `${provider.name} 连接失败: ${result.error}`,
+          content: t("provider.switchFailed", { error: result.error ?? "" }),
           duration: 8,
         });
       }
     } catch (e) {
-      message.error(`测试失败: ${typeof e === "string" ? e : String(e)}`);
+      message.error(t("provider.testFailed", { error: typeof e === "string" ? e : String(e) }));
     } finally {
       setTesting(null);
     }
@@ -79,7 +85,7 @@ export function ProviderList({
                 loading={isTesting}
                 onClick={() => handleTest(provider)}
               >
-                测试
+                {t("common.test")}
               </Button>,
               !isActive && (
                 <Button
@@ -90,7 +96,7 @@ export function ProviderList({
                   loading={switching}
                   onClick={() => handleSwitch(provider.name)}
                 >
-                  切换
+                  {t("provider.switch")}
                 </Button>
               ),
               <Button
@@ -116,7 +122,7 @@ export function ProviderList({
                   </span>
                   {isActive && (
                     <Tag icon={<CheckCircleOutlined />} color="success">
-                      活跃
+                      {t("provider.active")}
                     </Tag>
                   )}
                   <Tag color={provider.format === "openai" ? "blue" : "purple"}>
@@ -127,7 +133,7 @@ export function ProviderList({
               description={
                 <Space direction="vertical" size={0}>
                   <Text type="secondary" style={{ fontSize: 12 }}>
-                    模型: {provider.model}
+                    {t("provider.model", { model: provider.model })}
                   </Text>
                   <Text type="secondary" style={{ fontSize: 12 }}>
                     {provider.base_url}

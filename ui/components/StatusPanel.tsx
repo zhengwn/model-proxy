@@ -13,6 +13,7 @@ import {
   InputNumber,
   Typography,
   Tooltip,
+  Collapse,
 } from "antd";
 import {
   PlayCircleOutlined,
@@ -24,6 +25,7 @@ import { useState, useEffect } from "react";
 import { useServiceStatus } from "../hooks/useServiceStatus";
 import { useProviders } from "../hooks/useProviders";
 import { useConfig } from "../hooks/useConfig";
+import { useLocale } from "../i18n";
 
 const { Text } = Typography;
 
@@ -36,6 +38,7 @@ function formatTimestamp(iso: string): string {
 }
 
 function StatusPanel() {
+  const { t } = useLocale();
   const { status, loading, startService, stopService } = useServiceStatus();
   const { providers, activeProvider, loadProviders } = useProviders();
 
@@ -81,7 +84,7 @@ function StatusPanel() {
       await startService();
     } catch (err) {
       const errMsg = typeof err === "string" ? err : String(err);
-      message.error(`启动失败: ${errMsg}`);
+      message.error(t("status.startFailed", { error: errMsg }));
     } finally {
       setActionLoading(false);
     }
@@ -93,7 +96,7 @@ function StatusPanel() {
       await stopService();
     } catch (err) {
       const errMsg = typeof err === "string" ? err : String(err);
-      message.error(`停止失败: ${errMsg}`);
+      message.error(t("status.stopFailed", { error: errMsg }));
     } finally {
       setActionLoading(false);
     }
@@ -110,9 +113,9 @@ function StatusPanel() {
         admin_api_key: serverAdminApiKey || undefined,
       });
       setServerDirty(false);
-      message.success("服务器设置已保存");
+      message.success(t("status.serverSaved"));
     } catch (err) {
-      message.error(`保存失败: ${typeof err === "string" ? err : String(err)}`);
+      message.error(t("common.saveFailed", { error: typeof err === "string" ? err : String(err) }));
     }
   };
 
@@ -121,12 +124,12 @@ function StatusPanel() {
   const handleCopyAddress = () => {
     const addr = `http://${localDisplayHost}:${serverPort}`;
     navigator.clipboard.writeText(addr).then(() => {
-      message.success("已复制: " + addr);
+      message.success(t("status.copied", { addr }));
     });
   };
 
   if (loading && !status) {
-    return <Spin tip="加载中..." />;
+    return <Spin tip={t("common.loading")} />;
   }
 
   const isRunning = status?.running ?? false;
@@ -138,8 +141,8 @@ function StatusPanel() {
       {/* First-launch guide */}
       {isNew && (
         <Alert
-          message="首次使用"
-          description="请先在「Provider 管理」页面添加至少一个 Provider，然后回到此页面启动服务。"
+          message={t("status.firstUse")}
+          description={t("status.firstUseDesc")}
           type="info"
           showIcon
         />
@@ -147,8 +150,8 @@ function StatusPanel() {
 
       {!hasProviders && !isNew && (
         <Alert
-          message="尚未配置 Provider"
-          description="请先在「Provider 管理」页面添加至少一个 Provider 才能启动服务。"
+          message={t("status.noProviders")}
+          description={t("status.noProvidersDesc")}
           type="warning"
           showIcon
         />
@@ -158,10 +161,10 @@ function StatusPanel() {
       <Card
         title={
           <Space>
-            <span>服务状态</span>
+            <span>{t("status.serviceStatus")}</span>
             <Badge
               status={isRunning ? "success" : "error"}
-              text={isRunning ? "运行中" : "已停止"}
+              text={isRunning ? t("status.running") : t("status.stopped")}
             />
           </Space>
         }
@@ -174,7 +177,7 @@ function StatusPanel() {
               disabled={!canStart}
               loading={actionLoading && !isRunning}
             >
-              启动
+              {t("status.start")}
             </Button>
             <Button
               danger
@@ -183,22 +186,22 @@ function StatusPanel() {
               disabled={!isRunning}
               loading={actionLoading && isRunning}
             >
-              停止
+              {t("status.stop")}
             </Button>
           </Space>
         }
       >
         <Row gutter={16}>
           <Col span={6}>
-            <Statistic title="当前 Provider" value={activeProvider || "-"} />
+            <Statistic title={t("status.currentProvider")} value={activeProvider || "-"} />
           </Col>
           <Col span={6}>
             <Statistic
-              title="监听地址"
+              title={t("status.listenAddress")}
               value={isRunning ? status?.listen_addr ?? `${serverHost}:${serverPort}` : "-"}
               suffix={
                 isRunning && (
-                  <Tooltip title="复制连接地址">
+                  <Tooltip title={t("status.copyAddress")}>
                     <CopyOutlined
                       style={{ fontSize: 14, cursor: "pointer", color: "#1677ff" }}
                       onClick={handleCopyAddress}
@@ -209,11 +212,11 @@ function StatusPanel() {
             />
           </Col>
           <Col span={6}>
-            <Statistic title="总请求数" value={status?.total_requests ?? 0} />
+            <Statistic title={t("status.totalRequests")} value={status?.total_requests ?? 0} />
           </Col>
           <Col span={6}>
             <Statistic
-              title="失败请求数"
+              title={t("status.failedRequests")}
               value={status?.failed_requests ?? 0}
               valueStyle={
                 (status?.failed_requests ?? 0) > 0
@@ -227,7 +230,7 @@ function StatusPanel() {
         {isRunning && status?.started_at && (
           <div style={{ marginTop: 16 }}>
             <Text type="secondary">
-              启动于 {formatTimestamp(status.started_at)}
+              {t("status.startedAt", { time: formatTimestamp(status.started_at) })}
             </Text>
           </div>
         )}
@@ -235,7 +238,7 @@ function StatusPanel() {
 
       {status?.error_message && (
         <Alert
-          message="服务错误"
+          message={t("status.serviceError")}
           description={status.error_message}
           type="error"
           showIcon
@@ -243,90 +246,101 @@ function StatusPanel() {
       )}
 
       {/* Inline server settings */}
-      <Card title="服务器设置" size="small">
-        <Row gutter={[16, 12]} align="middle">
-          <Col>
-            <Space>
-              <Text>Host:</Text>
-              <Input
-                placeholder="127.0.0.1"
-                value={serverHost}
-                disabled={isRunning}
-                onChange={(e) => {
-                  setServerHost(e.target.value);
-                  setServerDirty(true);
-                }}
-                style={{ width: 140 }}
-              />
-            </Space>
-          </Col>
-          <Col>
-            <Space>
-              <Text>端口:</Text>
-              <InputNumber
-                min={1}
-                max={65535}
-                value={serverPort}
-                disabled={isRunning}
-                onChange={(v) => {
-                  setServerPort(v ?? 4000);
-                  setServerDirty(true);
-                }}
-                style={{ width: 100 }}
-              />
-            </Space>
-          </Col>
-          <Col>
-            <Space>
-              <Text>Client Key:</Text>
-              <Input.Password
-                placeholder="留空则不鉴权"
-                value={serverApiKey}
-                disabled={isRunning}
-                onChange={(e) => {
-                  setServerApiKey(e.target.value);
-                  setServerDirty(true);
-                }}
-                style={{ width: 200 }}
-              />
-            </Space>
-          </Col>
-          <Col>
-            <Space>
-              <Text>Admin Key:</Text>
-              <Input.Password
-                placeholder="留空则不鉴权"
-                value={serverAdminApiKey}
-                disabled={isRunning}
-                onChange={(e) => {
-                  setServerAdminApiKey(e.target.value);
-                  setServerDirty(true);
-                }}
-                style={{ width: 200 }}
-              />
-            </Space>
-          </Col>
-          <Col>
-            {serverDirty && !isRunning && (
-              <Button
-                icon={<SaveOutlined />}
-                size="small"
-                onClick={handleSaveServer}
-              >
-                保存
-              </Button>
-            )}
-          </Col>
-        </Row>
-        {configPath && (
-          <Text
-            type="secondary"
-            style={{ display: "block", marginTop: 8, fontSize: 12 }}
-          >
-            配置文件: {configPath}
-          </Text>
-        )}
-      </Card>
+      <Collapse
+        size="small"
+        items={[
+          {
+            key: "server",
+            label: t("status.serverSettings"),
+            children: (
+              <>
+                <Row gutter={[16, 12]} align="middle">
+                  <Col>
+                    <Space>
+                      <Text>Host:</Text>
+                      <Input
+                        placeholder="127.0.0.1"
+                        value={serverHost}
+                        disabled={isRunning}
+                        onChange={(e) => {
+                          setServerHost(e.target.value);
+                          setServerDirty(true);
+                        }}
+                        style={{ width: 140 }}
+                      />
+                    </Space>
+                  </Col>
+                  <Col>
+                    <Space>
+                      <Text>{t("status.port")}</Text>
+                      <InputNumber
+                        min={1}
+                        max={65535}
+                        value={serverPort}
+                        disabled={isRunning}
+                        onChange={(v) => {
+                          setServerPort(v ?? 4000);
+                          setServerDirty(true);
+                        }}
+                        style={{ width: 100 }}
+                      />
+                    </Space>
+                  </Col>
+                  <Col>
+                    <Space>
+                      <Text>Client Key:</Text>
+                      <Input.Password
+                        placeholder={t("status.noAuth")}
+                        value={serverApiKey}
+                        disabled={isRunning}
+                        onChange={(e) => {
+                          setServerApiKey(e.target.value);
+                          setServerDirty(true);
+                        }}
+                        style={{ width: 200 }}
+                      />
+                    </Space>
+                  </Col>
+                  <Col>
+                    <Space>
+                      <Text>Admin Key:</Text>
+                      <Input.Password
+                        placeholder={t("status.noAuth")}
+                        value={serverAdminApiKey}
+                        disabled={isRunning}
+                        onChange={(e) => {
+                          setServerAdminApiKey(e.target.value);
+                          setServerDirty(true);
+                        }}
+                        style={{ width: 200 }}
+                      />
+                    </Space>
+                  </Col>
+                  <Col>
+                    {serverDirty && !isRunning && (
+                      <Button
+                        icon={<SaveOutlined />}
+                        size="small"
+                        onClick={handleSaveServer}
+                      >
+                        {t("common.save")}
+                      </Button>
+                    )}
+                  </Col>
+                </Row>
+                {configPath && (
+                  <Text
+                    type="secondary"
+                    style={{ display: "block", marginTop: 8, fontSize: 12 }}
+                  >
+                    {t("status.configFile", { path: configPath })}
+                  </Text>
+                )}
+              </>
+            ),
+          },
+        ]}
+      />
 
       {/* Usage hint when running */}
       {isRunning && (
@@ -336,12 +350,12 @@ function StatusPanel() {
           message={
             <Space direction="vertical" size={2}>
               <Text>
-                服务已启动，将 IDE 的 API Base URL 设置为{" "}
+                {t("status.serviceRunningHint", { addr: `${localDisplayHost}:${serverPort}` }).split("{addr}")[0]}
                 <Text code copyable>{`http://${localDisplayHost}:${serverPort}`}</Text>
               </Text>
               {serverApiKey && (
                 <Text type="secondary" style={{ fontSize: 12 }}>
-                  API Key 设置为你上方配置的值
+                  {t("status.apiKeyHint")}
                 </Text>
               )}
             </Space>
