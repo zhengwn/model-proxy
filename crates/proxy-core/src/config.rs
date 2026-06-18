@@ -306,6 +306,12 @@ pub struct KiroConfig {
     /// 是否注入 Agentic System Prompt（文件操作限制 + 时间戳），默认 false
     #[serde(default)]
     pub agentic_prompt_injection: Option<bool>,
+    /// 是否过滤 Claude Code system prompt 中的环境噪声（gitStatus、Recent commits 等），默认 false
+    #[serde(default)]
+    pub filter_env_noise: Option<bool>,
+    /// 是否移除 system prompt 中的边界标记（--- SYSTEM PROMPT --- 等），默认 false
+    #[serde(default)]
+    pub filter_strip_boundaries: Option<bool>,
     /// 首 token 超时（秒），默认 15
     #[serde(default)]
     pub first_token_timeout: Option<u64>,
@@ -857,6 +863,8 @@ mod config_tests {
             accounts: None,
             load_balancing_mode: None,
             agentic_prompt_injection: None,
+            filter_env_noise: None,
+            filter_strip_boundaries: None,
             first_token_timeout: None,
             streaming_read_timeout: None,
             first_token_max_retries: None,

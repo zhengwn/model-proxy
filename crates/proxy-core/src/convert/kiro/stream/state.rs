@@ -65,6 +65,7 @@ pub(super) struct AnthropicStreamState {
     pub(super) input_tokens: u64,
     pub(super) completion_tokens: u64,
     pub(super) last_content: String, // for text dedup
+    pub(super) last_reasoning_content: String, // for reasoning content dedup
     pub(super) in_thinking: bool,
     pub(super) tool_input_buffers: HashMap<String, String>, // tool_use_id → accumulated input
     pub(super) thinking_parser: Option<ThinkingParser>,      // FSM for thinking tag extraction
@@ -88,6 +89,7 @@ impl AnthropicStreamState {
             input_tokens: 0,
             completion_tokens: 0,
             last_content: String::new(),
+            last_reasoning_content: String::new(),
             in_thinking: false,
             tool_input_buffers: HashMap::new(),
             thinking_parser: None,
@@ -292,6 +294,25 @@ pub(super) fn process_event(
                 return events;
             }
 
+            // Text dedup for reasoning content
+            if state.last_reasoning_content.len() >= text.len()
+                && state.last_reasoning_content[..text.len()] == *text
+            {
+                return events;
+            }
+            let new_text = if text.starts_with(&state.last_reasoning_content)
+                && !state.last_reasoning_content.is_empty()
+            {
+                &text[state.last_reasoning_content.len()..]
+            } else {
+                text.as_str()
+            };
+            state.last_reasoning_content = text.clone();
+
+            if new_text.is_empty() {
+                return events;
+            }
+
             // Emit message_start if not yet started
             if !state.started {
                 state.started = true;
@@ -333,10 +354,10 @@ pub(super) fn process_event(
                 &json!({
                     "type": "content_block_delta",
                     "index": idx,
-                    "delta": {"type": "thinking_delta", "thinking": text}
+                    "delta": {"type": "thinking_delta", "thinking": new_text}
                 }),
             ));
-            state.output_tokens += estimate_tokens(text);
+            state.output_tokens += estimate_tokens(new_text);
         }
 
         Event::ToolUse {
@@ -483,6 +504,16 @@ pub(super) fn process_event(
 
         Event::Metering { .. } => {
             // Billing info - not directly mappable to Anthropic usage
+        }
+
+        Event::MessageMetadata { input_tokens, output_tokens, .. } => {
+            // Direct token counts from Kiro - override percentage-based estimation
+            if *input_tokens > 0 {
+                state.input_tokens = *input_tokens;
+            }
+            if *output_tokens > 0 {
+                state.output_tokens = *output_tokens as usize;
+            }
         }
 
         Event::Error { code, message } => {

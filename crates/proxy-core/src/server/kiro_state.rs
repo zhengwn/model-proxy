@@ -235,6 +235,8 @@ fn collect_kiro_accounts(kiro_config: &KiroConfig, provider_name: &str) -> Vec<(
                 accounts: None,
                 load_balancing_mode: None,
                 agentic_prompt_injection: kiro_config.agentic_prompt_injection,
+                filter_env_noise: kiro_config.filter_env_noise,
+                filter_strip_boundaries: kiro_config.filter_strip_boundaries,
                 first_token_timeout: kiro_config.first_token_timeout,
                 streaming_read_timeout: kiro_config.streaming_read_timeout,
                 first_token_max_retries: kiro_config.first_token_max_retries,

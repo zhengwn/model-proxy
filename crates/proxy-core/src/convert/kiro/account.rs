@@ -1322,6 +1322,8 @@ mod tests {
             accounts: None,
             load_balancing_mode: None,
             agentic_prompt_injection: None,
+            filter_env_noise: None,
+            filter_strip_boundaries: None,
             first_token_timeout: None,
             streaming_read_timeout: None,
             first_token_max_retries: None,

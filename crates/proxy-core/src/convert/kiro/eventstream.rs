@@ -622,6 +622,13 @@ pub enum Event {
     ContextUsage { percentage: f64 },
     /// Billing/credit usage
     Metering { usage: f64 },
+    /// Token usage metadata (direct token counts from Kiro)
+    MessageMetadata {
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        cache_write_tokens: u64,
+    },
     /// Error from the API
     Error { code: String, message: String },
     /// Exception from the API
@@ -645,6 +652,21 @@ struct ReasoningContentPayload {
     text: String,
 }
 
+/// Deserialize `input` field that may be a JSON string or a JSON object.
+///
+/// Kiro's EventStream sometimes sends `input` as a plain string (e.g., `"{\"cmd\":\"ls\"}"`)
+/// and sometimes as a JSON object (e.g., `{"cmd": "ls"}`). We normalize both to a String.
+fn deserialize_tool_input<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val = serde_json::Value::deserialize(deserializer)?;
+    match val {
+        serde_json::Value::String(s) => Ok(s),
+        other => Ok(other.to_string()),
+    }
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ToolUsePayload {
@@ -652,7 +674,7 @@ struct ToolUsePayload {
     name: String,
     #[serde(default)]
     tool_use_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_tool_input")]
     input: String,
     #[serde(default)]
     stop: bool,
@@ -669,6 +691,32 @@ struct ContextUsagePayload {
 struct MeteringPayload {
     #[serde(default)]
     usage: f64,
+}
+
+/// Payload for messageMetadataEvent containing direct token counts.
+///
+/// Kiro sends token usage in `tokenUsage` with fields like:
+/// `outputTokens`, `totalTokens`, `uncachedInputTokens`, `cacheReadInputTokens`, `cacheWriteInputTokens`.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MessageMetadataPayload {
+    #[serde(default)]
+    token_usage: Option<TokenUsagePayload>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TokenUsagePayload {
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
+    #[serde(default)]
+    uncached_input_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+    #[serde(default)]
+    cache_write_input_tokens: u64,
 }
 
 impl Event {
@@ -712,6 +760,26 @@ impl Event {
                         Ok(Event::Metering {
                             usage: payload.usage,
                         })
+                    }
+                    "messageMetadataEvent" | "metadataEvent" => {
+                        let payload: MessageMetadataPayload = frame.payload_as_json()?;
+                        if let Some(tu) = payload.token_usage {
+                            let input_tokens = if tu.uncached_input_tokens > 0 || tu.cache_read_input_tokens > 0 || tu.cache_write_input_tokens > 0 {
+                                tu.uncached_input_tokens + tu.cache_read_input_tokens + tu.cache_write_input_tokens
+                            } else if tu.total_tokens > 0 && tu.output_tokens > 0 && tu.total_tokens > tu.output_tokens {
+                                tu.total_tokens - tu.output_tokens
+                            } else {
+                                0
+                            };
+                            Ok(Event::MessageMetadata {
+                                input_tokens,
+                                output_tokens: tu.output_tokens,
+                                cache_read_tokens: tu.cache_read_input_tokens,
+                                cache_write_tokens: tu.cache_write_input_tokens,
+                            })
+                        } else {
+                            Ok(Event::Unknown)
+                        }
                     }
                     _ => Ok(Event::Unknown),
                 }
@@ -797,6 +865,32 @@ fn value_to_event(val: &Value) -> Option<Event> {
     if let Some(usage) = val.get("contextUsageEvent") {
         let percentage = usage.get("contextUsagePercentage").and_then(|v| v.as_f64()).unwrap_or(0.0);
         return Some(Event::ContextUsage { percentage });
+    }
+
+    // { "messageMetadataEvent": { "tokenUsage": { "outputTokens": ..., ... } } }
+    // or { "metadataEvent": { "tokenUsage": { ... } } }
+    let metadata = val.get("messageMetadataEvent").or_else(|| val.get("metadataEvent"));
+    if let Some(meta) = metadata {
+        if let Some(tu) = meta.get("tokenUsage") {
+            let output = tu.get("outputTokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            let total = tu.get("totalTokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            let uncached = tu.get("uncachedInputTokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            let cache_read = tu.get("cacheReadInputTokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            let cache_write = tu.get("cacheWriteInputTokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            let input = if uncached > 0 || cache_read > 0 || cache_write > 0 {
+                uncached + cache_read + cache_write
+            } else if total > 0 && output > 0 && total > output {
+                total - output
+            } else {
+                0
+            };
+            return Some(Event::MessageMetadata {
+                input_tokens: input,
+                output_tokens: output,
+                cache_read_tokens: cache_read,
+                cache_write_tokens: cache_write,
+            });
+        }
     }
 
     None

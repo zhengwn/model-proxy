@@ -56,6 +56,13 @@ pub fn anthropic_to_kiro(
     // 2. Extract system prompt
     let system_text = extract_system_text(body);
 
+    // 2b. Apply prompt filters if configured
+    let system_text = if let Some(kiro_config) = provider.kiro_config.as_ref() {
+        apply_prompt_filters(&system_text, kiro_config)
+    } else {
+        system_text
+    };
+
     // 3. Extract thinking config (supports both Anthropic thinking and OpenAI reasoning_effort)
     let thinking_config = body.get("thinking");
     let reasoning_effort = body.get("reasoning_effort").and_then(|v| v.as_str());
@@ -317,6 +324,63 @@ fn extract_system_text(body: &Value) -> String {
         }
         _ => String::new(),
     }
+}
+
+// ---- Prompt filtering ----
+
+/// Patterns that indicate environment noise lines in Claude Code system prompts.
+const ENV_NOISE_PATTERNS: &[&str] = &[
+    "gitStatus:",
+    "Recent commits:",
+    "Assistant knowledge cutoff",
+    "x-anthropic-billing-header:",
+    "<fast_mode_info>",
+    "you are claude code",
+    ".claude/projects/",
+    "git status at the start of the conversation",
+    "has been invoked in the following environment",
+    "powered by the model named",
+    "Current date is",
+];
+
+/// Remove environment metadata noise lines from a system prompt.
+///
+/// Strips lines matching known Claude Code environment patterns (git status,
+/// commit history, billing headers, etc.) that waste tokens when proxied to Kiro.
+fn filter_env_noise(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            let lower = line.to_lowercase();
+            !ENV_NOISE_PATTERNS.iter().any(|p| lower.contains(&p.to_lowercase()))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Remove boundary marker lines (--- SYSTEM PROMPT ---, --- END SYSTEM PROMPT ---).
+fn filter_boundary_markers(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !(trimmed.starts_with("--- SYSTEM PROMPT ---")
+                || trimmed.starts_with("--- END SYSTEM PROMPT ---"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Apply configured prompt filters to the system text.
+fn apply_prompt_filters(text: &str, config: &super::super::super::config::KiroConfig) -> String {
+    let mut result = text.to_string();
+
+    if config.filter_strip_boundaries.unwrap_or(false) {
+        result = filter_boundary_markers(&result);
+    }
+    if config.filter_env_noise.unwrap_or(false) {
+        result = filter_env_noise(&result);
+    }
+
+    result
 }
 
 // ---- UUID generation ----

@@ -53,6 +53,8 @@ pub enum DeviceFlowStatus {
     },
     /// Still waiting for authorization
     AuthorizationPending,
+    /// Server requested slower polling (caller should increase interval by 5s)
+    SlowDown,
     /// User denied authorization
     Denied,
     /// Code expired
@@ -79,7 +81,13 @@ pub async fn start_device_flow(
         .json(&json!({
             "clientName": format!("KiroProxy-{}", &uuid_simple()[..8]),
             "clientType": "public",
-            "scopes": ["codewhisperer:completions", "codewhisperer:analysis"]
+            "scopes": [
+                "codewhisperer:completions",
+                "codewhisperer:analysis",
+                "codewhisperer:conversations",
+                "codewhisperer:transformations",
+                "codewhisperer:taskassist"
+            ]
         }))
         .send()
         .await
@@ -104,7 +112,7 @@ pub async fn start_device_flow(
         .post(format!("{}/device_authorization", oidc_base))
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(format!(
-            "client_id={}&scope=codewhisperer:completions+codewhisperer:analysis",
+            "client_id={}&scope=codewhisperer:completions+codewhisperer:analysis+codewhisperer:conversations+codewhisperer:transformations+codewhisperer:taskassist",
             client_id
         ))
         .send()
@@ -163,7 +171,7 @@ pub async fn poll_device_token(
     if let Some(error) = &token_resp.error {
         match error.as_str() {
             "authorization_pending" => DeviceFlowStatus::AuthorizationPending,
-            "slow_down" => DeviceFlowStatus::AuthorizationPending,
+            "slow_down" => DeviceFlowStatus::SlowDown,
             "access_denied" => DeviceFlowStatus::Denied,
             "expired_token" => DeviceFlowStatus::Expired,
             _ => DeviceFlowStatus::Error(

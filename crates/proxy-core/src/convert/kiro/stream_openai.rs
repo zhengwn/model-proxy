@@ -51,6 +51,7 @@ struct OpenAiStreamState {
     output_tokens: usize,
     input_tokens: u64,
     last_content: String,
+    last_reasoning_content: String,
     thinking_parser: Option<ThinkingParser>,
 }
 
@@ -68,6 +69,7 @@ impl OpenAiStreamState {
             output_tokens: 0,
             input_tokens: 0,
             last_content: String::new(),
+            last_reasoning_content: String::new(),
             thinking_parser: None,
         }
     }
@@ -187,6 +189,25 @@ fn process_event_openai(
                 return events;
             }
 
+            // Text dedup for reasoning content
+            if state.last_reasoning_content.len() >= text.len()
+                && state.last_reasoning_content[..text.len()] == *text
+            {
+                return events;
+            }
+            let new_text = if text.starts_with(&state.last_reasoning_content)
+                && !state.last_reasoning_content.is_empty()
+            {
+                &text[state.last_reasoning_content.len()..]
+            } else {
+                text.as_str()
+            };
+            state.last_reasoning_content = text.clone();
+
+            if new_text.is_empty() {
+                return events;
+            }
+
             if !state.has_role_emitted {
                 state.has_role_emitted = true;
                 state.started = true;
@@ -204,9 +225,9 @@ fn process_event_openai(
                 "object": "chat.completion.chunk",
                 "created": now_epoch_secs(),
                 "model": model,
-                "choices": [{"index": 0, "delta": {"reasoning_content": text}, "finish_reason": null}]
+                "choices": [{"index": 0, "delta": {"reasoning_content": new_text}, "finish_reason": null}]
             })));
-            state.output_tokens += estimate_tokens(text);
+            state.output_tokens += estimate_tokens(new_text);
         }
 
         Event::ToolUse {
@@ -288,6 +309,15 @@ fn process_event_openai(
             state.input_tokens = (*percentage * window as f64 / 100.0) as u64;
             if *percentage >= 100.0 {
                 state.stop_reason = Some("model_context_window_exceeded".to_string());
+            }
+        }
+
+        Event::MessageMetadata { input_tokens, output_tokens, .. } => {
+            if *input_tokens > 0 {
+                state.input_tokens = *input_tokens;
+            }
+            if *output_tokens > 0 {
+                state.output_tokens = *output_tokens as usize;
             }
         }
 
