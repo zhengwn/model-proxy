@@ -148,6 +148,14 @@ pub fn anthropic_to_kiro(
     let (mut history, current_content, current_images, current_tool_results) =
         process_messages(messages, &full_system_text, thinking_ref, &kiro_model, has_tools, &reverse_name_map);
 
+    // 7a. Inject placeholder when tools are present but content is empty
+    let current_content = if has_tools && current_content.trim().is_empty() && current_images.is_empty() {
+        debug!("注入占位内容（工具存在但 content 为空）");
+        "Continue with the task".to_string()
+    } else {
+        current_content
+    };
+
     // 7b. Apply History Manager (auto-truncate long histories)
     let history_mgr = super::history::HistoryManager::new(super::history::HistoryConfig::default());
     history_mgr.process_history(&mut history);

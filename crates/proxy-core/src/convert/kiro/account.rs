@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use super::auth::KiroAuthManager;
-use super::rate_limiter::QuotaManager;
+use super::rate_limiter::{check_quota, QuotaManager};
 use crate::config::KiroConfig;
 
 /// Error classification for failover decisions.
@@ -209,6 +209,9 @@ pub struct AccountSnapshot {
     pub proxy_url: Option<String>,
     pub region: String,
     pub health_score: u32,
+    pub quota_remaining: Option<f64>,
+    pub quota_limit: Option<f64>,
+    pub quota_exhausted: Option<bool>,
 }
 
 /// Persisted circuit breaker state for a single account.
@@ -271,6 +274,12 @@ impl AccountManager {
         let health_score_recovery = configs.first()
             .map(|(_, c)| c.health_score_recovery.unwrap_or(10))
             .unwrap_or(10);
+        let quota_check_enabled = configs.first()
+            .map(|(_, c)| c.enable_quota_check.unwrap_or(false))
+            .unwrap_or(false);
+        let quota_check_interval_secs = configs.first()
+            .map(|(_, c)| c.quota_check_interval_secs.unwrap_or(600))
+            .unwrap_or(600);
 
         let mut accounts: Vec<ManagedAccount> = configs
             .iter()
@@ -313,7 +322,8 @@ impl AccountManager {
             probabilistic_retry_chance: 0.1,
             load_balancing_mode: mode,
             round_robin_index: 0,
-            quota_manager: QuotaManager::new(quota_cooldown_secs),
+            quota_manager: QuotaManager::new(quota_cooldown_secs)
+                .with_quota_check(quota_check_enabled, quota_check_interval_secs),
             health_score_decay,
             health_score_recovery,
             state_file_path,
@@ -452,6 +462,7 @@ impl AccountManager {
             let current = &self.accounts[self.current_index];
             if !current.disabled && current.circuit.is_available()
                 && !self.quota_manager.is_in_cooldown(&current.id)
+                && !self.quota_manager.is_quota_exhausted(&current.id)
                 && !exclude.contains(&current.id)
             {
                 return Some((self.current_index, current.id.as_str(), &current.auth));
@@ -466,6 +477,7 @@ impl AccountManager {
             }
             if account.disabled || exclude.contains(&account.id)
                 || self.quota_manager.is_in_cooldown(&account.id)
+                || self.quota_manager.is_quota_exhausted(&account.id)
             {
                 continue;
             }
@@ -504,6 +516,7 @@ impl AccountManager {
             let account = &self.accounts[idx];
             if account.disabled || exclude.contains(&account.id)
                 || self.quota_manager.is_in_cooldown(&account.id)
+                || self.quota_manager.is_quota_exhausted(&account.id)
             {
                 continue;
             }
@@ -544,18 +557,23 @@ impl AccountManager {
         for (i, account) in self.accounts.iter().enumerate() {
             if account.disabled || exclude.contains(&account.id)
                 || self.quota_manager.is_in_cooldown(&account.id)
+                || self.quota_manager.is_quota_exhausted(&account.id)
             {
                 continue;
             }
             if !account.circuit.is_available() {
                 // Probabilistic retry for broken accounts
                 if account.circuit.state == CircuitState::Broken && self.should_probabilistic_retry(i) {
-                    let score = Self::compute_account_score(account, avg_recent);
+                    let quota_ratio = self.quota_manager.get_quota_info(&account.id)
+                        .and_then(|q| if q.limit > 0.0 { Some(q.remaining / q.limit) } else { None });
+                    let score = Self::compute_account_score(account, avg_recent, quota_ratio);
                     candidates.push((i, score));
                 }
                 continue;
             }
-            let score = Self::compute_account_score(account, avg_recent);
+            let quota_ratio = self.quota_manager.get_quota_info(&account.id)
+                .and_then(|q| if q.limit > 0.0 { Some(q.remaining / q.limit) } else { None });
+            let score = Self::compute_account_score(account, avg_recent, quota_ratio);
             candidates.push((i, score));
         }
 
@@ -589,7 +607,11 @@ impl AccountManager {
     }
 
     /// Compute composite score for smart load balancing. Higher = better.
-    fn compute_account_score(account: &ManagedAccount, avg_recent: f64) -> f64 {
+    fn compute_account_score(
+        account: &ManagedAccount,
+        avg_recent: f64,
+        quota_remaining_ratio: Option<f64>,
+    ) -> f64 {
         let health = account.circuit.health_score as f64;
         let inflight_penalty = -(account.inflight_count as f64 * 30.0);
         let usage_balance = if avg_recent > 0.0 {
@@ -617,8 +639,11 @@ impl AccountManager {
         } else {
             0.0
         };
+        let quota_bonus = quota_remaining_ratio
+            .map(|r| (r * 20.0).min(20.0))
+            .unwrap_or(0.0);
 
-        health + inflight_penalty + usage_balance + zero_use_bonus + idle_bonus + latency_bonus
+        health + inflight_penalty + usage_balance + zero_use_bonus + idle_bonus + latency_bonus + quota_bonus
     }
 
     /// Increment inflight count for the current account.
@@ -861,20 +886,26 @@ impl AccountManager {
         self.accounts
             .iter()
             .enumerate()
-            .map(|(i, a)| AccountSnapshot {
-                id: a.id.clone(),
-                priority: a.priority,
-                disabled: a.disabled,
-                failure_count: a.circuit.failures,
-                is_current: i == self.current_index,
-                is_available: !a.disabled && a.circuit.is_available(),
-                auth_method: "unknown".to_string(),
-                total_requests: a.circuit.total_requests,
-                successful_requests: a.circuit.successful_requests,
-                failed_requests: a.circuit.failed_requests,
-                proxy_url: a.proxy_url.clone(),
-                region: String::new(),
-                health_score: a.circuit.health_score,
+            .map(|(i, a)| {
+                let quota_info = self.quota_manager.get_quota_info(&a.id);
+                AccountSnapshot {
+                    id: a.id.clone(),
+                    priority: a.priority,
+                    disabled: a.disabled,
+                    failure_count: a.circuit.failures,
+                    is_current: i == self.current_index,
+                    is_available: !a.disabled && a.circuit.is_available(),
+                    auth_method: "unknown".to_string(),
+                    total_requests: a.circuit.total_requests,
+                    successful_requests: a.circuit.successful_requests,
+                    failed_requests: a.circuit.failed_requests,
+                    proxy_url: a.proxy_url.clone(),
+                    region: String::new(),
+                    health_score: a.circuit.health_score,
+                    quota_remaining: quota_info.map(|q| q.remaining),
+                    quota_limit: quota_info.map(|q| q.limit),
+                    quota_exhausted: quota_info.map(|q| q.is_exhausted()),
+                }
             })
             .collect()
     }
@@ -1066,6 +1097,54 @@ impl AccountManager {
         }
         None
     }
+
+    /// Start a background task that periodically checks quota for all accounts.
+    /// Only runs if quota checking is enabled. Drops lock before network I/O.
+    pub fn start_periodic_quota_check(
+        mgr: Arc<Mutex<Self>>,
+        client: reqwest::Client,
+    ) {
+        tokio::spawn(async move {
+            loop {
+                let (interval, accounts_to_check) = {
+                    let guard = mgr.lock().await;
+                    if !guard.quota_manager.quota_check_enabled() {
+                        let interval = guard.quota_manager.check_interval();
+                        drop(guard);
+                        tokio::time::sleep(interval).await;
+                        continue;
+                    }
+                    let interval = guard.quota_manager.check_interval();
+                    let accounts: Vec<(String, String, String)> = guard
+                        .accounts
+                        .iter()
+                        .filter(|a| !a.disabled && guard.quota_manager.is_quota_stale(&a.id))
+                        .filter_map(|a| {
+                            let auth = a.auth.blocking_lock();
+                            let cred = auth.credentials_iter().find(|c| !c.disabled)?;
+                            let token = cred.access_token.clone()?;
+                            let region = if cred.api_region.is_empty() {
+                                cred.region.clone()
+                            } else {
+                                cred.api_region.clone()
+                            };
+                            Some((a.id.clone(), token, region))
+                        })
+                        .collect();
+                    (interval, accounts)
+                };
+
+                for (account_id, token, region) in accounts_to_check {
+                    if let Some(info) = check_quota(&client, &token, &region).await {
+                        let mut guard = mgr.lock().await;
+                        guard.quota_manager.set_quota_info(&account_id, info);
+                    }
+                }
+
+                tokio::time::sleep(interval).await;
+            }
+        });
+    }
 }
 
 /// Simple pseudo-random chance check (0.0 - 1.0).
@@ -1253,6 +1332,8 @@ mod tests {
             endpoint_fallback: None,
             debug_save_requests: None,
             smart_summary_enabled: None,
+            enable_quota_check: None,
+            quota_check_interval_secs: None,
         }
     }
 }

@@ -62,6 +62,7 @@ pub(super) struct AnthropicStreamState {
     pub(super) in_thinking: bool,
     pub(super) tool_input_buffers: HashMap<String, String>, // tool_use_id → accumulated input
     pub(super) thinking_parser: Option<ThinkingParser>,      // FSM for thinking tag extraction
+    pub(super) force_close: bool, // force immediate stream closure (e.g. ContentLengthExceededException)
 }
 
 impl AnthropicStreamState {
@@ -84,6 +85,7 @@ impl AnthropicStreamState {
             in_thinking: false,
             tool_input_buffers: HashMap::new(),
             thinking_parser: None,
+            force_close: false,
         }
     }
 
@@ -114,6 +116,14 @@ impl AnthropicStreamState {
             "tool_use"
         } else {
             "end_turn"
+        }
+    }
+
+    /// Ensure output_tokens >= 1 when content was present.
+    /// Tool-only responses can produce output_tokens=0 which confuses billing/monitoring.
+    pub(super) fn ensure_min_output_tokens(&mut self) {
+        if self.has_tool_use || self.output_tokens > 0 {
+            self.output_tokens = self.output_tokens.max(1);
         }
     }
 }
@@ -349,6 +359,15 @@ pub(super) fn process_event(
                 ));
             }
 
+            // Close any open text/thinking block before processing tool event.
+            // For NEW tool blocks, stop_current_block is called again below (idempotent via take()).
+            // For CONTINUATION events (existing tool_use_id), this ensures text blocks are closed.
+            if state.current_block_type.as_deref() == Some("text")
+                || state.current_block_type.as_deref() == Some("thinking")
+            {
+                state.stop_current_block(&mut events);
+            }
+
             // Accumulate input
             let buffer = state
                 .tool_input_buffers
@@ -430,6 +449,7 @@ pub(super) fn process_event(
             tracing::warn!(type_name, message, "Kiro API 异常");
             if type_name == "ContentLengthExceededException" {
                 state.stop_reason = Some("max_tokens".to_string());
+                state.force_close = true;
             }
         }
 

@@ -245,6 +245,8 @@ fn collect_kiro_accounts(kiro_config: &KiroConfig, provider_name: &str) -> Vec<(
                 endpoint_fallback: kiro_config.endpoint_fallback,
                 debug_save_requests: kiro_config.debug_save_requests,
                 smart_summary_enabled: kiro_config.smart_summary_enabled,
+                enable_quota_check: kiro_config.enable_quota_check,
+                quota_check_interval_secs: kiro_config.quota_check_interval_secs,
             };
             (id, cfg)
         })

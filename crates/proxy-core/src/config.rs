@@ -336,6 +336,12 @@ pub struct KiroConfig {
     /// 是否启用 LLM Smart Summary（CONTENT_TOO_LONG 时用 Haiku 摘要再重试），默认 false
     #[serde(default)]
     pub smart_summary_enabled: Option<bool>,
+    /// 是否启用主动配额检查（通过 getUsageLimits API），默认 false
+    #[serde(default)]
+    pub enable_quota_check: Option<bool>,
+    /// 配额检查间隔（秒），默认 600（10 分钟）
+    #[serde(default)]
+    pub quota_check_interval_secs: Option<u64>,
 }
 
 impl ProviderConfig {
@@ -861,6 +867,8 @@ mod config_tests {
             endpoint_fallback: None,
             debug_save_requests: None,
             smart_summary_enabled: None,
+            enable_quota_check: None,
+            quota_check_interval_secs: None,
         });
         let config = make_config(vec![p]);
 

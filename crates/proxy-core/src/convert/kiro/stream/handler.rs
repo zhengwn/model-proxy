@@ -243,6 +243,10 @@ pub(crate) async fn handle_stream_anthropic_output(
                                     }
                                 }
                             }
+                            // Force-close on ContentLengthExceededException: exit read loop for immediate finalization
+                            if state.force_close {
+                                break;
+                            }
                         }
                         Some(Err(e)) => {
                             error!(
@@ -268,6 +272,7 @@ pub(crate) async fn handle_stream_anthropic_output(
                         for evt in timeout_events {
                             let _ = tx.send(Ok(Bytes::from(evt))).await;
                         }
+                        state.ensure_min_output_tokens();
                         let stop_reason = if first_chunk { "error" } else { state.get_stop_reason() };
                         let delta = sse_event("message_delta", &json!({
                             "type": "message_delta",
@@ -372,6 +377,7 @@ pub(crate) async fn handle_stream_anthropic_output(
 
             // Emit message_delta with stop_reason and usage
             if !has_emitted_message_delta {
+                state.ensure_min_output_tokens();
                 let stop_reason = state.get_stop_reason().to_string();
                 let delta = sse_event(
                     "message_delta",
@@ -597,6 +603,10 @@ pub(crate) async fn handle_stream_anthropic_output_buffered(
                                     }
                                 }
                             }
+                            // Force-close on ContentLengthExceededException
+                            if state.force_close {
+                                break;
+                            }
                         }
                         Some(Err(e)) => {
                             error!(request_id = request_id.as_str(), error = %e, "Kiro 流式读取错误");
@@ -618,6 +628,7 @@ pub(crate) async fn handle_stream_anthropic_output_buffered(
                         for evt in timeout_events {
                             let _ = tx.send(Ok(Bytes::from(evt))).await;
                         }
+                        state.ensure_min_output_tokens();
                         let stop_reason = if first_chunk { "error" } else { state.get_stop_reason() };
                         let delta = sse_event("message_delta", &json!({
                             "type": "message_delta",
@@ -731,6 +742,7 @@ pub(crate) async fn handle_stream_anthropic_output_buffered(
             }
 
             // Emit message_delta
+            state.ensure_min_output_tokens();
             let stop_reason = state.get_stop_reason().to_string();
             let delta = sse_event("message_delta", &json!({
                 "type": "message_delta",

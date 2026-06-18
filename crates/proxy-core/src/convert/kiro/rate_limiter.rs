@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Rate limiter with per-account and global limits.
 pub struct RateLimiter {
@@ -114,12 +114,111 @@ impl RateLimiter {
 /// Shared rate limiter type.
 pub type SharedRateLimiter = Arc<Mutex<RateLimiter>>;
 
+/// Quota information from getUsageLimits API.
+#[derive(Debug, Clone)]
+pub struct QuotaInfo {
+    pub remaining: f64,
+    pub limit: f64,
+    pub last_checked: Instant,
+    pub days_until_reset: Option<u32>,
+}
+
+impl QuotaInfo {
+    pub fn is_exhausted(&self) -> bool {
+        self.remaining <= 0.0
+    }
+
+    pub fn is_stale(&self, interval: Duration) -> bool {
+        self.last_checked.elapsed() > interval
+    }
+}
+
+/// Call getUsageLimits API to check account quota.
+/// Returns QuotaInfo on success. On failure, logs warning and returns None.
+pub async fn check_quota(
+    client: &reqwest::Client,
+    access_token: &str,
+    api_region: &str,
+) -> Option<QuotaInfo> {
+    let url = format!("https://q.{}.amazonaws.com/getUsageLimits", api_region);
+    match client
+        .post(&url)
+        .header("Content-Type", "application/x-amz-json-1.0")
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header(
+            "x-amz-target",
+            "AmazonCodeWhispererStreamingService.GetUsageLimits",
+        )
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+            Ok(json) => parse_quota_response(&json),
+            Err(e) => {
+                warn!(error = %e, "解析 getUsageLimits 响应失败");
+                None
+            }
+        },
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            warn!(status, body = body.as_str(), "getUsageLimits 请求失败");
+            None
+        }
+        Err(e) => {
+            warn!(error = %e, "getUsageLimits 网络错误");
+            None
+        }
+    }
+}
+
+fn parse_quota_response(json: &serde_json::Value) -> Option<QuotaInfo> {
+    let breakdown = json.get("usageBreakdownList").and_then(|v| v.as_array());
+    let entry = breakdown
+        .and_then(|arr| arr.first())
+        .or_else(|| json.as_object().map(|_| json));
+
+    let entry = entry?;
+
+    let limit = entry
+        .get("usageLimitWithPrecision")
+        .and_then(|v| v.as_f64())
+        .or_else(|| entry.get("usageLimit").and_then(|v| v.as_f64()))
+        .unwrap_or(f64::MAX);
+
+    let used = entry
+        .get("currentUsageWithPrecision")
+        .and_then(|v| v.as_f64())
+        .or_else(|| entry.get("currentUsage").and_then(|v| v.as_f64()))
+        .unwrap_or(0.0);
+
+    let remaining = (limit - used).max(0.0);
+
+    let days_until_reset = json
+        .get("daysUntilReset")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+
+    Some(QuotaInfo {
+        remaining,
+        limit,
+        last_checked: Instant::now(),
+        days_until_reset,
+    })
+}
+
 /// Quota cooldown manager for rate-limited accounts.
 pub struct QuotaManager {
     /// Account ID -> cooldown expiry time
     cooldowns: HashMap<String, Instant>,
     /// Default cooldown duration
     default_cooldown: Duration,
+    /// Per-account quota info from getUsageLimits
+    quota_data: HashMap<String, QuotaInfo>,
+    /// Quota check interval
+    check_interval: Duration,
+    /// Whether proactive quota checking is enabled
+    quota_check_enabled: bool,
 }
 
 impl QuotaManager {
@@ -127,7 +226,16 @@ impl QuotaManager {
         Self {
             cooldowns: HashMap::new(),
             default_cooldown: Duration::from_secs(default_cooldown_secs),
+            quota_data: HashMap::new(),
+            check_interval: Duration::from_secs(600),
+            quota_check_enabled: false,
         }
+    }
+
+    pub fn with_quota_check(mut self, enabled: bool, interval_secs: u64) -> Self {
+        self.quota_check_enabled = enabled;
+        self.check_interval = Duration::from_secs(interval_secs);
+        self
     }
 
     /// Check if an account is in cooldown.
@@ -180,6 +288,55 @@ impl QuotaManager {
             .filter(|(_, expiry)| now < **expiry)
             .map(|(id, _)| id.as_str())
             .collect()
+    }
+
+    /// Check if quota is exhausted for an account (proactive check).
+    pub fn is_quota_exhausted(&self, account_id: &str) -> bool {
+        if !self.quota_check_enabled {
+            return false;
+        }
+        self.quota_data
+            .get(account_id)
+            .map(|q| q.is_exhausted())
+            .unwrap_or(false)
+    }
+
+    /// Check if quota data is stale for an account.
+    pub fn is_quota_stale(&self, account_id: &str) -> bool {
+        self.quota_data
+            .get(account_id)
+            .map(|q| q.is_stale(self.check_interval))
+            .unwrap_or(true)
+    }
+
+    /// Update quota info for an account. Auto-sets cooldown if exhausted.
+    pub fn set_quota_info(&mut self, account_id: &str, info: QuotaInfo) {
+        if info.is_exhausted() {
+            self.set_cooldown(account_id);
+            warn!(account_id, "配额耗尽，自动进入冷却");
+        }
+        debug!(
+            account_id,
+            remaining = info.remaining,
+            limit = info.limit,
+            "配额信息已更新"
+        );
+        self.quota_data.insert(account_id.to_string(), info);
+    }
+
+    /// Get quota info for an account.
+    pub fn get_quota_info(&self, account_id: &str) -> Option<&QuotaInfo> {
+        self.quota_data.get(account_id)
+    }
+
+    /// Whether quota checking is enabled.
+    pub fn quota_check_enabled(&self) -> bool {
+        self.quota_check_enabled
+    }
+
+    /// Get the check interval.
+    pub fn check_interval(&self) -> Duration {
+        self.check_interval
     }
 }
 

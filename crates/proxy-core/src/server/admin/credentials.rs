@@ -38,6 +38,12 @@ pub(super) struct CredentialSnapshotResponse {
     pub proxy_url: Option<String>,
     pub region: String,
     pub health_score: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_remaining: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_limit: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_exhausted: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -118,6 +124,9 @@ pub(super) async fn admin_list_credentials(
             proxy_url: s.proxy_url,
             region: s.region,
             health_score: s.health_score,
+            quota_remaining: s.quota_remaining,
+            quota_limit: s.quota_limit,
+            quota_exhausted: s.quota_exhausted,
         })
         .collect();
 
@@ -172,6 +181,8 @@ pub(super) async fn admin_add_credential(
         endpoint_fallback: None,
         debug_save_requests: None,
         smart_summary_enabled: None,
+        enable_quota_check: None,
+        quota_check_interval_secs: None,
     };
 
     let id = {

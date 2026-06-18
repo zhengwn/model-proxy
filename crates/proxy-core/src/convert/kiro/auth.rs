@@ -1105,6 +1105,8 @@ mod tests {
             endpoint_fallback: None,
             debug_save_requests: None,
             smart_summary_enabled: None,
+            enable_quota_check: None,
+            quota_check_interval_secs: None,
         };
         let cred = KiroCredential::from_config(&config);
         assert_eq!(cred.auth_method, AuthMethod::Social);
