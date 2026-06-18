@@ -8,6 +8,12 @@ use crate::convert::kiro::eventstream::Event;
 use crate::convert::kiro::model_map::context_window_size;
 use crate::convert::kiro::thinking_parser::{ThinkingOutput, ThinkingParser};
 
+/// Maximum bytes for a single tool input accumulation buffer (1 MB).
+const MAX_TOOL_INPUT_BUFFER_BYTES: usize = 1024 * 1024;
+
+/// Maximum total bytes for the buffered-mode event buffer (2 MB).
+pub(super) const MAX_EVENT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+
 // ---- SSE helpers ----
 
 pub(super) fn sse_event(event: &str, data: &Value) -> String {
@@ -368,11 +374,52 @@ pub(super) fn process_event(
                 state.stop_current_block(&mut events);
             }
 
-            // Accumulate input
+            // Accumulate input (with size guard)
             let buffer = state
                 .tool_input_buffers
                 .entry(tool_use_id.clone())
                 .or_default();
+            if buffer.len() + input.len() > MAX_TOOL_INPUT_BUFFER_BYTES {
+                tracing::warn!(
+                    tool_use_id = tool_use_id.as_str(),
+                    current_len = buffer.len(),
+                    incoming_len = input.len(),
+                    limit = MAX_TOOL_INPUT_BUFFER_BYTES,
+                    "工具输入缓冲区超限，丢弃增量输入"
+                );
+                // Still need to start the block if new, but skip input accumulation
+                if !state.tool_block_indices.contains_key(tool_use_id) {
+                    state.stop_current_block(&mut events);
+                    state.close_open_tool_blocks(&mut events);
+                    let idx = state.alloc_block_index();
+                    let original_name = tool_name_map
+                        .get(name.as_str())
+                        .map(|s| s.as_str())
+                        .unwrap_or(name.as_str());
+                    events.push(sse_event(
+                        "content_block_start",
+                        &json!({
+                            "type": "content_block_start",
+                            "index": idx,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": tool_use_id,
+                                "name": original_name,
+                                "input": {}
+                            }
+                        }),
+                    ));
+                    state.tool_block_indices.insert(tool_use_id.clone(), idx);
+                    state.open_tool_blocks.push(idx);
+                }
+                if *stop {
+                    if let Some(idx) = state.tool_block_indices.get(tool_use_id) {
+                        events.push(sse_content_block_stop(*idx));
+                        state.open_tool_blocks.retain(|i| *i != *idx);
+                    }
+                }
+                return events;
+            }
             buffer.push_str(input);
 
             // Start new tool block if not yet started

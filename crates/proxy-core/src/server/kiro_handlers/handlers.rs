@@ -370,6 +370,70 @@ pub(crate) async fn handle_kiro_messages(
                     }
                 }
             }
+            Err(AppError::UpstreamStatus(status, body)) if status == 400 => {
+                // Generic 400 (not CONTENT_LENGTH_EXCEEDS): try deep sanitize → aggressive sanitize → give up
+                warn!(request_id = request_id, body_len = body.len(), "Kiro API 返回 400，尝试 sanitize 重试");
+
+                // Step 1: Try deep_sanitize (fill empty content, dedup tool results, repair orphans)
+                if let Some(history) = kiro_payload
+                    .pointer_mut("/conversationState/history")
+                    .and_then(|v| v.as_array_mut())
+                {
+                    if crate::convert::kiro::sanitize::deep_sanitize(history) {
+                        payload_bytes = serde_json::to_vec(&kiro_payload)?;
+                        match dispatch_kiro_request(&state, &kiro_payload, &payload_bytes, &auth_info, kiro_config, &request_id, false).await {
+                            Ok(r) => {
+                                info!(request_id = request_id, "deep_sanitize 重试成功");
+                                let response = handle_kiro_non_stream(
+                                    r.response, &kiro_model, &tool_name_map, &request_id,
+                                    request_start, Instant::now(), r.upstream_headers_ms,
+                                ).await;
+                                request_guard.complete();
+                                return response;
+                            }
+                            Err(AppError::UpstreamStatus(s2, _)) if s2 == 400 => {
+                                debug!("deep_sanitize 重试仍返回 400，降级到 aggressive_sanitize");
+                            }
+                            Err(e) => { request_guard.complete(); return Err(e); }
+                        }
+                    }
+                }
+
+                // Step 2: Try aggressive_sanitize (strip ALL tool history)
+                if let Some(history) = kiro_payload
+                    .pointer_mut("/conversationState/history")
+                    .and_then(|v| v.as_array_mut())
+                {
+                    if crate::convert::kiro::sanitize::aggressive_sanitize(history) {
+                        payload_bytes = serde_json::to_vec(&kiro_payload)?;
+                        match dispatch_kiro_request(&state, &kiro_payload, &payload_bytes, &auth_info, kiro_config, &request_id, false).await {
+                            Ok(r) => {
+                                info!(request_id = request_id, "aggressive_sanitize 重试成功");
+                                let response = handle_kiro_non_stream(
+                                    r.response, &kiro_model, &tool_name_map, &request_id,
+                                    request_start, Instant::now(), r.upstream_headers_ms,
+                                ).await;
+                                request_guard.complete();
+                                return response;
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "aggressive_sanitize 重试仍失败");
+                                request_guard.complete();
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+
+                // Both sanitize attempts didn't help — return original error
+                request_guard.complete();
+                return Ok((
+                    StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                    Json(json!({
+                        "type": "error", "error": { "type": "upstream_error", "message": body }
+                    })),
+                ).into_response());
+            }
             Err(AppError::UpstreamStatus(status, body)) => {
                 request_guard.complete();
                 return Ok((

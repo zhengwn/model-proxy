@@ -17,6 +17,7 @@ use tracing::{debug, error, info, warn};
 
 use super::state::{
     process_event, sse_content_block_stop, sse_event, sse_event_literal, AnthropicStreamState,
+    MAX_EVENT_BUFFER_BYTES,
 };
 use super::KEEP_ALIVE_BYTES;
 use crate::convert::anthropic_openai::stream::StreamLogContext;
@@ -483,6 +484,7 @@ pub(crate) async fn handle_stream_anthropic_output_buffered(
         }
         let mut upstream_chunks: u64 = 0;
         let mut event_buffer: Vec<String> = Vec::new();
+        let mut event_buffer_bytes: usize = 0;
 
         let log_stream_end = |reason: &str, state: &AnthropicStreamState, upstream_chunks: u64, buffered: u64| {
             let (status, error_message) = match reason {
@@ -531,7 +533,19 @@ pub(crate) async fn handle_stream_anthropic_output_buffered(
                         match Event::from_frame(&frame) {
                             Ok(event) => {
                                 let sse_events = process_event(&event, &model, &mut state, &tool_name_map);
+                                for evt in &sse_events {
+                                    event_buffer_bytes += evt.len();
+                                }
                                 event_buffer.extend(sse_events);
+                                if event_buffer_bytes > MAX_EVENT_BUFFER_BYTES {
+                                    warn!(
+                                        event_buffer_bytes,
+                                        limit = MAX_EVENT_BUFFER_BYTES,
+                                        "缓冲事件大小超限，强制结束流"
+                                    );
+                                    state.force_close = true;
+                                    break;
+                                }
                             }
                             Err(e) => warn!(error = %e, "Event 解析错误 (initial_bytes)，跳过"),
                         }
@@ -584,7 +598,19 @@ pub(crate) async fn handle_stream_anthropic_output_buffered(
                                                     &event, &model, &mut state, &tool_name_map,
                                                 );
                                                 // Buffer events instead of sending immediately
+                                                for evt in &sse_events {
+                                                    event_buffer_bytes += evt.len();
+                                                }
                                                 event_buffer.extend(sse_events);
+                                                if event_buffer_bytes > MAX_EVENT_BUFFER_BYTES {
+                                                    warn!(
+                                                        event_buffer_bytes,
+                                                        limit = MAX_EVENT_BUFFER_BYTES,
+                                                        "缓冲事件大小超限，强制结束流"
+                                                    );
+                                                    state.force_close = true;
+                                                    break;
+                                                }
                                             }
                                             Err(e) => {
                                                 warn!(error = %e, "Event 解析错误，跳过");

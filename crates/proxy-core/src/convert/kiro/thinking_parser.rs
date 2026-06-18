@@ -77,6 +77,29 @@ pub struct ThinkingParser {
     thinking_content: String,
 }
 
+/// Check if the text is inside a code fence (odd number of ``` backtick groups).
+/// An odd count means we're currently inside an open code fence.
+fn is_in_code_fence(text: &str) -> bool {
+    let mut count = 0;
+    let mut i = 0;
+    let bytes = text.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            let start = i;
+            while i < bytes.len() && bytes[i] == b'`' {
+                i += 1;
+            }
+            // Only count triple (or longer) backtick fences
+            if i - start >= 3 {
+                count += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    count % 2 == 1
+}
+
 impl ThinkingParser {
     pub fn new(mode: ThinkingHandlingMode) -> Self {
         Self {
@@ -155,6 +178,12 @@ impl ThinkingParser {
 
         for tag in &open_tags {
             if trimmed.starts_with(tag) {
+                // Quote detection: skip tag if preceded by an odd number of backticks
+                // (meaning we're inside a ``` code fence where <thinking> is literal text)
+                if is_in_code_fence(&self.buffer) {
+                    debug!(tag = tag, "thinking 标签在代码围栏内，跳过");
+                    break;
+                }
                 found_tag = Some(*tag);
                 break;
             }
@@ -377,5 +406,33 @@ mod tests {
 
         let thinking: Vec<_> = all.iter().filter(|o| matches!(o, ThinkingOutput::ThinkingDelta(_))).collect();
         assert!(!thinking.is_empty());
+    }
+
+    #[test]
+    fn test_thinking_in_code_fence_is_ignored() {
+        // When response starts with ``` followed by <thinking>, it's literal text
+        let mut parser = ThinkingParser::new(ThinkingHandlingMode::AsReasoningContent);
+        let mut all = Vec::new();
+
+        all.extend(parser.feed("```xml\n<thinking>this is code"));
+        all.extend(parser.feed("\n```\n\nActual answer."));
+        all.extend(parser.finalize());
+
+        // Everything should be content (thinking tag inside code fence is ignored)
+        let thinking: Vec<_> = all.iter().filter(|o| matches!(o, ThinkingOutput::ThinkingDelta(_))).collect();
+        let content: Vec<_> = all.iter().filter(|o| matches!(o, ThinkingOutput::ContentDelta(_))).collect();
+        assert!(thinking.is_empty(), "thinking inside code fence should be ignored");
+        assert!(!content.is_empty());
+    }
+
+    #[test]
+    fn test_is_in_code_fence() {
+        assert!(!is_in_code_fence("hello"));
+        assert!(!is_in_code_fence("```\nclosed\n```"));
+        assert!(is_in_code_fence("```\nopen fence"));
+        assert!(is_in_code_fence("```\n```\n```\nodd-count-open"));
+        assert!(!is_in_code_fence("```\n```\n```\n```\neven-count-closed"));
+        // Single backticks don't count as fences
+        assert!(!is_in_code_fence("`code`"));
     }
 }

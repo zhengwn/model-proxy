@@ -287,6 +287,143 @@ fn inject_synthetic_tool_results(msg: &mut Value, tool_use_ids: &[&str]) {
     }
 }
 
+// ---- Deep / Aggressive sanitize for 400 error recovery ----
+
+/// Deep sanitize: fill empty content, deduplicate tool results, repair orphans.
+/// Returns true if any modifications were made.
+pub fn deep_sanitize(messages: &mut Vec<Value>) -> bool {
+    let mut modified = false;
+
+    for msg in messages.iter_mut() {
+        // Fill empty assistant content with placeholder
+        if let Some(assistant) = msg.get_mut("assistantResponseMessage") {
+            let content = assistant.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            if content.is_empty() {
+                assistant["content"] = json!("Continue");
+                modified = true;
+            }
+        }
+
+        // Fill empty user content (but keep messages with tool results)
+        if let Some(user) = msg.get_mut("userInputMessage") {
+            let has_tool_results = user
+                .get("userInputMessageContext")
+                .and_then(|c| c.get("toolResults"))
+                .and_then(|v| v.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false);
+            let content = user.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            if content.is_empty() && !has_tool_results {
+                user["content"] = json!("Continue");
+                modified = true;
+            }
+        }
+
+        // Deduplicate tool_results by toolUseId (keep last)
+        if let Some(user) = msg.get_mut("userInputMessage") {
+            if let Some(results) = user
+                .pointer_mut("/userInputMessageContext/toolResults")
+                .and_then(|v| v.as_array_mut())
+            {
+                let original_len = results.len();
+                let mut seen_ids = std::collections::HashSet::new();
+                // Iterate in reverse to keep the last occurrence
+                let mut deduped: Vec<Value> = Vec::new();
+                for result in results.iter().rev() {
+                    let id = result.get("toolUseId").and_then(|v| v.as_str()).unwrap_or("");
+                    if id.is_empty() || seen_ids.insert(id.to_string()) {
+                        deduped.push(result.clone());
+                    }
+                }
+                deduped.reverse();
+                if deduped.len() != original_len {
+                    *results = deduped;
+                    modified = true;
+                }
+            }
+        }
+    }
+
+    // Re-run the standard sanitizer for orphan repair and alternation
+    let sanitizer = ConversationSanitizer {
+        enforce_boundary_guards: true,
+        insert_sentinels: true,
+    };
+    let result = sanitizer.sanitize(messages);
+    if result.inserted > 0 || result.orphans_repaired > 0 {
+        modified = true;
+    }
+
+    debug!(modified, "deep_sanitize 完成");
+    modified
+}
+
+/// Aggressive sanitize: strip ALL tool history, keep only text conversation.
+/// This is the last-resort fix when Kiro returns 400 for malformed tool data.
+/// Returns true if any modifications were made.
+pub fn aggressive_sanitize(messages: &mut Vec<Value>) -> bool {
+    let mut modified = false;
+
+    for msg in messages.iter_mut() {
+        // Strip tool_use blocks from assistant messages, keep text only
+        if let Some(assistant) = msg.get_mut("assistantResponseMessage") {
+            if let Some(content) = assistant.get("content").and_then(|v| v.as_array()) {
+                let text_only: Vec<Value> = content
+                    .iter()
+                    .filter(|block| {
+                        block.get("type").and_then(|v| v.as_str()) == Some("text")
+                    })
+                    .cloned()
+                    .collect();
+                if text_only.len() != content.len() {
+                    // Reconstruct: join text blocks into a single string
+                    let combined: String = text_only
+                        .iter()
+                        .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("");
+                    assistant["content"] = json!(if combined.is_empty() { "Continue".to_string() } else { combined });
+                    modified = true;
+                }
+            }
+            // Also clear tool_uses array if present
+            if assistant.get("tool_uses").is_some() {
+                assistant.as_object_mut().unwrap().remove("tool_uses");
+                modified = true;
+            }
+        }
+
+        // Strip toolResults from user messages
+        if let Some(user) = msg.get_mut("userInputMessage") {
+            if let Some(context) = user.get_mut("userInputMessageContext") {
+                if context.get("toolResults").is_some() {
+                    context.as_object_mut().unwrap().remove("toolResults");
+                    modified = true;
+                }
+            }
+            // Ensure user message still has content
+            let content = user.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            if content.is_empty() {
+                user["content"] = json!("Continue");
+                modified = true;
+            }
+        }
+    }
+
+    // Re-run standard sanitizer after stripping
+    let sanitizer = ConversationSanitizer {
+        enforce_boundary_guards: true,
+        insert_sentinels: true,
+    };
+    let result = sanitizer.sanitize(messages);
+    if result.inserted > 0 || result.orphans_repaired > 0 {
+        modified = true;
+    }
+
+    debug!(modified, "aggressive_sanitize 完成");
+    modified
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,5 +501,78 @@ mod tests {
         let result = sanitizer.sanitize(&mut msgs);
         // Empty user message should be stripped
         assert!(result.modified >= 1);
+    }
+
+    #[test]
+    fn deep_sanitize_fills_empty_content() {
+        let mut msgs = vec![
+            user("hi"),
+            json!({"assistantResponseMessage": {"content": ""}}),
+            user("bye"),
+        ];
+        let modified = deep_sanitize(&mut msgs);
+        assert!(modified);
+        let content = msgs[1]["assistantResponseMessage"]["content"].as_str().unwrap();
+        assert_eq!(content, "Continue");
+    }
+
+    #[test]
+    fn deep_sanitize_deduplicates_tool_results() {
+        let mut msgs = vec![
+            user("hi"),
+            assistant("ok"),
+            json!({
+                "userInputMessage": {
+                    "content": "",
+                    "userInputMessageContext": {
+                        "toolResults": [
+                            {"toolUseId": "id1", "status": "ok", "content": "first"},
+                            {"toolUseId": "id1", "status": "error", "content": "duplicate"}
+                        ]
+                    }
+                }
+            }),
+        ];
+        let modified = deep_sanitize(&mut msgs);
+        assert!(modified);
+        // Should keep the last occurrence of id1
+        let results = msgs[2]["userInputMessage"]["userInputMessageContext"]["toolResults"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["content"].as_str().unwrap(), "duplicate");
+    }
+
+    #[test]
+    fn aggressive_sanitize_strips_tool_data() {
+        let mut msgs = vec![
+            user("hi"),
+            json!({
+                "assistantResponseMessage": {
+                    "content": [
+                        {"type": "text", "text": "Let me search"},
+                        {"type": "tool_use", "id": "tu1", "name": "search", "input": {}}
+                    ],
+                    "tool_uses": [{"id": "tu1", "name": "search"}]
+                }
+            }),
+            json!({
+                "userInputMessage": {
+                    "content": "",
+                    "userInputMessageContext": {
+                        "toolResults": [{"toolUseId": "tu1", "content": "result"}]
+                    }
+                }
+            }),
+            user("continue"),
+        ];
+        let modified = aggressive_sanitize(&mut msgs);
+        assert!(modified);
+        // Assistant content should be text-only
+        let content = msgs[1]["assistantResponseMessage"]["content"].as_str().unwrap();
+        assert_eq!(content, "Let me search");
+        // tool_uses should be removed
+        assert!(msgs[1]["assistantResponseMessage"].get("tool_uses").is_none());
+        // User tool results should be stripped
+        let context = msgs[2]["userInputMessage"].get("userInputMessageContext");
+        assert!(context.is_none() || context.unwrap().get("toolResults").is_none());
     }
 }

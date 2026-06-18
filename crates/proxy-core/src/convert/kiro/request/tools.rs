@@ -59,13 +59,23 @@ pub(super) fn convert_tools(tools: &[Value], name_map: &mut HashMap<String, Stri
 }
 
 /// Shorten a tool name if it exceeds the Kiro limit.
+/// For MCP-style names (e.g. `mcp_server_filesystem_read_file`), tries extracting
+/// the last segment first, then falls back to hash-based truncation.
 /// Returns (shortened_name, was_shortened).
 pub(super) fn shorten_tool_name(name: &str) -> (String, bool) {
     if name.chars().count() <= TOOL_NAME_MAX_LEN {
         return (name.to_string(), false);
     }
 
-    // Hash-based shortening: prefix + "_" + 8 hex chars
+    // First attempt: extract last segment for MCP-style names
+    // (e.g. "mcp_server_filesystem_read_file" → "read_file")
+    if let Some(last_segment) = extract_last_segment(name) {
+        if last_segment.chars().count() <= TOOL_NAME_MAX_LEN && !last_segment.is_empty() {
+            return (last_segment.to_string(), true);
+        }
+    }
+
+    // Second attempt: hash-based shortening
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -78,6 +88,27 @@ pub(super) fn shorten_tool_name(name: &str) -> (String, bool) {
     let prefix: String = name.chars().take(prefix_len).collect();
 
     (format!("{}_{}", prefix, hash_hex), true)
+}
+
+/// Extract the last segment from an underscore or slash-separated tool name.
+/// "mcp_server_fs_read_file" → Some("read_file")
+/// "namespace/tool/action" → Some("action")
+fn extract_last_segment(name: &str) -> Option<&str> {
+    // Try underscore separator first (most common for MCP)
+    if let Some(pos) = name.rfind('_') {
+        let last = &name[pos + 1..];
+        if !last.is_empty() {
+            return Some(last);
+        }
+    }
+    // Try slash separator
+    if let Some(pos) = name.rfind('/') {
+        let last = &name[pos + 1..];
+        if !last.is_empty() {
+            return Some(last);
+        }
+    }
+    None
 }
 
 /// Normalize a JSON Schema for Kiro compatibility.
@@ -153,4 +184,60 @@ pub(super) fn normalize_json_schema(mut schema: Value) -> Value {
     obj.remove("additionalProperties");
 
     schema
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shorten_tool_name_no_change() {
+        let (name, shortened) = shorten_tool_name("read_file");
+        assert_eq!(name, "read_file");
+        assert!(!shortened);
+    }
+
+    #[test]
+    fn shorten_mcp_tool_name() {
+        // Name over 63 chars with underscore separator
+        let name = "mcp_very_long_server_name_that_exceeds_the_limit_and_more_chars_read_file";
+        let (result, shortened) = shorten_tool_name(name);
+        assert!(shortened);
+        // Last segment after final '_' is "file"
+        assert_eq!(result, "file");
+    }
+
+    #[test]
+    fn shorten_mcp_tool_name_slash() {
+        // Name over 63 chars with slash separator
+        let name = "mcp/very/long/server/name/that/exceeds/the/limit/and/has/many/segments/action";
+        let (result, shortened) = shorten_tool_name(name);
+        assert!(shortened);
+        assert_eq!(result, "action");
+    }
+
+    #[test]
+    fn shorten_tool_name_hash_fallback() {
+        // Name that exceeds limit but has no underscore/slash separators
+        let long_name = "a".repeat(100);
+        let (name, shortened) = shorten_tool_name(&long_name);
+        assert!(shortened);
+        assert!(name.chars().count() <= TOOL_NAME_MAX_LEN);
+    }
+
+    #[test]
+    fn extract_last_segment_underscore() {
+        assert_eq!(extract_last_segment("mcp_server_fs_read"), Some("read"));
+        assert_eq!(extract_last_segment("a_b_c"), Some("c"));
+    }
+
+    #[test]
+    fn extract_last_segment_slash() {
+        assert_eq!(extract_last_segment("a/b/c"), Some("c"));
+    }
+
+    #[test]
+    fn extract_last_segment_no_separator() {
+        assert_eq!(extract_last_segment("simple"), None);
+    }
 }

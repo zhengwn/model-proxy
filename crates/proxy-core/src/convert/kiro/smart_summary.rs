@@ -115,24 +115,52 @@ impl Default for SummaryCache {
 // ---- History Formatting ----
 
 /// Format history messages into a readable text for the summary prompt.
-/// Each message becomes `[user]: text` or `[assistant]: text`.
+/// Each message becomes `[role]: text` with tool call annotations.
 fn format_history_for_summary(history: &[Value]) -> String {
     let mut lines = Vec::new();
     let mut total_chars = 0;
 
     for entry in history {
-        let (role, content) = if let Some(user_msg) = entry.get("userInputMessage") {
+        let (role, content, tool_info) = if let Some(user_msg) = entry.get("userInputMessage") {
             let text = user_msg
                 .get("content")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            ("user", text)
+            // Check for tool results
+            let tool_result_count = user_msg
+                .get("userInputMessageContext")
+                .and_then(|c| c.get("toolResults"))
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let tool_info = if tool_result_count > 0 {
+                format!(" [{} tool results]", tool_result_count)
+            } else {
+                String::new()
+            };
+            ("user", text, tool_info)
         } else if let Some(assistant_msg) = entry.get("assistantResponseMessage") {
             let text = assistant_msg
                 .get("content")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            ("assistant", text)
+            // Extract tool_use names if present
+            let tool_names: Vec<String> = assistant_msg
+                .get("content")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("tool_use"))
+                        .filter_map(|b| b.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let tool_info = if !tool_names.is_empty() {
+                format!(" [tools: {}]", tool_names.join(", "))
+            } else {
+                String::new()
+            };
+            ("assistant", text, tool_info)
         } else {
             continue;
         };
@@ -144,7 +172,7 @@ fn format_history_for_summary(history: &[Value]) -> String {
             content.to_string()
         };
 
-        let line = format!("[{}]: {}", role, truncated);
+        let line = format!("[{}]{}: {}", role, tool_info, truncated);
         if total_chars + line.len() > INPUT_CAP {
             break;
         }
@@ -158,10 +186,11 @@ fn format_history_for_summary(history: &[Value]) -> String {
 /// Build the summary prompt in Chinese (matching KiroProxy's approach).
 fn build_summary_prompt(formatted: &str) -> String {
     format!(
-        "请简洁地总结以下对话历史的关键信息，包括：\n\
-         1. 用户的主要目标和需求\n\
-         2. 已完成的重要操作\n\
-         3. 当前的工作状态和上下文\n\n\
+        "请简洁地总结以下对话历史的关键信息，按以下结构输出：\n\
+         1. **目标**：用户的主要目标和需求\n\
+         2. **操作**：已完成的重要操作（特别是工具调用）\n\
+         3. **状态**：当前的工作进展和上下文\n\
+         4. **关键决策**：做出的重要决定\n\n\
          对话历史：\n\
          {}\n\n\
          请用中文输出摘要，控制在 {} 字符以内：",
@@ -453,9 +482,10 @@ mod tests {
             json!({"userInputMessage": {"content": "Rust please"}}),
         ];
         let formatted = format_history_for_summary(&history);
-        assert!(formatted.contains("[user]: Hello"));
-        assert!(formatted.contains("[assistant]: Sure"));
-        assert!(formatted.contains("[user]: Rust please"));
+        assert!(formatted.contains("[user]"));
+        assert!(formatted.contains("[assistant]"));
+        assert!(formatted.contains("Hello, help me write code"));
+        assert!(formatted.contains("Rust please"));
     }
 
     #[test]
@@ -484,6 +514,7 @@ mod tests {
         let prompt = build_summary_prompt("[user]: test");
         assert!(prompt.contains("请简洁地总结"));
         assert!(prompt.contains("[user]: test"));
+        assert!(prompt.contains("关键决策"));
         assert!(prompt.contains(&SUMMARY_MAX_LENGTH.to_string()));
     }
 
