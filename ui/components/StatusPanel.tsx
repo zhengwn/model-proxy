@@ -2,7 +2,6 @@ import {
   Card,
   Badge,
   Button,
-  Statistic,
   Alert,
   Space,
   Row,
@@ -13,7 +12,6 @@ import {
   InputNumber,
   Typography,
   Tooltip,
-  Collapse,
 } from "antd";
 import {
   PlayCircleOutlined,
@@ -191,50 +189,91 @@ function StatusPanel() {
           </Space>
         }
       >
-        <Row gutter={16}>
-          <Col span={6}>
-            <Statistic title={t("status.currentProvider")} value={activeProvider || "-"} />
-          </Col>
-          <Col span={6}>
-            <Statistic
-              title={t("status.listenAddress")}
-              value={isRunning ? status?.listen_addr ?? `${serverHost}:${serverPort}` : "-"}
-              suffix={
-                isRunning && (
-                  <Tooltip title={t("status.copyAddress")}>
-                    <CopyOutlined
-                      style={{ fontSize: 14, cursor: "pointer", color: "#1677ff" }}
-                      onClick={handleCopyAddress}
-                    />
-                  </Tooltip>
-                )
-              }
-            />
-          </Col>
-          <Col span={6}>
-            <Statistic title={t("status.totalRequests")} value={status?.total_requests ?? 0} />
-          </Col>
-          <Col span={6}>
-            <Statistic
-              title={t("status.failedRequests")}
-              value={status?.failed_requests ?? 0}
-              valueStyle={
-                (status?.failed_requests ?? 0) > 0
-                  ? { color: "#cf1322" }
-                  : undefined
-              }
-            />
-          </Col>
-        </Row>
-
-        {isRunning && status?.started_at && (
-          <div style={{ marginTop: 16 }}>
-            <Text type="secondary">
-              {t("status.startedAt", { time: formatTimestamp(status.started_at) })}
-            </Text>
-          </div>
-        )}
+        <div style={{ height: 106, display: "flex", flexDirection: "column", justifyContent: "center" }}>
+          {isRunning && status?.started_at ? (
+            <Space direction="vertical" style={{ width: "100%" }}>
+              <Text type="secondary">
+                {t("status.startedAt", { time: formatTimestamp(status.started_at) })}
+              </Text>
+              <Alert
+                type="success"
+                showIcon={false}
+                message={
+                  <Space direction="vertical" size={2}>
+                    <Text>
+                      {t("status.serviceRunningHint", { addr: "|||ADDR|||" }).split("|||ADDR|||")[0]}
+                      <Text code copyable>{`http://${localDisplayHost}:${serverPort}`}</Text>
+                      {t("status.serviceRunningHint", { addr: "|||ADDR|||" }).split("|||ADDR|||")[1]}
+                    </Text>
+                    {serverApiKey && (
+                      <Text type="secondary" style={{ fontSize: 12 }}>
+                        {t("status.apiKeyHint")}
+                      </Text>
+                    )}
+                  </Space>
+                }
+                style={{ marginTop: 8 }}
+              />
+            </Space>
+          ) : (
+            <div style={{ textAlign: "center", color: "var(--ant-color-text-secondary)" }}>
+              <StopOutlined style={{ fontSize: 24, marginBottom: 8, opacity: 0.4 }} />
+              <br />
+              <Text type="secondary" style={{ fontSize: 13 }}>
+                {t("status.stoppedHint")}
+              </Text>
+            </div>
+          )}
+        </div>
       </Card>
+
+      {/* Grid of Metric Cards */}
+      <Row gutter={[12, 12]} align="stretch">
+        <Col span={8}>
+          <Card style={{ height: "100%" }} bodyStyle={{ padding: "12px 16px" }}>
+            <Text type="secondary" style={{ fontSize: 13, display: "block", marginBottom: 6 }}>
+              {t("status.currentProvider")}
+            </Text>
+            <div style={{ fontSize: 16, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", fontWeight: 500 }}>
+              {activeProvider || "-"}
+            </div>
+          </Card>
+        </Col>
+        
+        <Col span={8}>
+          <Card style={{ height: "100%" }} bodyStyle={{ padding: "12px 16px" }}>
+            <Text type="secondary" style={{ fontSize: 13, display: "block", marginBottom: 6 }}>
+              {t("status.listenAddress")}
+            </Text>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <div style={{ fontSize: 16, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", fontWeight: 500 }}>
+                {isRunning ? status?.listen_addr ?? `${serverHost}:${serverPort}` : "-"}
+              </div>
+            </div>
+          </Card>
+        </Col>
+
+        <Col span={8}>
+          <Card style={{ height: "100%" }} bodyStyle={{ padding: "12px 16px" }}>
+            <Text type="secondary" style={{ fontSize: 13, display: "block", marginBottom: 6 }}>
+              {t("status.requestStats")}
+            </Text>
+            <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+              <div style={{ fontSize: 16, fontWeight: 500 }}>
+                {status?.total_requests ?? 0}
+              </div>
+              <div style={{ color: "var(--ant-color-text-secondary)", fontSize: 14 }}>/</div>
+              <div style={{ 
+                fontSize: 16, 
+                fontWeight: 500,
+                color: (status?.failed_requests ?? 0) > 0 ? "#cf1322" : undefined
+              }}>
+                {status?.failed_requests ?? 0}
+              </div>
+            </div>
+          </Card>
+        </Col>
+      </Row>
 
       {status?.error_message && (
         <Alert
@@ -245,16 +284,9 @@ function StatusPanel() {
         />
       )}
 
-      {/* Inline server settings */}
-      <Collapse
-        size="small"
-        items={[
-          {
-            key: "server",
-            label: t("status.serverSettings"),
-            children: (
-              <>
-                <Row gutter={[16, 12]} align="middle">
+      {/* Server settings card */}
+      <Card title={t("status.serverSettings")}>
+        <Row gutter={[16, 12]} align="middle">
                   <Col>
                     <Space>
                       <Text>Host:</Text>
@@ -328,40 +360,16 @@ function StatusPanel() {
                     )}
                   </Col>
                 </Row>
-                {configPath && (
-                  <Text
-                    type="secondary"
-                    style={{ display: "block", marginTop: 8, fontSize: 12 }}
-                  >
-                    {t("status.configFile", { path: configPath })}
-                  </Text>
-                )}
-              </>
-            ),
-          },
-        ]}
-      />
+        {configPath && (
+          <Text
+            type="secondary"
+            style={{ display: "block", marginTop: 8, fontSize: 12 }}
+          >
+            {t("status.configFile", { path: configPath })}
+          </Text>
+        )}
+      </Card>
 
-      {/* Usage hint when running */}
-      {isRunning && (
-        <Alert
-          type="success"
-          showIcon={false}
-          message={
-            <Space direction="vertical" size={2}>
-              <Text>
-                {t("status.serviceRunningHint", { addr: `${localDisplayHost}:${serverPort}` }).split("{addr}")[0]}
-                <Text code copyable>{`http://${localDisplayHost}:${serverPort}`}</Text>
-              </Text>
-              {serverApiKey && (
-                <Text type="secondary" style={{ fontSize: 12 }}>
-                  {t("status.apiKeyHint")}
-                </Text>
-              )}
-            </Space>
-          }
-        />
-      )}
     </Space>
   );
 }

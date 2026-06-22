@@ -1,5 +1,5 @@
 import { createContext, useContext, useState, useCallback, useMemo, type ReactNode } from "react";
-import { messages, antdLocales, type Locale, type Messages } from "./zh";
+import { messages, antdLocales, type Locale, type Messages } from "./locales";
 
 const STORAGE_KEY = "model-proxy-locale";
 

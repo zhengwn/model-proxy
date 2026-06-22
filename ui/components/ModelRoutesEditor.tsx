@@ -182,24 +182,6 @@ export function ModelRoutesEditor() {
 
   return (
     <div style={{ maxWidth: 780 }}>
-      {/* Explanation */}
-      <Alert
-        type="info"
-        showIcon={false}
-        style={{ marginBottom: 16 }}
-        message={
-          <div>
-            <Paragraph style={{ margin: 0 }}>
-              <strong>{t("routes.explanation")}</strong>{t("routes.explanationDesc")}
-            </Paragraph>
-            <Paragraph style={{ margin: "8px 0 0 0" }}>
-              <strong>{t("routes.matchMethod")}</strong>{t("routes.matchDesc")}
-            </Paragraph>
-          </div>
-        }
-      />
-
-      {/* Route list */}
       <Card
         size="small"
         title={t("routes.routeRules")}
@@ -210,6 +192,22 @@ export function ModelRoutesEditor() {
           </Tooltip>
         }
       >
+        {/* Explanation */}
+        <Alert
+          type="info"
+          showIcon={false}
+          style={{ marginBottom: 16 }}
+          message={
+            <div>
+              <Paragraph style={{ margin: 0 }}>
+                <strong>{t("routes.explanation")}</strong>{t("routes.explanationDesc")}
+              </Paragraph>
+              <Paragraph style={{ margin: "8px 0 0 0" }}>
+                <strong>{t("routes.matchMethod")}</strong>{t("routes.matchDesc")}
+              </Paragraph>
+            </div>
+          }
+        />
         {routes.length === 0 && (
           <Text type="secondary" style={{ display: "block", marginBottom: 12 }}>
             {t("routes.noRules")}

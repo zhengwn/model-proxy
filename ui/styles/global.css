@@ -6,21 +6,28 @@
 
 /* Theme variables */
 [data-theme="dark"] {
-  --border-color: #434343;
+  --border-color: #303030;
 }
 
 [data-theme="light"] {
-  --border-color: #d9d9d9;
+  --border-color: #e8e8e8;
 }
 
 html,
 body {
   height: 100%;
   overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif;
 }
 
 #root {
   height: 100%;
+}
+
+/* Professional Modern Cards */
+.ant-card {
+  border-radius: 12px !important;
+  overflow: hidden;
 }
 
 /* Scrollbar styling — dark (default) */

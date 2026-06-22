@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ConfigProvider, Layout, Menu, Badge, Tag, Segmented, Spin, theme } from "antd";
+import { ConfigProvider, Layout, Menu, Badge, Spin, theme, Dropdown, Button } from "antd";
 import type { MenuProps } from "antd";
 import {
   DashboardOutlined,
@@ -7,6 +7,10 @@ import {
   ApiOutlined,
   NodeIndexOutlined,
   FileTextOutlined,
+  GlobalOutlined,
+  SunOutlined,
+  MoonOutlined,
+  DesktopOutlined,
 } from "@ant-design/icons";
 import StatusPanel from "./components/StatusPanel";
 import { ProviderManager } from "./components/ProviderManager";
@@ -19,23 +23,24 @@ import { useProviders } from "./hooks/useProviders";
 import { useTheme } from "./hooks/useTheme";
 import type { ThemeMode } from "./hooks/useTheme";
 import { LocaleProvider, useLocale } from "./i18n";
-import { localeNames, type Locale } from "./i18n/zh";
+import { type Locale } from "./i18n/locales";
+
 
 const { Header, Sider, Content } = Layout;
 
 interface AppLayoutProps {
   themeMode: ThemeMode;
-  resolvedTheme: "dark" | "light";
+  resolved: "dark" | "light";
   onThemeChange: (mode: ThemeMode) => void;
 }
 
-function AppLayout({ themeMode, resolvedTheme, onThemeChange }: AppLayoutProps) {
+function AppLayout({ themeMode, resolved, onThemeChange }: AppLayoutProps) {
+  const { token } = theme.useToken();
   const [activePage, setActivePage] = useState("status");
   const { status } = useServiceStatus();
   const { activeProvider } = useProviders();
   const isRunning = status?.running ?? false;
-  const isDark = resolvedTheme === "dark";
-  const { t, locale, setLocale } = useLocale();
+  const { t, setLocale } = useLocale();
 
   const menuItems: MenuProps["items"] = [
     { key: "status", icon: <DashboardOutlined />, label: t("nav.overview") },
@@ -53,33 +58,44 @@ function AppLayout({ themeMode, resolvedTheme, onThemeChange }: AppLayoutProps) 
     logs: <LogViewer />,
   };
 
-  const themeOptions = [
-    { label: t("theme.dark"), value: "dark" },
-    { label: t("theme.light"), value: "light" },
-    { label: t("theme.system"), value: "system" },
+  const themeMenuItems = [
+    { key: "light", icon: <SunOutlined />, label: t("theme.light") },
+    { key: "dark", icon: <MoonOutlined />, label: t("theme.dark") },
+    { key: "system", icon: <DesktopOutlined />, label: t("theme.system") },
   ];
 
-  const localeOptions = Object.entries(localeNames).map(([value, label]) => ({
-    label,
-    value,
-  }));
+  const localeMenuItems = [
+    { key: "zh", label: "中文" },
+    { key: "en", label: "English" },
+  ];
+
+  const themeIcon = themeMode === "dark" ? <MoonOutlined /> : themeMode === "light" ? <SunOutlined /> : <DesktopOutlined />;
 
   return (
-    <Layout style={{ minHeight: "100vh" }}>
-      <Sider width={160} theme={isDark ? "dark" : "light"}>
+    <Layout style={{ minHeight: "100vh", background: token.colorBgLayout }}>
+      <Sider 
+        width={180} 
+        theme={resolved === "dark" ? "dark" : "light"}
+        style={{ 
+          margin: "16px 0 16px 16px",
+          borderRadius: 12,
+          border: `1px solid ${token.colorBorderSecondary}`,
+          background: token.colorBgContainer,
+          overflow: "hidden"
+        }}
+      >
         <div
           style={{
             height: 56,
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
-            borderBottom: "1px solid",
-            borderColor: isDark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.06)",
+            borderBottom: `1px solid ${token.colorBorderSecondary}`,
           }}
         >
           <span
             style={{
-              color: isDark ? "#fff" : "#1a1a1a",
+              color: token.colorText,
               fontSize: 15,
               fontWeight: 600,
             }}
@@ -89,6 +105,7 @@ function AppLayout({ themeMode, resolvedTheme, onThemeChange }: AppLayoutProps) 
         </div>
         <Menu
           mode="inline"
+          theme={resolved === "dark" ? "dark" : "light"}
           selectedKeys={[activePage]}
           onClick={(e) => setActivePage(e.key)}
           items={menuItems}
@@ -98,6 +115,8 @@ function AppLayout({ themeMode, resolvedTheme, onThemeChange }: AppLayoutProps) 
       <Layout>
         <Header
           style={{
+            background: "transparent",
+            borderBottom: "none",
             display: "flex",
             alignItems: "center",
             justifyContent: "flex-end",
@@ -106,33 +125,41 @@ function AppLayout({ themeMode, resolvedTheme, onThemeChange }: AppLayoutProps) 
             lineHeight: "48px",
           }}
         >
-          <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-            <Segmented
-              size="small"
-              value={locale}
-              onChange={(v) => setLocale(v as Locale)}
-              options={localeOptions}
-            />
-            <Segmented
-              size="small"
-              value={themeMode}
-              onChange={(v) => onThemeChange(v as ThemeMode)}
-              options={themeOptions}
-            />
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <Dropdown menu={{ items: localeMenuItems, onClick: (e) => setLocale(e.key as Locale) }} placement="bottomRight">
+              <Button type="text" icon={<GlobalOutlined />} style={{ color: token.colorTextSecondary }} />
+            </Dropdown>
+            <Dropdown menu={{ items: themeMenuItems, onClick: (e) => onThemeChange(e.key as ThemeMode) }} placement="bottomRight">
+              <Button type="text" icon={themeIcon} style={{ color: token.colorTextSecondary }} />
+            </Dropdown>
             {status ? (
               <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
                 <Badge
                   status={isRunning ? "success" : "error"}
                   text={
-                    <span style={{ fontSize: 13 }}>
+                    <span style={{ fontSize: 13, color: token.colorText }}>
                       {isRunning ? t("status.running") : t("status.stopped")}
                     </span>
                   }
                 />
                 {activeProvider && (
-                  <Tag color="blue" style={{ margin: 0 }}>
+                  <span
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      height: 24,
+                      lineHeight: "24px",
+                      fontSize: 12,
+                      color: token.colorText,
+                      background: token.colorBgContainer,
+                      padding: "0 10px",
+                      borderRadius: 12,
+                      border: `1px solid ${token.colorBorderSecondary}`,
+                      boxShadow: "0 1px 2px rgba(0,0,0,0.03)"
+                    }}
+                  >
                     {activeProvider}
-                  </Tag>
+                  </span>
                 )}
               </div>
             ) : (
@@ -145,6 +172,7 @@ function AppLayout({ themeMode, resolvedTheme, onThemeChange }: AppLayoutProps) 
             padding: 20,
             overflow: "auto",
             height: "calc(100vh - 48px)",
+            background: token.colorBgLayout,
           }}
         >
           {PAGE_MAP[activePage] ?? <StatusPanel />}
@@ -165,12 +193,20 @@ function App() {
         theme={{
           algorithm: resolved === "dark" ? theme.darkAlgorithm : theme.defaultAlgorithm,
           token: {
-            colorPrimary: "#1677ff",
-            borderRadius: 6,
+            colorPrimary: "#1677ff", // Classic professional blue
+            borderRadius: 12,
+            fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'PingFang SC', 'Helvetica Neue', sans-serif",
+            ...(resolved === "dark"
+              ? {
+                  colorBgLayout: "#141414",
+                  colorBgContainer: "#1f1f1f",
+                  colorBgElevated: "#2a2a2a",
+                }
+              : {}),
           },
         }}
       >
-        <AppLayout themeMode={mode} resolvedTheme={resolved} onThemeChange={setMode} />
+        <AppLayout themeMode={mode} resolved={resolved} onThemeChange={setMode} />
       </ConfigProvider>
     </ErrorBoundary>
   );

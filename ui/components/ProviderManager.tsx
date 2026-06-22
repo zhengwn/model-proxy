@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Spin, Alert, Button, Modal, Drawer, message } from "antd";
+import { Spin, Alert, Button, Modal, Drawer, message, Card } from "antd";
 import { PlusOutlined } from "@ant-design/icons";
 import { useProviders } from "../hooks/useProviders";
 import { ProviderList } from "./ProviderList";
@@ -101,7 +101,7 @@ export function ProviderManager() {
   const isEditing = !!editingProvider;
 
   return (
-    <div>
+    <Card>
       {error && (
         <Alert
           message={error}
@@ -111,7 +111,7 @@ export function ProviderManager() {
           style={{ marginBottom: 16 }}
         />
       )}
-      <div style={{ marginBottom: 16 }}>
+      <div style={{ marginBottom: 16, display: "flex", justifyContent: "space-between" }}>
         <Button
           type="primary"
           icon={<PlusOutlined />}
@@ -157,6 +157,6 @@ export function ProviderManager() {
           defaultTemplate={isEditing ? undefined : "deepseek"}
         />
       </Drawer>
-    </div>
+    </Card>
   );
 }

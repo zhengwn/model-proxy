@@ -77,6 +77,8 @@ const zhMessages = {
   "status.serviceRunningHint":
     "服务已启动，将 IDE 的 API Base URL 设置为 {addr}",
   "status.apiKeyHint": "API Key 设置为你上方配置的值",
+  "status.requestStats": "请求统计 (总数 / 失败)",
+  "status.stoppedHint": "代理服务未启动。请在下方配置服务器参数后，点击右上角启动服务。",
 
   // ---- provider ----
   "provider.cannotDelete": "无法删除",
@@ -384,6 +386,8 @@ const enMessages: Messages = {
   "status.serviceRunningHint":
     "Service is running. Set your IDE's API Base URL to {addr}",
   "status.apiKeyHint": "Set API Key to the value configured above",
+  "status.requestStats": "Request Stats (Total / Failed)",
+  "status.stoppedHint": "Proxy service is not running. Configure parameters below and click Start.",
 
   // ---- provider ----
   "provider.cannotDelete": "Cannot Delete",

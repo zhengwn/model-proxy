@@ -10,7 +10,6 @@ import {
   Input,
   Select,
   Switch,
-  Collapse,
   Statistic,
   Row,
   Col,
@@ -45,15 +44,9 @@ export default function KiroPanel() {
       <CredentialManager />
       <EndpointDashboard />
       <SettingsPanel />
-      <Collapse
-        items={[
-          {
-            key: "auth",
-            label: t("kiro.ssoLogin"),
-            children: <AuthFlows />,
-          },
-        ]}
-      />
+      <Card title={t("kiro.ssoLogin")}>
+        <AuthFlows />
+      </Card>
     </div>
   );
 }

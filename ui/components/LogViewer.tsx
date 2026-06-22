@@ -6,12 +6,15 @@ import {
   Tag,
   Select,
   Input,
-  Collapse,
   Form,
   Switch,
   InputNumber,
   message,
   Tooltip,
+  Card,
+  Row,
+  Col,
+  Drawer,
 } from "antd";
 import { DeleteOutlined, SearchOutlined, SettingOutlined } from "@ant-design/icons";
 import { listen } from "@tauri-apps/api/event";
@@ -26,7 +29,7 @@ import {
   RETENTION_DAYS_MAX,
 } from "../utils/loggingValidation";
 import { useLocale } from "../i18n";
-import type { Messages } from "../i18n/zh";
+import type { Messages } from "../i18n/locales";
 
 const MAX_LOG_ENTRIES = 100;
 
@@ -223,13 +226,12 @@ function LogSettings() {
   if (loading) return null;
 
   return (
-    <Form form={form} layout="inline" size="small" style={{ marginBottom: 8 }}>
+    <Form form={form} layout="vertical">
       <Form.Item name="enabled" valuePropName="checked" label={t("log.enabled")}>
-        <Switch size="small" />
+        <Switch />
       </Form.Item>
       <Form.Item name="level" label={t("log.level")}>
         <Select
-          style={{ width: 110 }}
           options={[
             { value: "all", label: t("log.allRequests") },
             { value: "errors_only", label: t("log.errorsOnly") },
@@ -237,48 +239,27 @@ function LogSettings() {
         />
       </Form.Item>
       <Form.Item name="record_body" valuePropName="checked" label={t("log.recordBody")}>
-        <Switch size="small" />
+        <Switch />
       </Form.Item>
       <Form.Item
         name="max_body_bytes"
         label={t("log.maxBytes")}
-        rules={[
-          {
-            type: "number",
-            min: MAX_BODY_BYTES_MIN,
-            max: MAX_BODY_BYTES_MAX,
-          },
-        ]}
+        rules={[{ type: "number", min: MAX_BODY_BYTES_MIN, max: MAX_BODY_BYTES_MAX }]}
       >
-        <InputNumber
-          min={MAX_BODY_BYTES_MIN}
-          max={MAX_BODY_BYTES_MAX}
-          step={1024}
-          style={{ width: 100 }}
-        />
+        <InputNumber min={MAX_BODY_BYTES_MIN} max={MAX_BODY_BYTES_MAX} step={1024} style={{ width: "100%" }} />
       </Form.Item>
       <Form.Item
         name="retention_days"
         label={t("log.retentionDays")}
-        rules={[
-          {
-            type: "number",
-            min: RETENTION_DAYS_MIN,
-            max: RETENTION_DAYS_MAX,
-          },
-        ]}
+        rules={[{ type: "number", min: RETENTION_DAYS_MIN, max: RETENTION_DAYS_MAX }]}
       >
-        <InputNumber
-          min={RETENTION_DAYS_MIN}
-          max={RETENTION_DAYS_MAX}
-          style={{ width: 70 }}
-        />
+        <InputNumber min={RETENTION_DAYS_MIN} max={RETENTION_DAYS_MAX} style={{ width: "100%" }} />
       </Form.Item>
-      <Form.Item>
-        <Button type="primary" size="small" onClick={handleSave}>
+      <div style={{ marginTop: 24 }}>
+        <Button type="primary" block onClick={handleSave}>
           {t("common.save")}
         </Button>
-      </Form.Item>
+      </div>
     </Form>
   );
 }
@@ -288,6 +269,7 @@ function LogViewer() {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [providerFilter, setProviderFilter] = useState<string | undefined>(undefined);
   const [keyword, setKeyword] = useState<string>("");
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const tableRef = useRef<HTMLDivElement>(null);
   const { t } = useLocale();
 
@@ -335,56 +317,52 @@ function LogViewer() {
   };
 
   return (
-    <div ref={tableRef}>
-      <Collapse
+    <div ref={tableRef} style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <Card
+        title={t("nav.requestLogs")}
         size="small"
-        style={{ marginBottom: 16 }}
-        items={[
-          {
-            key: "settings",
-            label: (
-              <span>
-                <SettingOutlined style={{ marginRight: 8 }} />
-                {t("log.settings")}
-              </span>
-            ),
-            children: <LogSettings />,
-          },
-        ]}
-      />
-      <Space style={{ marginBottom: 16 }} wrap>
-        <Button icon={<DeleteOutlined />} onClick={handleClear} disabled={logs.length === 0}>
-          {t("log.clearLogs")}
-        </Button>
-        <Select
-          value={statusFilter}
-          onChange={setStatusFilter}
-          options={statusFilterOptions}
-          style={{ width: 100 }}
-          size="small"
-        />
-        <Select
-          value={providerFilter}
-          onChange={setProviderFilter}
-          placeholder="Provider"
-          allowClear
-          style={{ width: 140 }}
-          size="small"
-          options={uniqueProviders.map((p) => ({ label: p, value: p }))}
-        />
-        <Input
-          prefix={<SearchOutlined />}
-          placeholder={t("log.searchPlaceholder")}
-          value={keyword}
-          onChange={(e) => setKeyword(e.target.value)}
-          allowClear
-          style={{ width: 200 }}
-          size="small"
-        />
-        <span style={{ color: "#999", fontSize: 12 }}>
-          {t("log.displayCount", { filtered: filteredLogs.length, total: logs.length, max: MAX_LOG_ENTRIES })}
-        </span>
-      </Space>
+        extra={
+          <Space size="middle">
+            <span style={{ color: "var(--ant-color-text-secondary)", fontSize: 13 }}>
+              {t("log.displayCount", { filtered: filteredLogs.length, total: logs.length, max: MAX_LOG_ENTRIES })}
+            </span>
+            <Button type="text" size="small" icon={<SettingOutlined />} onClick={() => setSettingsOpen(true)} />
+          </Space>
+        }
+      >
+        <div style={{ marginBottom: 12 }}>
+          <Space wrap size="small">
+            <Button danger size="small" icon={<DeleteOutlined />} onClick={handleClear} disabled={logs.length === 0}>
+              {t("log.clearLogs")}
+            </Button>
+            <div style={{ width: 1, height: 16, background: "var(--ant-color-border)", margin: "0 4px", opacity: 0.6 }} />
+            <Select
+              size="small"
+              value={statusFilter}
+              onChange={setStatusFilter}
+              options={statusFilterOptions}
+              style={{ width: 100 }}
+            />
+            <Select
+              size="small"
+              value={providerFilter}
+              onChange={setProviderFilter}
+              placeholder="Provider"
+              allowClear
+              style={{ width: 130 }}
+              options={uniqueProviders.map((p) => ({ label: p, value: p }))}
+            />
+            <Input
+              size="small"
+              prefix={<SearchOutlined style={{ color: "var(--ant-color-text-secondary)" }} />}
+              placeholder={t("log.searchPlaceholder")}
+              value={keyword}
+              onChange={(e) => setKeyword(e.target.value)}
+              allowClear
+              style={{ width: 200 }}
+            />
+          </Space>
+        </div>
       <Table
         columns={columns}
         dataSource={filteredLogs}
@@ -395,6 +373,16 @@ function LogViewer() {
         scroll={{ x: 1524, y: 400 }}
         locale={{ emptyText: t("log.noLogs") }}
       />
+      </Card>
+      <Drawer
+        title={t("log.settings")}
+        placement="right"
+        onClose={() => setSettingsOpen(false)}
+        open={settingsOpen}
+        width={320}
+      >
+        <LogSettings />
+      </Drawer>
     </div>
   );
 }
