@@ -218,10 +218,14 @@ function App() {
   );
 }
 
+import { ProvidersProvider } from "./hooks/useProviders";
+
 function AppRoot() {
   return (
     <LocaleProvider>
-      <App />
+      <ProvidersProvider>
+        <App />
+      </ProvidersProvider>
     </LocaleProvider>
   );
 }

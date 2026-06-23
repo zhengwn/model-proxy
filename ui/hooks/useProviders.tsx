@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import React, { createContext, useContext, useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { ProviderConfig, ProvidersInfo } from "../types";
 
@@ -15,7 +15,9 @@ interface UseProvidersReturn {
   deleteProvider: (name: string) => Promise<void>;
 }
 
-export function useProviders(): UseProvidersReturn {
+const ProvidersContext = createContext<UseProvidersReturn | null>(null);
+
+export function ProvidersProvider({ children }: { children: React.ReactNode }) {
   const [providers, setProviders] = useState<ProviderConfig[]>([]);
   const [activeProvider, setActiveProvider] = useState<string>("");
   const [loading, setLoading] = useState(true);
@@ -31,7 +33,6 @@ export function useProviders(): UseProvidersReturn {
       setActiveProvider(result.active_provider);
     } catch (e) {
       const errMsg = typeof e === "string" ? e : String(e);
-      // If config file doesn't exist yet (first launch), show empty state
       if (errMsg.includes("不存在")) {
         setProviders([]);
         setActiveProvider("");
@@ -49,6 +50,7 @@ export function useProviders(): UseProvidersReturn {
     try {
       await invoke("switch_provider", { name });
       setActiveProvider(name);
+      window.dispatchEvent(new CustomEvent("provider-switched"));
     } catch (e) {
       const errMsg = typeof e === "string" ? e : String(e);
       setError(errMsg);
@@ -98,16 +100,30 @@ export function useProviders(): UseProvidersReturn {
     loadProviders();
   }, [loadProviders]);
 
-  return {
-    providers,
-    activeProvider,
-    loading,
-    error,
-    switching,
-    loadProviders,
-    switchProvider,
-    addProvider,
-    updateProvider,
-    deleteProvider,
-  };
+  return (
+    <ProvidersContext.Provider
+      value={{
+        providers,
+        activeProvider,
+        loading,
+        error,
+        switching,
+        loadProviders,
+        switchProvider,
+        addProvider,
+        updateProvider,
+        deleteProvider,
+      }}
+    >
+      {children}
+    </ProvidersContext.Provider>
+  );
+}
+
+export function useProviders(): UseProvidersReturn {
+  const context = useContext(ProvidersContext);
+  if (!context) {
+    throw new Error("useProviders must be used within a ProvidersProvider");
+  }
+  return context;
 }
