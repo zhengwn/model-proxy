@@ -123,8 +123,7 @@ async fn start_server_with_state(
         );
     }
 
-    // Build admin routes (has its own auth middleware)
-    let admin_routes = server::admin::admin_router(state.clone());
+    // Admin routes removed
 
     let scheduler_state = state.clone();
 
@@ -146,7 +145,7 @@ async fn start_server_with_state(
         .route("/api/kiro/social/start", post(proxy_kiro_social_start))
         .route("/api/kiro/social/exchange", post(proxy_kiro_social_exchange))
         .route("/api/event_logging/batch", post(event_logging_batch))
-        .merge(admin_routes)
+        // Admin routes removed
         // Client auth middleware (skips /health, /metrics, /v1/models, /api/admin/*)
         .layer(middleware::from_fn_with_state(
             state.clone(),

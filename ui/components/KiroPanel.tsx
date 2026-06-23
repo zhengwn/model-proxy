@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   Card,
   Table,
@@ -39,6 +39,7 @@ const { Text } = Typography;
 
 export default function KiroPanel() {
   const { t } = useLocale();
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
       <CredentialManager />
@@ -57,20 +58,32 @@ function CredentialManager() {
   const kiro = useKiroAdmin();
   const { t } = useLocale();
   const [creds, setCreds] = useState<KiroCredential[]>([]);
+  const [credLoading, setCredLoading] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
   const [detailId, setDetailId] = useState<string | null>(null);
   const [detail, setDetail] = useState<unknown>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const isMounted = useRef(true);
+
+  useEffect(() => {
+    isMounted.current = true;
+    return () => { isMounted.current = false; };
+  }, []);
+
+  const { listCredentials, addCredential, testCredential, deleteCredential, setDisabled, batchCredentials, refreshCredential, getCredentialFull } = kiro;
 
   const refresh = useCallback(async () => {
+    if (isMounted.current) setCredLoading(true);
     try {
-      const data = await kiro.listCredentials();
+      const data = await listCredentials();
       const list = Array.isArray(data) ? data : (data as Record<string, unknown>)?.credentials ?? [];
-      setCreds(list as KiroCredential[]);
+      if (isMounted.current) setCreds(list as KiroCredential[]);
     } catch {
       // error shown by hook
+    } finally {
+      if (isMounted.current) setCredLoading(false);
     }
-  }, [kiro]);
+  }, [listCredentials]);
 
   useEffect(() => {
     refresh();
@@ -78,7 +91,7 @@ function CredentialManager() {
 
   const handleTest = async (id: string) => {
     try {
-      const result = (await kiro.testCredential(id)) as unknown as Record<string, unknown>;
+      const result = (await testCredential(id)) as unknown as Record<string, unknown>;
       if (result?.success) {
         message.success(t("kiro.testPassed", { latency: result.latency_ms as number }));
       } else {
@@ -91,7 +104,7 @@ function CredentialManager() {
 
   const handleDelete = async (id: string) => {
     try {
-      await kiro.deleteCredential(id);
+      await deleteCredential(id);
       message.success(t("kiro.deleted"));
       refresh();
     } catch {
@@ -101,7 +114,7 @@ function CredentialManager() {
 
   const handleToggle = async (id: string, disabled: boolean) => {
     try {
-      await kiro.setDisabled(id, disabled);
+      await setDisabled(id, disabled);
       message.success(disabled ? t("kiro.disabled") : t("kiro.enabled"));
       refresh();
     } catch {
@@ -115,7 +128,7 @@ function CredentialManager() {
       return;
     }
     try {
-      const result = (await kiro.batchCredentials(selectedIds, action)) as unknown as Record<string, unknown>;
+      const result = (await batchCredentials(selectedIds, action)) as unknown as Record<string, unknown>;
       message.success(t("kiro.batchDone", { count: ((result?.results as string[])?.length ?? 0) as number }));
       setSelectedIds([]);
       refresh();
@@ -126,7 +139,7 @@ function CredentialManager() {
 
   const handleDetail = async (id: string) => {
     try {
-      const data = await kiro.getCredentialFull(id);
+      const data = await getCredentialFull(id);
       setDetail(data);
       setDetailId(id);
     } catch {
@@ -212,7 +225,7 @@ function CredentialManager() {
             icon={<ReloadOutlined />}
             onClick={async () => {
               try {
-                await kiro.refreshCredential(record.id);
+                await refreshCredential(record.id);
                 message.success(t("kiro.refreshed"));
                 refresh();
               } catch {}
@@ -276,7 +289,10 @@ function CredentialManager() {
           selectedRowKeys: selectedIds,
           onChange: (keys) => setSelectedIds(keys as string[]),
         }}
-        loading={kiro.loading}
+        loading={credLoading}
+        locale={{
+          emptyText: <div style={{ padding: '40px 0', color: '#888' }}>{t("kiro.emptyCredentials")}</div>
+        }}
       />
 
       <AddCredentialModal
@@ -286,7 +302,8 @@ function CredentialManager() {
           setAddOpen(false);
           refresh();
         }}
-        kiro={kiro}
+        addCredential={addCredential}
+        loading={kiro.loading}
       />
 
       <Modal
@@ -311,12 +328,14 @@ function AddCredentialModal({
   open,
   onClose,
   onAdded,
-  kiro,
+  addCredential,
+  loading,
 }: {
   open: boolean;
   onClose: () => void;
   onAdded: () => void;
-  kiro: ReturnType<typeof useKiroAdmin>;
+  addCredential: ReturnType<typeof useKiroAdmin>['addCredential'];
+  loading: boolean;
 }) {
   const [form] = Form.useForm();
   const { t } = useLocale();
@@ -324,7 +343,7 @@ function AddCredentialModal({
   const handleOk = async () => {
     try {
       const values = await form.validateFields();
-      await kiro.addCredential(
+      await addCredential(
         values.refresh_token,
         values.auth_method,
         values.region,
@@ -344,7 +363,7 @@ function AddCredentialModal({
       open={open}
       onCancel={onClose}
       onOk={handleOk}
-      confirmLoading={kiro.loading}
+      confirmLoading={loading}
     >
       <Form form={form} layout="vertical">
         <Form.Item
@@ -387,15 +406,16 @@ function EndpointDashboard() {
   const kiro = useKiroAdmin();
   const { t } = useLocale();
   const [health, setHealth] = useState<KiroEndpointHealth | null>(null);
+  const { getEndpointHealth } = kiro;
 
   const refresh = useCallback(async () => {
     try {
-      const data = await kiro.getEndpointHealth();
+      const data = await getEndpointHealth();
       setHealth(data);
     } catch {
       // handled
     }
-  }, [kiro]);
+  }, [getEndpointHealth]);
 
   useEffect(() => {
     refresh();
@@ -460,16 +480,17 @@ function SettingsPanel() {
   const { t } = useLocale();
   const [thinking, setThinkingState] = useState<KiroThinkingConfig | null>(null);
   const [settings, setSettingsState] = useState<KiroSettings | null>(null);
+  const { getThinking, getSettings, setThinking, setSettings } = kiro;
 
   const refresh = useCallback(async () => {
     try {
-      const [thinkingData, s] = await Promise.all([kiro.getThinking(), kiro.getSettings()]);
+      const [thinkingData, s] = await Promise.all([getThinking(), getSettings()]);
       setThinkingState(thinkingData);
       setSettingsState(s);
     } catch {
       // handled
     }
-  }, [kiro]);
+  }, [getThinking, getSettings]);
 
   useEffect(() => {
     refresh();
@@ -477,7 +498,7 @@ function SettingsPanel() {
 
   const handleThinkingChange = async (mode: string) => {
     try {
-      await kiro.setThinking(mode);
+      await setThinking(mode);
       message.success(t("kiro.thinkingUpdated"));
       setThinkingState({ mode });
     } catch {
@@ -487,7 +508,7 @@ function SettingsPanel() {
 
   const handleSettingsChange = async (field: string, value: unknown) => {
     try {
-      await kiro.setSettings(
+      await setSettings(
         field === "preferred_endpoint" ? (value as string) : settings?.preferred_endpoint,
         field === "endpoint_fallback" ? (value as boolean) : settings?.endpoint_fallback
       );
@@ -547,26 +568,29 @@ function SettingsPanel() {
       </Card>
 
       <Card title={t("kiro.loadBalance")}>
-        <LoadBalanceConfig kiro={kiro} />
+        <LoadBalanceConfig getLbConfig={kiro.getLbConfig} setLbConfig={kiro.setLbConfig} />
       </Card>
     </Space>
   );
 }
 
-function LoadBalanceConfig({ kiro }: { kiro: ReturnType<typeof useKiroAdmin> }) {
+function LoadBalanceConfig({ getLbConfig, setLbConfig }: { 
+  getLbConfig: ReturnType<typeof useKiroAdmin>['getLbConfig'],
+  setLbConfig: ReturnType<typeof useKiroAdmin>['setLbConfig'] 
+}) {
   const { t } = useLocale();
   const [mode, setMode] = useState<string>("priority");
 
   useEffect(() => {
-    kiro.getLbConfig().then((data: unknown) => {
+    getLbConfig().then((data: unknown) => {
       const d = data as Record<string, unknown>;
       if (d?.mode) setMode(d.mode as string);
     }).catch(() => {});
-  }, [kiro]);
+  }, [getLbConfig]);
 
   const handleChange = async (newMode: string) => {
     try {
-      await kiro.setLbConfig(newMode);
+      await setLbConfig(newMode);
       setMode(newMode);
       message.success(t("kiro.lbUpdated"));
     } catch {

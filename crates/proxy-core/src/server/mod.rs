@@ -1,4 +1,4 @@
-pub(crate) mod admin;
+
 pub mod auth;
 pub mod dns_cache;
 mod fallback;

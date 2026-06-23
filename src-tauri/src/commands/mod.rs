@@ -65,17 +65,7 @@ fn validate_url_not_local(url: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Sanitize a credential ID to prevent path injection.
-/// Only allows alphanumeric characters, hyphens, and underscores.
-fn sanitize_credential_id(id: &str) -> Result<String, String> {
-    if id.is_empty() || id.len() > 128 {
-        return Err("Invalid credential ID length".to_string());
-    }
-    if !id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
-        return Err("Credential ID contains invalid characters".to_string());
-    }
-    Ok(id.to_string())
-}
+
 
 /// Response payload for the `get_providers` command.
 #[derive(Debug, Clone, Serialize)]

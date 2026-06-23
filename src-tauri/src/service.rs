@@ -29,6 +29,7 @@ struct ServiceInner {
     handle: Option<JoinHandle<()>>,
     token: Option<CancellationToken>,
     counters: Option<RequestCounters>,
+    app_state: Option<ProxyCoreAppState>,
 }
 
 impl ServiceInner {
@@ -41,6 +42,7 @@ impl ServiceInner {
             handle: None,
             token: None,
             counters: None,
+            app_state: None,
         }
     }
 
@@ -108,6 +110,7 @@ impl ServiceManager {
         inner.handle = Some(handle);
         inner.token = Some(token);
         inner.counters = Some(RequestCounters::new());
+        inner.app_state = None;
 
         info!("代理服务已启动，监听 {}", listen_addr);
         Ok(())
@@ -135,7 +138,7 @@ impl ServiceManager {
         let host = state.config.server.host.clone();
         let token = cancel_token.unwrap_or_default();
         let handle =
-            proxy_core::start_server_shared(state, port, token.clone(), Some(counters.clone()))
+            proxy_core::start_server_shared(state.clone(), port, token.clone(), Some(counters.clone()))
                 .await
                 .map_err(|e| format!("端口占用或启动失败: {}", e))?;
 
@@ -149,6 +152,7 @@ impl ServiceManager {
         inner.handle = Some(handle);
         inner.token = Some(token);
         inner.counters = Some(counters);
+        inner.app_state = Some(state);
 
         info!("代理服务已启动（共享模式），监听 {}", listen_addr);
         Ok(())
@@ -184,6 +188,7 @@ impl ServiceManager {
         inner.running = false;
         inner.listen_addr = None;
         inner.error_message = None;
+        inner.app_state = None;
 
         info!("代理服务已停止");
         Ok(())
@@ -193,6 +198,12 @@ impl ServiceManager {
     pub async fn get_status(&self) -> ServiceStatus {
         let inner = self.inner.lock().await;
         inner.status()
+    }
+
+    /// Get a clone of the currently running ProxyCoreAppState (if any).
+    pub async fn get_app_state(&self) -> Option<ProxyCoreAppState> {
+        let inner = self.inner.lock().await;
+        inner.app_state.clone()
     }
 }
 

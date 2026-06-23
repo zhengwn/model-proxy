@@ -224,6 +224,9 @@ fn default_kiro_region() -> String {
 /// 多账户凭据池中的单个账户配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KiroAccountEntry {
+    /// 唯一标识符（新增），用于持久化跟踪
+    #[serde(default)]
+    pub id: Option<String>,
     /// 认证方式: "social" | "idc" | "api_key"（默认继承 kiro_config.auth_method）
     #[serde(default)]
     pub auth_method: Option<String>,

@@ -212,6 +212,7 @@ const zhMessages = {
   "kiro.consecutiveErrors": "连续错误: {n}",
   "kiro.noEndpointData":
     "暂无端点数据。代理服务启动后将自动记录端点健康状态。",
+  "kiro.emptyCredentials": "当前没有任何账号，请点击右上角的\"添加账户\"按钮进行配置。",
   "kiro.thinkingUpdated": "Thinking 模式已更新",
   "kiro.settingsUpdated": "设置已更新",
   "kiro.thinkingMode": "Thinking 模式",
@@ -521,6 +522,7 @@ const enMessages: Messages = {
   "kiro.consecutiveErrors": "Consecutive errors: {n}",
   "kiro.noEndpointData":
     "No endpoint data yet. Endpoint health will be recorded after the proxy service starts.",
+  "kiro.emptyCredentials": "No accounts configured. Click the \"Add Account\" button in the top right to get started.",
   "kiro.thinkingUpdated": "Thinking mode updated",
   "kiro.settingsUpdated": "Settings updated",
   "kiro.thinkingMode": "Thinking Mode",

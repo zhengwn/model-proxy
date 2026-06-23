@@ -202,7 +202,7 @@ fn collect_kiro_accounts(kiro_config: &KiroConfig, provider_name: &str) -> Vec<(
         .iter()
         .enumerate()
         .map(|(i, entry)| {
-            let id = format!("{}:{}", provider_name, i);
+            let id = entry.id.clone().unwrap_or_else(|| format!("{}:{}", provider_name, i));
             let cfg = KiroConfig {
                 auth_method: entry
                     .auth_method
