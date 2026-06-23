@@ -320,13 +320,14 @@ function LogViewer() {
     <div ref={tableRef} style={{ display: "flex", flexDirection: "column", gap: 12 }}>
       <Card
         title={t("nav.requestLogs")}
-        size="small"
         extra={
           <Space size="middle">
             <span style={{ color: "var(--ant-color-text-secondary)", fontSize: 13 }}>
               {t("log.displayCount", { filtered: filteredLogs.length, total: logs.length, max: MAX_LOG_ENTRIES })}
             </span>
-            <Button type="text" size="small" icon={<SettingOutlined />} onClick={() => setSettingsOpen(true)} />
+            <Button icon={<SettingOutlined />} onClick={() => setSettingsOpen(true)}>
+              {t("log.settings")}
+            </Button>
           </Space>
         }
       >

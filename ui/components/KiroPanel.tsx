@@ -504,7 +504,7 @@ function SettingsPanel() {
         <Alert type="error" message={kiro.error} closable onClose={() => kiro.setError(null)} />
       )}
 
-      <Card title={t("kiro.thinkingMode")} size="small">
+      <Card title={t("kiro.thinkingMode")}>
         <Form layout="inline">
           <Form.Item label={t("kiro.mode")}>
             <Select
@@ -522,7 +522,7 @@ function SettingsPanel() {
         </Form>
       </Card>
 
-      <Card title={t("kiro.endpointConfig")} size="small">
+      <Card title={t("kiro.endpointConfig")}>
         <Form layout="inline">
           <Form.Item label={t("kiro.preferredEndpoint")}>
             <Select
@@ -546,7 +546,7 @@ function SettingsPanel() {
         </Form>
       </Card>
 
-      <Card title={t("kiro.loadBalance")} size="small">
+      <Card title={t("kiro.loadBalance")}>
         <LoadBalanceConfig kiro={kiro} />
       </Card>
     </Space>
@@ -667,7 +667,7 @@ function AuthFlows() {
         <Alert type="error" message={kiro.error} closable onClose={() => kiro.setError(null)} />
       )}
 
-      <Card title={t("kiro.ssoImport")} size="small" extra={<SafetyOutlined />}>
+      <Card title={t("kiro.ssoImport")} extra={<SafetyOutlined />}>
         <Text type="secondary" style={{ display: "block", marginBottom: 12 }}>
           {t("kiro.ssoImportDesc")}
         </Text>
@@ -705,7 +705,7 @@ function AuthFlows() {
         </Form>
       </Card>
 
-      <Card title={t("kiro.iamLogin")} size="small" extra={<SafetyOutlined />}>
+      <Card title={t("kiro.iamLogin")} extra={<SafetyOutlined />}>
         <Text type="secondary" style={{ display: "block", marginBottom: 12 }}>
           {t("kiro.iamLoginDesc")}
         </Text>

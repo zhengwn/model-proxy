@@ -204,6 +204,12 @@ function App() {
                 }
               : {}),
           },
+          components: {
+            Menu: {
+              itemMarginInline: 12,
+              itemBorderRadius: 8,
+            },
+          },
         }}
       >
         <AppLayout themeMode={mode} resolved={resolved} onThemeChange={setMode} />

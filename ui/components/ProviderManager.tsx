@@ -101,17 +101,9 @@ export function ProviderManager() {
   const isEditing = !!editingProvider;
 
   return (
-    <Card>
-      {error && (
-        <Alert
-          message={error}
-          type="error"
-          showIcon
-          closable
-          style={{ marginBottom: 16 }}
-        />
-      )}
-      <div style={{ marginBottom: 16, display: "flex", justifyContent: "space-between" }}>
+    <Card
+      title={t("nav.providers")}
+      extra={
         <Button
           type="primary"
           icon={<PlusOutlined />}
@@ -122,7 +114,17 @@ export function ProviderManager() {
         >
           {t("provider.addProvider")}
         </Button>
-      </div>
+      }
+    >
+      {error && (
+        <Alert
+          message={error}
+          type="error"
+          showIcon
+          closable
+          style={{ marginBottom: 16 }}
+        />
+      )}
       {providers.length === 0 && !error ? (
         <Alert
           message={t("provider.notConfigured")}

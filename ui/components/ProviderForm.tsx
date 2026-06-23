@@ -235,7 +235,7 @@ export function ProviderForm({
       style={{ maxWidth: 640 }}
       initialValues={computedInitialValues}
     >
-      <Card title={t("providerForm.basicInfo")} size="small" style={{ marginBottom: 16 }}>
+      <Card title={t("providerForm.basicInfo")} style={{ marginBottom: 16 }}>
         {mode === "add" && (
           <Form.Item label={t("providerForm.fromTemplate")}>
             <Select

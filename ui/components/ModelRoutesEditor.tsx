@@ -183,26 +183,31 @@ export function ModelRoutesEditor() {
   return (
     <div style={{ maxWidth: 780 }}>
       <Card
-        size="small"
         title={t("routes.routeRules")}
-        style={{ marginBottom: 16 }}
+        style={{ marginBottom: 8 }}
         extra={
-          <Tooltip title={t("routes.routeOrderTip")}>
-            <QuestionCircleOutlined />
-          </Tooltip>
+          <Space>
+            <Button type="primary" onClick={handleSave}>
+              {t("routes.saveRoutes")}
+            </Button>
+            <Tooltip title={t("routes.routeOrderTip")}>
+              <QuestionCircleOutlined style={{ color: "var(--ant-color-text-description, #999)" }} />
+            </Tooltip>
+          </Space>
         }
       >
         {/* Explanation */}
         <Alert
           type="info"
           showIcon={false}
-          style={{ marginBottom: 16 }}
+          className="modern-alert"
+          style={{ marginBottom: 10 }}
           message={
             <div>
               <Paragraph style={{ margin: 0 }}>
                 <strong>{t("routes.explanation")}</strong>{t("routes.explanationDesc")}
               </Paragraph>
-              <Paragraph style={{ margin: "8px 0 0 0" }}>
+              <Paragraph style={{ margin: "4px 0 0 0" }}>
                 <strong>{t("routes.matchMethod")}</strong>{t("routes.matchDesc")}
               </Paragraph>
             </div>
@@ -217,15 +222,7 @@ export function ModelRoutesEditor() {
         {routes.map((route, index) => (
           <div
             key={index}
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 8,
-              marginBottom: 10,
-              padding: "8px 12px",
-              border: "1px solid var(--border-color, #434343)",
-              borderRadius: 6,
-            }}
+            className="route-rule-item"
           >
             <Tooltip title={t("routes.matchTooltip")}>
               <Input
@@ -237,7 +234,7 @@ export function ModelRoutesEditor() {
               />
             </Tooltip>
 
-            <ArrowRightOutlined style={{ color: "#999", flexShrink: 0 }} />
+            <ArrowRightOutlined className="route-arrow-icon" />
 
             <Tooltip title={t("routes.forwardTooltip")}>
               <Input
@@ -275,30 +272,28 @@ export function ModelRoutesEditor() {
           onClick={handleAdd}
           block
           icon={<PlusOutlined />}
-          style={{ marginTop: 4 }}
+          style={{ marginTop: 4, marginBottom: 16 }}
         >
           {t("routes.addRule")}
         </Button>
-      </Card>
 
-      {/* Quick templates */}
-      <Card size="small" title={t("routes.quickAdd")} style={{ marginBottom: 16 }}>
-        <Space wrap>
-          {ROUTE_TEMPLATES.map((tpl) => (
-            <Button
-              key={tpl.label}
-              size="small"
-              onClick={() => handleAddTemplate(tpl)}
-            >
-              {tpl.label}
-            </Button>
-          ))}
-        </Space>
+        {/* Quick templates merged to save space */}
+        <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+          <Text type="secondary" style={{ fontSize: 13 }}>{t("routes.quickAdd")}:</Text>
+          <Space wrap size={[8, 8]}>
+            {ROUTE_TEMPLATES.map((tpl) => (
+              <Button
+                key={tpl.label}
+                size="small"
+                className="route-template-btn"
+                onClick={() => handleAddTemplate(tpl)}
+              >
+                {tpl.label}
+              </Button>
+            ))}
+          </Space>
+        </div>
       </Card>
-
-      <Button type="primary" onClick={handleSave}>
-        {t("routes.saveRoutes")}
-      </Button>
     </div>
   );
 }
