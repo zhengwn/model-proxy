@@ -7,10 +7,18 @@
 构建安装包后直接安装运行：
 
 ```bash
+# macOS
+npm run package:mac
+
+# Windows
 npm run tauri build
 ```
 
-安装包位于 `target/release/bundle/nsis/`（Windows）。
+macOS 安装包位于 `target/aarch64-apple-darwin/release/bundle/dmg/`。
+
+Windows 安装包位于 `target/release/bundle/nsis/`。
+
+macOS 打包前置检查、通用包、签名和常见错误见 [macOS 打包指南](mac-packaging.md)。
 
 特点：
 - 图形化管理界面

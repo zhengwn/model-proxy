@@ -9,7 +9,10 @@
     "preview": "vite preview",
     "test": "vitest --run",
     "test:watch": "vitest",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "package:mac": "bash scripts/package-mac.sh",
+    "package:mac:universal": "MAC_TARGET=universal-apple-darwin bash scripts/package-mac.sh",
+    "package:mac:signed": "MAC_SIGN=1 bash scripts/package-mac.sh"
   },
   "dependencies": {
     "@ant-design/icons": "^5.6.1",

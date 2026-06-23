@@ -11,13 +11,11 @@ import {
   Input,
   InputNumber,
   Typography,
-  Tooltip,
 } from "antd";
 import {
   PlayCircleOutlined,
   StopOutlined,
   SaveOutlined,
-  CopyOutlined,
 } from "@ant-design/icons";
 import { useState, useEffect } from "react";
 import { useServiceStatus } from "../hooks/useServiceStatus";
@@ -118,13 +116,6 @@ function StatusPanel() {
   };
 
   const localDisplayHost = !serverHost || serverHost === "0.0.0.0" ? "localhost" : serverHost;
-
-  const handleCopyAddress = () => {
-    const addr = `http://${localDisplayHost}:${serverPort}`;
-    navigator.clipboard.writeText(addr).then(() => {
-      message.success(t("status.copied", { addr }));
-    });
-  };
 
   if (loading && !status) {
     return <Spin tip={t("common.loading")} />;

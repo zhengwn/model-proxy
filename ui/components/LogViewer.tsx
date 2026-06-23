@@ -12,8 +12,6 @@ import {
   message,
   Tooltip,
   Card,
-  Row,
-  Col,
   Drawer,
 } from "antd";
 import { DeleteOutlined, SearchOutlined, SettingOutlined } from "@ant-design/icons";
