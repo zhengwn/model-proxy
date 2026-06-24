@@ -19,6 +19,7 @@ import {
   Tooltip,
   Alert,
   Typography,
+  Tabs,
 } from "antd";
 import {
   PlusOutlined,
@@ -30,6 +31,9 @@ import {
   ExperimentOutlined,
   SafetyOutlined,
   ApiOutlined,
+  TeamOutlined,
+  SettingOutlined,
+  InfoCircleOutlined,
 } from "@ant-design/icons";
 import { useKiroAdmin } from "../hooks/useKiroAdmin";
 import { useLocale } from "../i18n";
@@ -42,12 +46,52 @@ export default function KiroPanel() {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-      <CredentialManager />
-      <EndpointDashboard />
-      <SettingsPanel />
-      <Card title={t("kiro.ssoLogin")}>
-        <AuthFlows />
-      </Card>
+      {/* Main Tabbed Panels */}
+      <Tabs
+        defaultActiveKey="accounts"
+        type="card"
+        items={[
+          {
+            key: "accounts",
+            label: (
+              <span>
+                <TeamOutlined style={{ marginRight: 6 }} />
+                {t("kiro.tabAccounts")}
+              </span>
+            ),
+            children: (
+              <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+                <CredentialManager />
+                <AuthFlows />
+              </div>
+            ),
+          },
+          {
+            key: "endpoints",
+            label: (
+              <span>
+                <ThunderboltOutlined style={{ marginRight: 6 }} />
+                {t("kiro.tabEndpoints")}
+              </span>
+            ),
+            children: (
+              <EndpointDashboard />
+            ),
+          },
+          {
+            key: "settings",
+            label: (
+              <span>
+                <SettingOutlined style={{ marginRight: 6 }} />
+                {t("kiro.tabSettings")}
+              </span>
+            ),
+            children: (
+              <SettingsPanel />
+            ),
+          },
+        ]}
+      />
     </div>
   );
 }
@@ -152,6 +196,7 @@ function CredentialManager() {
       title: "ID",
       dataIndex: "id",
       key: "id",
+      ellipsis: true,
       render: (id: string) => (
         <Button type="link" size="small" onClick={() => handleDetail(id)}>
           {id}
@@ -161,6 +206,7 @@ function CredentialManager() {
     {
       title: t("kiro.status"),
       key: "status",
+      width: 140,
       render: (_: unknown, record: KiroCredential) => (
         <Space>
           {record.disabled ? (
@@ -184,14 +230,14 @@ function CredentialManager() {
       title: t("kiro.priority"),
       dataIndex: "priority",
       key: "priority",
-      width: 70,
+      width: 100,
       sorter: (a: KiroCredential, b: KiroCredential) => a.priority - b.priority,
     },
     {
       title: t("kiro.healthScore"),
       dataIndex: "health_score",
       key: "health_score",
-      width: 100,
+      width: 120,
       render: (score: number) => (
         <Progress
           percent={score}
@@ -214,7 +260,7 @@ function CredentialManager() {
     {
       title: t("kiro.actions"),
       key: "actions",
-      width: 250,
+      width: 260,
       render: (_: unknown, record: KiroCredential) => (
         <Space size="small">
           <Button size="small" icon={<ExperimentOutlined />} onClick={() => handleTest(record.id)}>
@@ -268,6 +314,13 @@ function CredentialManager() {
         </Space>
       }
     >
+      <div style={{ marginBottom: 16, display: "flex", alignItems: "center", gap: 8 }}>
+        <InfoCircleOutlined style={{ color: "#1677ff" }} />
+        <Text type="secondary" style={{ fontSize: 13 }}>
+          {t("kiro.accountManagerDesc")}
+        </Text>
+      </div>
+
       {kiro.error && (
         <Alert
           type="error"
@@ -290,6 +343,7 @@ function CredentialManager() {
           onChange: (keys) => setSelectedIds(keys as string[]),
         }}
         loading={credLoading}
+        scroll={{ x: "max-content" }}
         locale={{
           emptyText: <div style={{ padding: '40px 0', color: '#888' }}>{t("kiro.emptyCredentials")}</div>
         }}
@@ -423,6 +477,32 @@ function EndpointDashboard() {
     return () => clearInterval(interval);
   }, [refresh]);
 
+  const endpoints = health?.endpoints ?? [];
+  const hasData = endpoints.length > 0;
+
+  // Calculate aggregated stats
+  let totalSuccess = 0;
+  let totalFail = 0;
+  let maxConsecutiveErrors = 0;
+  let totalLatency = 0;
+  let latencyCount = 0;
+
+  endpoints.forEach((ep) => {
+    totalSuccess += ep.success_count;
+    totalFail += ep.fail_count;
+    if (ep.consecutive_errors > maxConsecutiveErrors) {
+      maxConsecutiveErrors = ep.consecutive_errors;
+    }
+    if (ep.latency_ema_ms > 0.0) {
+      totalLatency += ep.latency_ema_ms;
+      latencyCount += 1;
+    }
+  });
+
+  const totalRequests = totalSuccess + totalFail;
+  const overallSuccessRate = totalRequests > 0 ? totalSuccess / totalRequests : 1.0;
+  const avgLatency = latencyCount > 0 ? totalLatency / latencyCount : 0.0;
+
   return (
     <Card
       title={t("kiro.endpointHealth")}
@@ -432,38 +512,57 @@ function EndpointDashboard() {
         </Button>
       }
     >
+      <div style={{ marginBottom: 16, display: "flex", alignItems: "center", gap: 8 }}>
+        <InfoCircleOutlined style={{ color: "#1677ff" }} />
+        <Text type="secondary" style={{ fontSize: 13 }}>
+          {t("kiro.endpointHealthDesc")}
+        </Text>
+      </div>
+
       {kiro.error && (
         <Alert type="error" message={kiro.error} closable onClose={() => kiro.setError(null)} style={{ marginBottom: 16 }} />
       )}
 
       <Row gutter={[16, 16]}>
-        {health?.endpoints?.map((ep) => (
-          <Col span={8} key={ep.endpoint}>
-            <Card size="small">
-              <Statistic
-                title={ep.endpoint}
-                value={ep.success_rate * 100}
-                suffix="%"
-                prefix={
-                  ep.success_rate > 0.9 ? (
-                    <CheckCircleOutlined style={{ color: "#52c41a" }} />
-                  ) : ep.success_rate > 0.5 ? (
-                    <ThunderboltOutlined style={{ color: "#faad14" }} />
-                  ) : (
-                    <CloseCircleOutlined style={{ color: "#ff4d4f" }} />
-                  )
-                }
-              />
-              <div style={{ marginTop: 8, fontSize: 12, color: "#888" }}>
-                <div>{t("kiro.endpointSuccessFail", { s: ep.success_count, f: ep.fail_count })}</div>
-                <div>{t("kiro.latencyEma", { ms: ep.latency_ema_ms.toFixed(1) })}</div>
-                <div>{t("kiro.consecutiveErrors", { n: ep.consecutive_errors })}</div>
-              </div>
+        {hasData ? (
+          <Col span={24}>
+            <Card size="small" style={{ background: "rgba(22, 119, 255, 0.02)" }}>
+              <Row align="middle" gutter={[24, 16]}>
+                <Col xs={24} sm={8}>
+                  <Statistic
+                    title="Kiro API 服务连接状态 (runtime.kiro.dev)"
+                    value={overallSuccessRate * 100}
+                    precision={1}
+                    suffix="%"
+                    prefix={
+                      overallSuccessRate > 0.9 ? (
+                        <CheckCircleOutlined style={{ color: "#52c41a" }} />
+                      ) : overallSuccessRate > 0.5 ? (
+                        <ThunderboltOutlined style={{ color: "#faad14" }} />
+                      ) : (
+                        <CloseCircleOutlined style={{ color: "#ff4d4f" }} />
+                      )
+                    }
+                  />
+                </Col>
+                <Col xs={12} sm={8}>
+                  <Statistic
+                    title="平均响应延迟"
+                    value={avgLatency}
+                    precision={1}
+                    suffix=" ms"
+                  />
+                </Col>
+                <Col xs={12} sm={8}>
+                  <div style={{ fontSize: 13, color: "#888", display: "flex", flexDirection: "column", justifyContent: "center" }}>
+                    <div>总请求数: <strong style={{ color: "#333" }}>{totalRequests}</strong> (成功: {totalSuccess} | 失败: {totalFail})</div>
+                    <div>最大连续错误数: <strong style={{ color: "#333" }}>{maxConsecutiveErrors}</strong></div>
+                  </div>
+                </Col>
+              </Row>
             </Card>
           </Col>
-        ))}
-
-        {(!health?.endpoints || health.endpoints.length === 0) && (
+        ) : (
           <Col span={24}>
             <Text type="secondary">{t("kiro.noEndpointData")}</Text>
           </Col>
@@ -526,6 +625,12 @@ function SettingsPanel() {
       )}
 
       <Card title={t("kiro.thinkingMode")}>
+        <div style={{ marginBottom: 16, display: "flex", alignItems: "start", gap: 8 }}>
+          <InfoCircleOutlined style={{ color: "#1677ff", marginTop: 3 }} />
+          <Text type="secondary" style={{ fontSize: 13 }}>
+            {t("kiro.thinkingModeDesc")}
+          </Text>
+        </div>
         <Form layout="inline">
           <Form.Item label={t("kiro.mode")}>
             <Select
@@ -544,6 +649,12 @@ function SettingsPanel() {
       </Card>
 
       <Card title={t("kiro.endpointConfig")}>
+        <div style={{ marginBottom: 16, display: "flex", alignItems: "start", gap: 8 }}>
+          <InfoCircleOutlined style={{ color: "#1677ff", marginTop: 3 }} />
+          <Text type="secondary" style={{ fontSize: 13 }}>
+            {t("kiro.endpointConfigDesc")}
+          </Text>
+        </div>
         <Form layout="inline">
           <Form.Item label={t("kiro.preferredEndpoint")}>
             <Select
@@ -568,6 +679,12 @@ function SettingsPanel() {
       </Card>
 
       <Card title={t("kiro.loadBalance")}>
+        <div style={{ marginBottom: 16, display: "flex", alignItems: "start", gap: 8 }}>
+          <InfoCircleOutlined style={{ color: "#1677ff", marginTop: 3 }} />
+          <Text type="secondary" style={{ fontSize: 13 }}>
+            {t("kiro.loadBalanceDesc")}
+          </Text>
+        </div>
         <LoadBalanceConfig getLbConfig={kiro.getLbConfig} setLbConfig={kiro.setLbConfig} />
       </Card>
     </Space>
@@ -686,103 +803,109 @@ function AuthFlows() {
   };
 
   return (
-    <Space direction="vertical" style={{ width: "100%" }} size="middle">
+    <Row gutter={[16, 16]}>
       {kiro.error && (
-        <Alert type="error" message={kiro.error} closable onClose={() => kiro.setError(null)} />
+        <Col span={24}>
+          <Alert type="error" message={kiro.error} closable onClose={() => kiro.setError(null)} />
+        </Col>
       )}
 
-      <Card title={t("kiro.ssoImport")} extra={<SafetyOutlined />}>
-        <Text type="secondary" style={{ display: "block", marginBottom: 12 }}>
-          {t("kiro.ssoImportDesc")}
-        </Text>
-        <Form layout="vertical">
-          <Form.Item label="SSO Token(s)">
-            <Input.TextArea
-              value={ssoTokens}
-              onChange={(e) => setSsoTokens(e.target.value)}
-              rows={4}
-              placeholder={"token1\ntoken2\ntoken3"}
-            />
-          </Form.Item>
-          <Form.Item label={t("kiro.regionLabel")}>
-            <Select
-              value={ssoRegion}
-              onChange={setSsoRegion}
-              style={{ width: 200 }}
-              options={[
-                { label: "us-east-1", value: "us-east-1" },
-                { label: "us-west-2", value: "us-west-2" },
-                { label: "eu-west-1", value: "eu-west-1" },
-              ]}
-            />
-          </Form.Item>
-          <Form.Item>
-            <Button
-              type="primary"
-              icon={<ApiOutlined />}
-              onClick={handleSsoImport}
-              loading={kiro.loading}
-            >
-              {t("kiro.import")}
-            </Button>
-          </Form.Item>
-        </Form>
-      </Card>
+      <Col xs={24} md={12}>
+        <Card title={t("kiro.ssoImport")} extra={<SafetyOutlined />} style={{ height: "100%" }}>
+          <Text type="secondary" style={{ display: "block", marginBottom: 12, fontSize: 12 }}>
+            {t("kiro.ssoImportDesc")}
+          </Text>
+          <Form layout="vertical">
+            <Form.Item label="SSO Token(s)">
+              <Input.TextArea
+                value={ssoTokens}
+                onChange={(e) => setSsoTokens(e.target.value)}
+                rows={4}
+                placeholder={"token1\ntoken2\ntoken3"}
+              />
+            </Form.Item>
+            <Form.Item label={t("kiro.regionLabel")}>
+              <Select
+                value={ssoRegion}
+                onChange={setSsoRegion}
+                style={{ width: "100%" }}
+                options={[
+                  { label: "us-east-1", value: "us-east-1" },
+                  { label: "us-west-2", value: "us-west-2" },
+                  { label: "eu-west-1", value: "eu-west-1" },
+                ]}
+              />
+            </Form.Item>
+            <Form.Item style={{ marginBottom: 0 }}>
+              <Button
+                type="primary"
+                icon={<ApiOutlined />}
+                onClick={handleSsoImport}
+                loading={kiro.loading}
+              >
+                {t("kiro.import")}
+              </Button>
+            </Form.Item>
+          </Form>
+        </Card>
+      </Col>
 
-      <Card title={t("kiro.iamLogin")} extra={<SafetyOutlined />}>
-        <Text type="secondary" style={{ display: "block", marginBottom: 12 }}>
-          {t("kiro.iamLoginDesc")}
-        </Text>
-        <Form layout="vertical">
-          <Form.Item label="Start URL">
-            <Input
-              value={iamStartUrl}
-              onChange={(e) => setIamStartUrl(e.target.value)}
-              placeholder="https://your-sso-portal.awsapps.com/start"
-            />
-          </Form.Item>
-          <Form.Item label={t("kiro.regionLabel")}>
-            <Select
-              value={iamRegion}
-              onChange={setIamRegion}
-              style={{ width: 200 }}
-              options={[
-                { label: "us-east-1", value: "us-east-1" },
-                { label: "us-west-2", value: "us-west-2" },
-                { label: "eu-west-1", value: "eu-west-1" },
-              ]}
-            />
-          </Form.Item>
-          <Form.Item>
-            <Button
-              type="primary"
-              icon={<ApiOutlined />}
-              onClick={handleIamStart}
-              loading={kiro.loading}
-              disabled={!!iamSession}
-            >
-              {iamSession ? t("kiro.started") : t("kiro.startLogin")}
-            </Button>
-          </Form.Item>
+      <Col xs={24} md={12}>
+        <Card title={t("kiro.iamLogin")} extra={<SafetyOutlined />} style={{ height: "100%" }}>
+          <Text type="secondary" style={{ display: "block", marginBottom: 12, fontSize: 12 }}>
+            {t("kiro.iamLoginDesc")}
+          </Text>
+          <Form layout="vertical">
+            <Form.Item label="Start URL">
+              <Input
+                value={iamStartUrl}
+                onChange={(e) => setIamStartUrl(e.target.value)}
+                placeholder="https://your-sso-portal.awsapps.com/start"
+              />
+            </Form.Item>
+            <Form.Item label={t("kiro.regionLabel")}>
+              <Select
+                value={iamRegion}
+                onChange={setIamRegion}
+                style={{ width: "100%" }}
+                options={[
+                  { label: "us-east-1", value: "us-east-1" },
+                  { label: "us-west-2", value: "us-west-2" },
+                  { label: "eu-west-1", value: "eu-west-1" },
+                ]}
+              />
+            </Form.Item>
+            <Form.Item style={{ marginBottom: iamSession ? 16 : 0 }}>
+              <Button
+                type="primary"
+                icon={<ApiOutlined />}
+                onClick={handleIamStart}
+                loading={kiro.loading}
+                disabled={!!iamSession}
+              >
+                {iamSession ? t("kiro.started") : t("kiro.startLogin")}
+              </Button>
+            </Form.Item>
 
-          {iamSession && (
-            <>
-              <Form.Item label={t("kiro.callbackUrl")}>
-                <Input
-                  value={iamCallbackUrl}
-                  onChange={(e) => setIamCallbackUrl(e.target.value)}
-                  placeholder="http://127.0.0.1/oauth/callback?code=...&state=..."
-                />
-              </Form.Item>
-              <Form.Item>
-                <Button onClick={handleIamComplete} loading={kiro.loading}>
-                  {t("kiro.completeLogin")}
-                </Button>
-              </Form.Item>
-            </>
-          )}
-        </Form>
-      </Card>
-    </Space>
+            {iamSession && (
+              <>
+                <Form.Item label={t("kiro.callbackUrl")}>
+                  <Input
+                    value={iamCallbackUrl}
+                    onChange={(e) => setIamCallbackUrl(e.target.value)}
+                    placeholder="http://127.0.0.1/oauth/callback?code=...&state=..."
+                  />
+                </Form.Item>
+                <Form.Item style={{ marginBottom: 0 }}>
+                  <Button onClick={handleIamComplete} loading={kiro.loading}>
+                    {t("kiro.completeLogin")}
+                  </Button>
+                </Form.Item>
+              </>
+            )}
+          </Form>
+        </Card>
+      </Col>
+    </Row>
   );
 }

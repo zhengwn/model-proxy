@@ -20,19 +20,19 @@ pub struct KiroEndpoint {
 pub static KIRO_ENDPOINTS: [KiroEndpoint; 3] = [
     KiroEndpoint {
         name: "kiro",
-        url_template: "https://q.{region}.amazonaws.com/generateAssistantResponse",
+        url_template: "https://runtime.{region}.kiro.dev/generateAssistantResponse",
         origin: "AI_EDITOR",
         amz_target: None,
     },
     KiroEndpoint {
         name: "codewhisperer",
-        url_template: "https://codewhisperer.{region}.amazonaws.com/generateAssistantResponse",
+        url_template: "https://runtime.{region}.kiro.dev/generateAssistantResponse",
         origin: "AI_EDITOR",
         amz_target: Some("AmazonCodeWhispererStreamingService.GenerateAssistantResponse"),
     },
     KiroEndpoint {
         name: "amazonq",
-        url_template: "https://q.{region}.amazonaws.com/generateAssistantResponse",
+        url_template: "https://runtime.{region}.kiro.dev/generateAssistantResponse",
         origin: "AI_EDITOR",
         amz_target: Some("AmazonQDeveloperStreamingService.SendMessage"),
     },
@@ -162,7 +162,7 @@ mod tests {
     #[test]
     fn endpoint_url_substitutes_region() {
         let url = build_endpoint_url(&KIRO_ENDPOINTS[0], "us-east-1");
-        assert_eq!(url, "https://q.us-east-1.amazonaws.com/generateAssistantResponse");
+        assert_eq!(url, "https://runtime.us-east-1.kiro.dev/generateAssistantResponse");
     }
 
     #[test]

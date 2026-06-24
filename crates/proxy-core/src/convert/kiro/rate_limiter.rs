@@ -140,7 +140,7 @@ pub async fn check_quota(
     access_token: &str,
     api_region: &str,
 ) -> Option<QuotaInfo> {
-    let url = format!("https://q.{}.amazonaws.com/getUsageLimits", api_region);
+    let url = format!("https://runtime.{}.kiro.dev/getUsageLimits", api_region);
     match client
         .post(&url)
         .header("Content-Type", "application/x-amz-json-1.0")
