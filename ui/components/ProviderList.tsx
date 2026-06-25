@@ -79,15 +79,6 @@ export function ProviderList({
           <List.Item
             className={`provider-item${isActive ? " provider-item-active" : ""}`}
             actions={[
-              <Button
-                key="test"
-                icon={<ThunderboltOutlined />}
-                size="small"
-                loading={isTesting}
-                onClick={() => handleTest(provider)}
-              >
-                {t("common.test")}
-              </Button>,
               !isActive && (
                 <Button
                   key="switch"
@@ -100,6 +91,15 @@ export function ProviderList({
                   {t("provider.switch")}
                 </Button>
               ),
+              <Button
+                key="test"
+                icon={<ThunderboltOutlined />}
+                size="small"
+                loading={isTesting}
+                onClick={() => handleTest(provider)}
+              >
+                {t("common.test")}
+              </Button>,
               <Button
                 key="edit"
                 icon={<EditOutlined />}

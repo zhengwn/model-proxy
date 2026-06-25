@@ -329,36 +329,33 @@ function LogViewer() {
           </Space>
         }
       >
-        <div style={{ marginBottom: 12 }}>
-          <Space wrap size="small">
-            <Button danger size="small" icon={<DeleteOutlined />} onClick={handleClear} disabled={logs.length === 0}>
+        <div style={{ marginBottom: 16 }}>
+          <Space wrap size={10}>
+            <Button danger icon={<DeleteOutlined />} onClick={handleClear} disabled={logs.length === 0}>
               {t("log.clearLogs")}
             </Button>
-            <div style={{ width: 1, height: 16, background: "var(--ant-color-border)", margin: "0 4px", opacity: 0.6 }} />
+            <div style={{ width: 1, height: 20, background: "var(--ant-color-split)", margin: "0 4px" }} />
             <Select
-              size="small"
               value={statusFilter}
               onChange={setStatusFilter}
               options={statusFilterOptions}
-              style={{ width: 100 }}
+              style={{ width: 110 }}
             />
             <Select
-              size="small"
               value={providerFilter}
               onChange={setProviderFilter}
               placeholder="Provider"
               allowClear
-              style={{ width: 130 }}
+              style={{ width: 150 }}
               options={uniqueProviders.map((p) => ({ label: p, value: p }))}
             />
             <Input
-              size="small"
-              prefix={<SearchOutlined style={{ color: "var(--ant-color-text-secondary)" }} />}
+              prefix={<SearchOutlined style={{ color: "var(--ant-color-text-tertiary)" }} />}
               placeholder={t("log.searchPlaceholder")}
               value={keyword}
               onChange={(e) => setKeyword(e.target.value)}
               allowClear
-              style={{ width: 200 }}
+              style={{ width: 240 }}
             />
           </Space>
         </div>
