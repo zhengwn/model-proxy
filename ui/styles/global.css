@@ -36,6 +36,45 @@ body {
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 6px 22px rgba(0, 0, 0, 0.3);
 }
 
+/* Shared info-hint bar (Kiro panels, etc.) */
+.info-hint {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  margin-bottom: 16px;
+  border-radius: 10px;
+  background: rgba(79, 70, 229, 0.05);
+  border: 1px solid rgba(79, 70, 229, 0.1);
+}
+
+[data-theme="dark"] .info-hint {
+  background: rgba(99, 102, 241, 0.08);
+  border-color: rgba(99, 102, 241, 0.16);
+}
+
+.info-hint .anticon {
+  color: #6366f1;
+  margin-top: 2px;
+  flex-shrink: 0;
+}
+
+/* Active provider row highlight */
+.ant-list-item {
+  transition: background 0.2s ease;
+  border-radius: 8px;
+}
+
+.provider-item-active {
+  background: linear-gradient(90deg, rgba(79, 70, 229, 0.07), rgba(79, 70, 229, 0) 55%);
+  box-shadow: inset 3px 0 0 #4f46e5;
+}
+
+[data-theme="dark"] .provider-item-active {
+  background: linear-gradient(90deg, rgba(99, 102, 241, 0.12), rgba(99, 102, 241, 0) 55%);
+  box-shadow: inset 3px 0 0 #6366f1;
+}
+
 /* Metric cards on the overview page */
 .metric-card {
   position: relative;
@@ -187,12 +226,4 @@ body {
 .route-rule-item:hover .route-arrow-icon {
   color: #4f46e5;
   transform: translateX(2px);
-}
-
-.routes-footer {
-  --bg-color: #f5f5f5; /* Light mode layout background */
-}
-
-[data-theme="dark"] .routes-footer {
-  --bg-color: #141414; /* Dark mode layout background */
 }

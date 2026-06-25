@@ -314,8 +314,8 @@ function CredentialManager() {
         </Space>
       }
     >
-      <div style={{ marginBottom: 16, display: "flex", alignItems: "center", gap: 8 }}>
-        <InfoCircleOutlined style={{ color: "#1677ff" }} />
+      <div className="info-hint">
+        <InfoCircleOutlined />
         <Text type="secondary" style={{ fontSize: 13 }}>
           {t("kiro.accountManagerDesc")}
         </Text>
@@ -345,7 +345,7 @@ function CredentialManager() {
         loading={credLoading}
         scroll={{ x: "max-content" }}
         locale={{
-          emptyText: <div style={{ padding: '40px 0', color: '#888' }}>{t("kiro.emptyCredentials")}</div>
+          emptyText: <div style={{ padding: '40px 0', color: 'var(--ant-color-text-secondary)' }}>{t("kiro.emptyCredentials")}</div>
         }}
       />
 
@@ -512,8 +512,8 @@ function EndpointDashboard() {
         </Button>
       }
     >
-      <div style={{ marginBottom: 16, display: "flex", alignItems: "center", gap: 8 }}>
-        <InfoCircleOutlined style={{ color: "#1677ff" }} />
+      <div className="info-hint">
+        <InfoCircleOutlined />
         <Text type="secondary" style={{ fontSize: 13 }}>
           {t("kiro.endpointHealthDesc")}
         </Text>
@@ -526,7 +526,7 @@ function EndpointDashboard() {
       <Row gutter={[16, 16]}>
         {hasData ? (
           <Col span={24}>
-            <Card size="small" style={{ background: "rgba(22, 119, 255, 0.02)" }}>
+            <Card size="small" style={{ background: "rgba(79, 70, 229, 0.04)" }}>
               <Row align="middle" gutter={[24, 16]}>
                 <Col xs={24} sm={8}>
                   <Statistic
@@ -554,9 +554,9 @@ function EndpointDashboard() {
                   />
                 </Col>
                 <Col xs={12} sm={8}>
-                  <div style={{ fontSize: 13, color: "#888", display: "flex", flexDirection: "column", justifyContent: "center" }}>
-                    <div>总请求数: <strong style={{ color: "#333" }}>{totalRequests}</strong> (成功: {totalSuccess} | 失败: {totalFail})</div>
-                    <div>最大连续错误数: <strong style={{ color: "#333" }}>{maxConsecutiveErrors}</strong></div>
+                  <div style={{ fontSize: 13, color: "var(--ant-color-text-secondary)", display: "flex", flexDirection: "column", justifyContent: "center", gap: 4 }}>
+                    <div>总请求数: <strong style={{ color: "var(--ant-color-text)" }}>{totalRequests}</strong> (成功: {totalSuccess} | 失败: {totalFail})</div>
+                    <div>最大连续错误数: <strong style={{ color: "var(--ant-color-text)" }}>{maxConsecutiveErrors}</strong></div>
                   </div>
                 </Col>
               </Row>
@@ -625,8 +625,8 @@ function SettingsPanel() {
       )}
 
       <Card title={t("kiro.thinkingMode")}>
-        <div style={{ marginBottom: 16, display: "flex", alignItems: "start", gap: 8 }}>
-          <InfoCircleOutlined style={{ color: "#1677ff", marginTop: 3 }} />
+        <div className="info-hint">
+          <InfoCircleOutlined />
           <Text type="secondary" style={{ fontSize: 13 }}>
             {t("kiro.thinkingModeDesc")}
           </Text>
@@ -649,8 +649,8 @@ function SettingsPanel() {
       </Card>
 
       <Card title={t("kiro.endpointConfig")}>
-        <div style={{ marginBottom: 16, display: "flex", alignItems: "start", gap: 8 }}>
-          <InfoCircleOutlined style={{ color: "#1677ff", marginTop: 3 }} />
+        <div className="info-hint">
+          <InfoCircleOutlined />
           <Text type="secondary" style={{ fontSize: 13 }}>
             {t("kiro.endpointConfigDesc")}
           </Text>
@@ -679,8 +679,8 @@ function SettingsPanel() {
       </Card>
 
       <Card title={t("kiro.loadBalance")}>
-        <div style={{ marginBottom: 16, display: "flex", alignItems: "start", gap: 8 }}>
-          <InfoCircleOutlined style={{ color: "#1677ff", marginTop: 3 }} />
+        <div className="info-hint">
+          <InfoCircleOutlined />
           <Text type="secondary" style={{ fontSize: 13 }}>
             {t("kiro.loadBalanceDesc")}
           </Text>

@@ -77,6 +77,7 @@ export function ProviderList({
         const isTesting = testing === provider.name;
         return (
           <List.Item
+            className={isActive ? "provider-item-active" : undefined}
             actions={[
               <Button
                 key="test"
