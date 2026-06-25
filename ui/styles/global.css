@@ -26,8 +26,68 @@ body {
 
 /* Professional Modern Cards */
 .ant-card {
-  border-radius: 12px !important;
+  border-radius: 14px !important;
   overflow: hidden;
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 6px 20px rgba(16, 24, 40, 0.05);
+  transition: box-shadow 0.25s ease, border-color 0.25s ease;
+}
+
+[data-theme="dark"] .ant-card {
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 6px 22px rgba(0, 0, 0, 0.3);
+}
+
+/* Metric cards on the overview page */
+.metric-card {
+  position: relative;
+}
+
+.metric-card::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  border-radius: 3px;
+  background: linear-gradient(180deg, #6366f1, #7c3aed);
+  opacity: 0;
+  transition: opacity 0.25s ease;
+}
+
+.metric-card:hover {
+  box-shadow: 0 2px 4px rgba(16, 24, 40, 0.06), 0 12px 28px rgba(16, 24, 40, 0.1);
+  transform: translateY(-1px);
+}
+
+[data-theme="dark"] .metric-card:hover {
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.5), 0 14px 30px rgba(0, 0, 0, 0.4);
+}
+
+.metric-card:hover::before {
+  opacity: 1;
+}
+
+.metric-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.metric-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.metric-value {
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: -0.2px;
 }
 
 /* Scrollbar styling — dark (default) */
@@ -71,15 +131,15 @@ body {
 }
 
 .route-rule-item:hover {
-  border-color: #1677ff;
-  box-shadow: 0 4px 12px rgba(22, 119, 255, 0.08);
+  border-color: #4f46e5;
+  box-shadow: 0 4px 12px rgba(79, 70, 229, 0.10);
   transform: translateY(-1px);
-  background: var(--route-item-hover-bg, rgba(22, 119, 255, 0.02));
+  background: var(--route-item-hover-bg, rgba(79, 70, 229, 0.03));
 }
 
 [data-theme="dark"] .route-rule-item:hover {
-  box-shadow: 0 4px 12px rgba(22, 119, 255, 0.15);
-  background: rgba(22, 119, 255, 0.04);
+  box-shadow: 0 4px 12px rgba(79, 70, 229, 0.18);
+  background: rgba(79, 70, 229, 0.05);
 }
 
 .route-template-btn {
@@ -99,8 +159,8 @@ body {
 .modern-alert {
   border-radius: 10px !important;
   border: none !important;
-  background: linear-gradient(145deg, var(--alert-bg-1, #f0f7ff), var(--alert-bg-2, #e6f2ff)) !important;
-  box-shadow: 0 2px 8px var(--alert-shadow, rgba(22, 119, 255, 0.05));
+  background: linear-gradient(145deg, var(--alert-bg-1, #f1f0fe), var(--alert-bg-2, #e8e6fb)) !important;
+  box-shadow: 0 2px 8px var(--alert-shadow, rgba(79, 70, 229, 0.06));
   padding: 10px 14px !important;
 }
 
@@ -111,11 +171,11 @@ body {
 }
 
 .modern-alert .ant-alert-message {
-  color: var(--alert-text, #0958d9) !important;
+  color: var(--alert-text, #4338ca) !important;
 }
 
 [data-theme="dark"] .modern-alert .ant-alert-message {
-  --alert-text: #69b1ff;
+  --alert-text: #a5b4fc;
 }
 
 .route-arrow-icon {
@@ -125,7 +185,7 @@ body {
 }
 
 .route-rule-item:hover .route-arrow-icon {
-  color: #1677ff;
+  color: #4f46e5;
   transform: translateX(2px);
 }
 

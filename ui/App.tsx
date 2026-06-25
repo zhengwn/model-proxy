@@ -89,15 +89,32 @@ function AppLayout({ themeMode, resolved, onThemeChange }: AppLayoutProps) {
             height: 56,
             display: "flex",
             alignItems: "center",
-            justifyContent: "center",
+            gap: 10,
+            padding: "0 16px",
             borderBottom: `1px solid ${token.colorBorderSecondary}`,
           }}
         >
+          <div
+            style={{
+              width: 28,
+              height: 28,
+              borderRadius: 8,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              background: "linear-gradient(135deg, #6366f1 0%, #4f46e5 55%, #7c3aed 100%)",
+              boxShadow: "0 2px 8px rgba(79,70,229,0.35)",
+              flexShrink: 0,
+            }}
+          >
+            <ApiOutlined style={{ color: "#fff", fontSize: 15 }} />
+          </div>
           <span
             style={{
               color: token.colorText,
               fontSize: 15,
               fontWeight: 600,
+              letterSpacing: 0.2,
             }}
           >
             Model Proxy
@@ -193,21 +210,37 @@ function App() {
         theme={{
           algorithm: resolved === "dark" ? theme.darkAlgorithm : theme.defaultAlgorithm,
           token: {
-            colorPrimary: "#1677ff", // Classic professional blue
+            colorPrimary: "#4f46e5", // Refined indigo — distinct from stock AntD blue
+            colorInfo: "#4f46e5",
             borderRadius: 12,
-            fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'PingFang SC', 'Helvetica Neue', sans-serif",
+            fontFamily:
+              "-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'PingFang SC', 'HarmonyOS Sans SC', 'Helvetica Neue', sans-serif",
             ...(resolved === "dark"
               ? {
-                  colorBgLayout: "#141414",
-                  colorBgContainer: "#1f1f1f",
-                  colorBgElevated: "#2a2a2a",
+                  colorBgLayout: "#0c0d12",
+                  colorBgContainer: "#16181f",
+                  colorBgElevated: "#1d1f28",
+                  colorBorderSecondary: "#262833",
                 }
-              : {}),
+              : {
+                  colorBgLayout: "#f5f6f9",
+                  colorBgContainer: "#ffffff",
+                  colorBorderSecondary: "#eceef2",
+                }),
           },
           components: {
             Menu: {
               itemMarginInline: 12,
               itemBorderRadius: 8,
+              itemSelectedBg:
+                resolved === "dark" ? "rgba(79,70,229,0.18)" : "rgba(79,70,229,0.08)",
+              itemSelectedColor: "#4f46e5",
+            },
+            Card: {
+              boxShadowTertiary:
+                resolved === "dark"
+                  ? "0 1px 2px rgba(0,0,0,0.4), 0 4px 16px rgba(0,0,0,0.28)"
+                  : "0 1px 2px rgba(16,24,40,0.04), 0 6px 20px rgba(16,24,40,0.06)",
             },
           },
         }}

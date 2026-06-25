@@ -11,11 +11,15 @@ import {
   Input,
   InputNumber,
   Typography,
+  Progress,
 } from "antd";
 import {
   PlayCircleOutlined,
   StopOutlined,
   SaveOutlined,
+  CloudServerOutlined,
+  GlobalOutlined,
+  ThunderboltOutlined,
 } from "@ant-design/icons";
 import { useState, useEffect } from "react";
 import { useServiceStatus } from "../hooks/useServiceStatus";
@@ -122,7 +126,7 @@ function StatusPanel() {
   const canStart = hasProviders && !isRunning;
 
   return (
-    <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+    <Space direction="vertical" size={12} style={{ width: "100%" }}>
       {/* First-launch guide */}
       {isNew && (
         <Alert
@@ -176,7 +180,7 @@ function StatusPanel() {
           </Space>
         }
       >
-        <div style={{ height: 106, display: "flex", flexDirection: "column", justifyContent: "center" }}>
+        <div style={{ minHeight: 116, display: "flex", flexDirection: "column", justifyContent: "center" }}>
           {isRunning && status?.started_at ? (
             <Space direction="vertical" style={{ width: "100%" }}>
               <Text type="secondary">
@@ -217,46 +221,70 @@ function StatusPanel() {
       {/* Grid of Metric Cards */}
       <Row gutter={[12, 12]} align="stretch">
         <Col span={8}>
-          <Card style={{ height: "100%" }} bodyStyle={{ padding: "12px 16px" }}>
-            <Text type="secondary" style={{ fontSize: 13, display: "block", marginBottom: 6 }}>
-              {t("status.currentProvider")}
-            </Text>
-            <div style={{ fontSize: 16, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", fontWeight: 500 }}>
-              {activeProvider || "-"}
+          <Card className="metric-card" style={{ height: "100%" }} bodyStyle={{ padding: 16 }}>
+            <div className="metric-head">
+              <span className="metric-icon" style={{ background: "rgba(79,70,229,0.12)", color: "#4f46e5" }}>
+                <CloudServerOutlined />
+              </span>
+              <Text type="secondary" style={{ fontSize: 13 }}>
+                {t("status.currentProvider")}
+              </Text>
             </div>
-          </Card>
-        </Col>
-        
-        <Col span={8}>
-          <Card style={{ height: "100%" }} bodyStyle={{ padding: "12px 16px" }}>
-            <Text type="secondary" style={{ fontSize: 13, display: "block", marginBottom: 6 }}>
-              {t("status.listenAddress")}
-            </Text>
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-              <div style={{ fontSize: 16, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", fontWeight: 500 }}>
-                {isRunning ? status?.listen_addr ?? `${serverHost}:${serverPort}` : "-"}
-              </div>
+            <div className="metric-value" style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+              {activeProvider || "-"}
             </div>
           </Card>
         </Col>
 
         <Col span={8}>
-          <Card style={{ height: "100%" }} bodyStyle={{ padding: "12px 16px" }}>
-            <Text type="secondary" style={{ fontSize: 13, display: "block", marginBottom: 6 }}>
-              {t("status.requestStats")}
-            </Text>
-            <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
-              <div style={{ fontSize: 16, fontWeight: 500 }}>
-                {status?.total_requests ?? 0}
+          <Card className="metric-card" style={{ height: "100%" }} bodyStyle={{ padding: 16 }}>
+            <div className="metric-head">
+              <span className="metric-icon" style={{ background: "rgba(8,145,178,0.12)", color: "#0891b2" }}>
+                <GlobalOutlined />
+              </span>
+              <Text type="secondary" style={{ fontSize: 13 }}>
+                {t("status.listenAddress")}
+              </Text>
+            </div>
+            <div className="metric-value" style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", fontVariantNumeric: "tabular-nums" }}>
+              {isRunning ? status?.listen_addr ?? `${serverHost}:${serverPort}` : "-"}
+            </div>
+          </Card>
+        </Col>
+
+        <Col span={8}>
+          <Card className="metric-card" style={{ height: "100%" }} bodyStyle={{ padding: 16 }}>
+            <div className="metric-head">
+              <span className="metric-icon" style={{ background: "rgba(217,119,6,0.12)", color: "#d97706" }}>
+                <ThunderboltOutlined />
+              </span>
+              <Text type="secondary" style={{ fontSize: 13, whiteSpace: "nowrap" }}>
+                {t("status.requestStats")}
+              </Text>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+              <div className="metric-value" style={{ display: "flex", alignItems: "baseline", gap: 6, fontVariantNumeric: "tabular-nums" }}>
+                <span>{status?.total_requests ?? 0}</span>
+                <span style={{ fontSize: 13, fontWeight: 400, color: "var(--ant-color-text-tertiary)" }}>/</span>
+                <span style={{ color: (status?.failed_requests ?? 0) > 0 ? "#dc2626" : undefined }}>
+                  {status?.failed_requests ?? 0}
+                </span>
               </div>
-              <div style={{ color: "var(--ant-color-text-secondary)", fontSize: 14 }}>/</div>
-              <div style={{ 
-                fontSize: 16, 
-                fontWeight: 500,
-                color: (status?.failed_requests ?? 0) > 0 ? "#cf1322" : undefined
-              }}>
-                {status?.failed_requests ?? 0}
-              </div>
+              {(() => {
+                const total = status?.total_requests ?? 0;
+                const failed = status?.failed_requests ?? 0;
+                const rate = total > 0 ? Math.round(((total - failed) / total) * 100) : 100;
+                return (
+                  <Progress
+                    type="circle"
+                    size={44}
+                    percent={rate}
+                    strokeColor={failed > 0 ? "#d97706" : "#16a34a"}
+                    strokeWidth={9}
+                    format={(p) => <span style={{ fontSize: 11, fontWeight: 600 }}>{p}%</span>}
+                  />
+                );
+              })()}
             </div>
           </Card>
         </Col>
@@ -273,7 +301,7 @@ function StatusPanel() {
 
       {/* Server settings card */}
       <Card title={t("status.serverSettings")}>
-        <Row gutter={[16, 12]} align="middle">
+        <Row gutter={[12, 12]} align="middle" wrap={false}>
                   <Col>
                     <Space>
                       <Text>Host:</Text>
@@ -285,7 +313,7 @@ function StatusPanel() {
                           setServerHost(e.target.value);
                           setServerDirty(true);
                         }}
-                        style={{ width: 140 }}
+                        style={{ width: 120 }}
                       />
                     </Space>
                   </Col>
@@ -301,7 +329,7 @@ function StatusPanel() {
                           setServerPort(v ?? 4000);
                           setServerDirty(true);
                         }}
-                        style={{ width: 100 }}
+                        style={{ width: 80 }}
                       />
                     </Space>
                   </Col>
@@ -316,19 +344,19 @@ function StatusPanel() {
                           setServerApiKey(e.target.value);
                           setServerDirty(true);
                         }}
-                        style={{ width: 200 }}
+                        style={{ width: 160 }}
                       />
                     </Space>
                   </Col>
                   <Col>
                     {serverDirty && !isRunning && (
                       <Button
+                        type="primary"
                         icon={<SaveOutlined />}
                         size="small"
                         onClick={handleSaveServer}
-                      >
-                        {t("common.save")}
-                      </Button>
+                        title={t("common.save")}
+                      />
                     )}
                   </Col>
                 </Row>
