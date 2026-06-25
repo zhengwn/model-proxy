@@ -106,9 +106,6 @@ pub struct ServerConfig {
     pub host: String,
     #[serde(default)]
     pub api_key: Option<String>,
-    /// Admin API 认证密钥（独立于 client API key）
-    #[serde(default)]
-    pub admin_api_key: Option<String>,
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
     /// 每个 Provider 的最大并发请求数，0 表示不限制
@@ -122,7 +119,6 @@ impl Default for ServerConfig {
             port: 4000,
             host: default_host(),
             api_key: None,
-            admin_api_key: None,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_concurrent_requests: 0,
         }

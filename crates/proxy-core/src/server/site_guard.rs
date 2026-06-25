@@ -1,6 +1,6 @@
 //! SiteGuard middleware: maintenance mode and self-use mode.
 //!
-//! - **Maintenance mode**: returns 503 for all requests except `/health` and `/api/admin/*`.
+//! - **Maintenance mode**: returns 503 for all requests except `/health`.
 //! - **Self-use mode**: rejects requests not originating from `127.0.0.1`.
 
 use axum::{
@@ -57,7 +57,7 @@ impl Default for SiteGuardConfig {
 
 /// axum `from_fn_with_state` middleware that applies site guard rules.
 ///
-/// - Maintenance mode: returns 503 for all requests except `/health` and `/api/admin/*`.
+/// - Maintenance mode: returns 503 for all requests except `/health`.
 /// - Self-use mode: rejects requests whose client IP is not a loopback address.
 pub async fn site_guard_middleware(
     State(config): State<SiteGuardConfig>,
@@ -66,9 +66,9 @@ pub async fn site_guard_middleware(
 ) -> Response {
     let path = req.uri().path().to_owned();
 
-    // Maintenance mode: block everything except /health and /api/admin/*
+    // Maintenance mode: block everything except /health
     if config.is_maintenance() {
-        let allowed = path == "/health" || path.starts_with("/api/admin/");
+        let allowed = path == "/health";
         if !allowed {
             return (StatusCode::SERVICE_UNAVAILABLE, "Service is under maintenance").into_response();
         }

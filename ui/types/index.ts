@@ -2,7 +2,6 @@ export interface ServerConfig {
   port: number;
   host?: string;
   api_key?: string;
-  admin_api_key?: string;
   max_body_bytes?: number;
   max_concurrent_requests?: number;
 }

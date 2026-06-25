@@ -3,7 +3,17 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ProviderManager } from "../ProviderManager";
 import { LocaleProvider } from "../../i18n";
+import { ProvidersProvider } from "../../hooks/useProviders";
 import type { ProvidersInfo } from "../../types";
+
+const renderManager = () =>
+  render(
+    <LocaleProvider>
+      <ProvidersProvider>
+        <ProviderManager />
+      </ProvidersProvider>
+    </LocaleProvider>
+  );
 
 // Mock Tauri invoke
 const mockInvoke = vi.fn();
@@ -50,7 +60,7 @@ describe("ProviderManager", () => {
 
   it("shows loading spinner initially", () => {
     mockInvoke.mockReturnValue(new Promise(() => {})); // Never resolves
-    render(<LocaleProvider><ProviderManager /></LocaleProvider>);
+    renderManager();
 
     // Ant Design Spin renders with aria-busy="true" and role="status" via aria-live="polite"
     const spinner = document.querySelector(".ant-spin-spinning");
@@ -59,7 +69,7 @@ describe("ProviderManager", () => {
 
   it("shows error alert on load failure", async () => {
     mockInvoke.mockRejectedValue("Network error");
-    render(<LocaleProvider><ProviderManager /></LocaleProvider>);
+    renderManager();
 
     await waitFor(() => {
       expect(screen.getByText("Load Failed")).toBeInTheDocument();
@@ -70,7 +80,7 @@ describe("ProviderManager", () => {
 
   it("renders provider list after successful load", async () => {
     mockInvoke.mockResolvedValue(mockProvidersInfo);
-    render(<LocaleProvider><ProviderManager /></LocaleProvider>);
+    renderManager();
 
     await waitFor(() => {
       // "openai" appears as both name and format tag, use getAllByText
@@ -91,7 +101,7 @@ describe("ProviderManager", () => {
       return Promise.resolve();
     });
 
-    render(<LocaleProvider><ProviderManager /></LocaleProvider>);
+    renderManager();
 
     await waitFor(() => {
       expect(screen.getAllByText("anthropic").length).toBeGreaterThanOrEqual(1);
@@ -112,7 +122,7 @@ describe("ProviderManager", () => {
     const user = userEvent.setup();
     mockInvoke.mockResolvedValue(mockProvidersInfo);
 
-    render(<LocaleProvider><ProviderManager /></LocaleProvider>);
+    renderManager();
 
     await waitFor(() => {
       expect(screen.getAllByText("anthropic").length).toBeGreaterThanOrEqual(1);
@@ -137,7 +147,7 @@ describe("ProviderManager", () => {
     const user = userEvent.setup();
     mockInvoke.mockResolvedValue(mockProvidersInfo);
 
-    render(<LocaleProvider><ProviderManager /></LocaleProvider>);
+    renderManager();
 
     await waitFor(() => {
       expect(screen.getAllByText("openai").length).toBeGreaterThanOrEqual(1);
@@ -160,7 +170,7 @@ describe("ProviderManager", () => {
 
   it("shows retry button on error", async () => {
     mockInvoke.mockRejectedValue("Connection failed");
-    render(<LocaleProvider><ProviderManager /></LocaleProvider>);
+    renderManager();
 
     await waitFor(() => {
       expect(screen.getByText("Load Failed")).toBeInTheDocument();
@@ -177,7 +187,7 @@ describe("ProviderManager", () => {
       .mockRejectedValueOnce("Connection failed")
       .mockResolvedValueOnce(mockProvidersInfo);
 
-    render(<LocaleProvider><ProviderManager /></LocaleProvider>);
+    renderManager();
 
     await waitFor(() => {
       expect(screen.getByText("Load Failed")).toBeInTheDocument();

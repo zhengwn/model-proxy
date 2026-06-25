@@ -812,7 +812,7 @@ fn persist_config(config_path: &PathBuf, config: &Config) -> Result<(), String> 
 
 /// Restrict a config/secret file to owner-only access (0600 on Unix).
 ///
-/// The config file contains provider API keys and the admin key, so it should
+/// The config file contains provider API keys, so it should
 /// not be readable by other local users. On non-Unix platforms this is a no-op
 /// (the file lives under the user's profile directory, which NTFS ACLs protect).
 fn restrict_file_permissions(path: &std::path::Path) {

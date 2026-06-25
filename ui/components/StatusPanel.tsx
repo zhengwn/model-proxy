@@ -52,7 +52,6 @@ function StatusPanel() {
   const [serverHost, setServerHost] = useState<string>("127.0.0.1");
   const [serverPort, setServerPort] = useState<number>(4000);
   const [serverApiKey, setServerApiKey] = useState<string>("");
-  const [serverAdminApiKey, setServerAdminApiKey] = useState<string>("");
   const [serverDirty, setServerDirty] = useState(false);
 
   useEffect(() => {
@@ -60,7 +59,6 @@ function StatusPanel() {
       setServerHost(config.server.host || "127.0.0.1");
       setServerPort(config.server.port);
       setServerApiKey(config.server.api_key || "");
-      setServerAdminApiKey(config.server.admin_api_key || "");
     }
   }, [config]);
 
@@ -73,7 +71,6 @@ function StatusPanel() {
           host: serverHost || "127.0.0.1",
           port: serverPort,
           api_key: serverApiKey || undefined,
-          admin_api_key: serverAdminApiKey || undefined,
         });
         setServerDirty(false);
       }
@@ -106,7 +103,6 @@ function StatusPanel() {
         host: serverHost || "127.0.0.1",
         port: serverPort,
         api_key: serverApiKey || undefined,
-        admin_api_key: serverAdminApiKey || undefined,
       });
       setServerDirty(false);
       message.success(t("status.serverSaved"));
@@ -318,21 +314,6 @@ function StatusPanel() {
                         disabled={isRunning}
                         onChange={(e) => {
                           setServerApiKey(e.target.value);
-                          setServerDirty(true);
-                        }}
-                        style={{ width: 200 }}
-                      />
-                    </Space>
-                  </Col>
-                  <Col>
-                    <Space>
-                      <Text>Admin Key:</Text>
-                      <Input.Password
-                        placeholder={t("status.noAuth")}
-                        value={serverAdminApiKey}
-                        disabled={isRunning}
-                        onChange={(e) => {
-                          setServerAdminApiKey(e.target.value);
                           setServerDirty(true);
                         }}
                         style={{ width: 200 }}

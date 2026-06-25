@@ -13,9 +13,6 @@ port = 4000
 host = "127.0.0.1"
 # Optional. If set, clients must provide this value via x-api-key or Authorization header.
 api_key = "change-me"
-# Optional but recommended for Kiro/admin management APIs.
-# Admin routes use this key only; they do not require server.api_key.
-admin_api_key = "change-admin-me"
 # max_body_bytes = 67108864
 # 0 means unlimited per-provider concurrency.
 max_concurrent_requests = 0

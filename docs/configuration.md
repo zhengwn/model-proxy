@@ -28,9 +28,6 @@ host = "127.0.0.1"
 # 设置后，客户端必须通过 x-api-key 或 Authorization: Bearer 提供此值
 # api_key = "your-server-api-key"
 
-# Admin API 认证密钥（可选，Kiro 管理面板需要）
-# admin_api_key = "your-admin-api-key"
-
 # 请求体大小上限（字节），默认 64MB
 # max_body_bytes = 67108864
 
@@ -123,7 +120,6 @@ retention_days = 7       # 日志文件保留天数
 | `port` | u16 | 必填 | 监听端口 |
 | `host` | string | "127.0.0.1" | 监听地址 |
 | `api_key` | string? | 无 | 客户端认证密钥，不设置则不鉴权 |
-| `admin_api_key` | string? | 无 | Admin API 认证密钥 |
 | `max_body_bytes` | usize | 67108864 (64MB) | 请求体大小上限 |
 | `max_concurrent_requests` | usize | 0 | 每个 Provider 最大并发请求数，0 表示不限制 |
 

@@ -55,7 +55,7 @@ cargo build --release
 ## 使用方式
 
 1. 启动应用后，在 **Provider 管理** 页面添加你的 AI 服务提供商配置（可用模板快速填充）
-2. 在 **服务状态** 页面的内联设置中配置监听 Host、端口、客户端认证密钥和 Admin 密钥
+2. 在 **服务状态** 页面的内联设置中配置监听 Host、端口和客户端认证密钥
 3. 在 **服务状态** 页面点击启动服务
 4. 将 IDE 或客户端的 API Base URL 指向 `http://localhost:4000`，API Key 设为你配置的 `server.api_key`
 5. 可在 **模型路由** 页面配置模型名称映射（如将 `claude-sonnet` 路由到 `deepseek-v4-pro`），随时修改无需重启；Kiro provider 的运行参数可在 **Kiro 管理** 页面调整
@@ -77,9 +77,10 @@ cargo build --release
 | GET | `/api/usage` | Kiro 用量查询 |
 | GET | `/api/flows` | Kiro flow 监控 |
 | POST | `/api/event_logging/batch` | 遥测事件接收兼容端点 |
-| `/api/admin/*` | Admin API | Kiro 凭据、设置、IP、站点状态等管理端点 |
+| POST | `/api/kiro/login/start`、`/api/kiro/login/poll` | Kiro 设备授权登录（发起 / 轮询） |
+| POST | `/api/kiro/social/start`、`/api/kiro/social/exchange` | Kiro 社交登录（发起 / 换取令牌） |
 
-**认证：** 若配置了 `server.api_key`，客户端代理请求需通过 `x-api-key` 或 `Authorization: Bearer` 头提供密钥，否则返回 401。`/health`、`/metrics`、`/v1/models` 为公开端点。`/api/admin/*` 使用独立的 `server.admin_api_key`，不叠加客户端 key。
+**认证：** 若配置了 `server.api_key`，客户端代理请求需通过 `x-api-key` 或 `Authorization: Bearer` 头提供密钥，否则返回 401。`/health`、`/metrics`、`/v1/models` 为公开端点。
 
 **超时：** 上游连接 30s，非流式请求 300s，流式请求无总超时，连接池空闲 90s。
 
@@ -92,7 +93,7 @@ model-proxy/
 │   ├── src/error.rs         #   统一错误类型（thiserror）
 │   ├── src/provider_registry.rs  # Provider 注册表（按名查找、重复检测）
 │   ├── src/convert/         #   Anthropic/OpenAI/Kiro 请求响应转换
-│   ├── src/server/          #   HTTP 路由、鉴权、中间件、Kiro/admin handlers
+│   ├── src/server/          #   HTTP 路由、鉴权、中间件、Kiro handlers
 │   └── src/logging/         #   日志收集器、文件写入（JSONL）、截断、轮转
 ├── src/                     # CLI 二进制入口
 │   └── main.rs              #   配置加载、信号处理、服务器启动

@@ -146,7 +146,7 @@ async fn start_server_with_state(
         .route("/api/kiro/social/exchange", post(proxy_kiro_social_exchange))
         .route("/api/event_logging/batch", post(event_logging_batch))
         // Admin routes removed
-        // Client auth middleware (skips /health, /metrics, /v1/models, /api/admin/*)
+        // Client auth middleware (skips /health, /metrics, /v1/models)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             server::client_auth_middleware,

@@ -196,7 +196,7 @@ const zhMessages = {
   "kiro.batchRefresh": "批量刷新",
   "kiro.addAccount": "添加账户",
   "kiro.startServiceHint":
-    "请确认代理服务已启动，且已配置 admin_api_key",
+    "请确认代理服务已启动",
   "kiro.accountDetail": "账户详情: {id}",
   "kiro.accountAdded": "账户已添加",
   "kiro.addAccountTitle": "添加 Kiro 账户",
@@ -516,7 +516,7 @@ const enMessages: Messages = {
   "kiro.batchRefresh": "Batch Refresh",
   "kiro.addAccount": "Add Account",
   "kiro.startServiceHint":
-    "Please ensure the proxy service is running and admin_api_key is configured",
+    "Please ensure the proxy service is running",
   "kiro.accountDetail": "Account Details: {id}",
   "kiro.accountAdded": "Account added",
   "kiro.addAccountTitle": "Add Kiro Account",
