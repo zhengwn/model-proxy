@@ -323,6 +323,9 @@ function LogViewer() {
             <span style={{ color: "var(--ant-color-text-secondary)", fontSize: 13 }}>
               {t("log.displayCount", { filtered: filteredLogs.length, total: logs.length, max: MAX_LOG_ENTRIES })}
             </span>
+            <Button danger icon={<DeleteOutlined />} onClick={handleClear} disabled={logs.length === 0}>
+              {t("log.clearLogs")}
+            </Button>
             <Button icon={<SettingOutlined />} onClick={() => setSettingsOpen(true)}>
               {t("log.settings")}
             </Button>
@@ -331,10 +334,6 @@ function LogViewer() {
       >
         <div style={{ marginBottom: 16 }}>
           <Space wrap size={10}>
-            <Button danger icon={<DeleteOutlined />} onClick={handleClear} disabled={logs.length === 0}>
-              {t("log.clearLogs")}
-            </Button>
-            <div style={{ width: 1, height: 20, background: "var(--ant-color-split)", margin: "0 4px" }} />
             <Select
               value={statusFilter}
               onChange={setStatusFilter}
