@@ -386,19 +386,6 @@ impl ProviderConfig {
         matching_route(requested_model, global_routes)
             .and_then(|route| route.reasoning_effort.as_deref())
     }
-
-    /// 向后兼容：使用 provider 自身的 model_routes（已废弃，优先使用全局路由）
-    pub fn resolve_model<'a>(&'a self, requested_model: Option<&str>) -> &'a str {
-        self.resolve_model_with_routes(requested_model, &self.model_routes)
-    }
-
-    /// 向后兼容：使用 provider 自身的 model_routes（已废弃，优先使用全局路由）
-    pub fn resolve_route_reasoning_effort<'a>(
-        &'a self,
-        requested_model: Option<&str>,
-    ) -> Option<&'a str> {
-        self.resolve_route_reasoning_effort_with_routes(requested_model, &self.model_routes)
-    }
 }
 
 /// 在路由列表中查找匹配的路由
