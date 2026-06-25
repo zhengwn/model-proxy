@@ -66,22 +66,26 @@ body {
 
 .provider-item-active {
   position: relative;
-  background: linear-gradient(90deg, rgba(79, 70, 229, 0.06), rgba(79, 70, 229, 0) 50%);
+  margin: 4px 0;
+  padding-left: 16px !important;
+  border-radius: 10px;
+  border-block-end-color: transparent !important;
+  background: linear-gradient(90deg, rgba(79, 70, 229, 0.13), rgba(79, 70, 229, 0.04) 70%);
 }
 
 .provider-item-active::before {
   content: "";
   position: absolute;
   left: 0;
-  top: 10px;
-  bottom: 10px;
-  width: 3px;
-  border-radius: 0 3px 3px 0;
+  top: 8px;
+  bottom: 8px;
+  width: 4px;
+  border-radius: 0 4px 4px 0;
   background: #4f46e5;
 }
 
 [data-theme="dark"] .provider-item-active {
-  background: linear-gradient(90deg, rgba(99, 102, 241, 0.1), rgba(99, 102, 241, 0) 50%);
+  background: linear-gradient(90deg, rgba(99, 102, 241, 0.2), rgba(99, 102, 241, 0.06) 70%);
 }
 
 [data-theme="dark"] .provider-item-active::before {
