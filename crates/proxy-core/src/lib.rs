@@ -1,3 +1,8 @@
+// Edition 2024 stabilized let-chains, so clippy's `collapsible_if` now flags
+// nested `if let ... { if ... }` blocks throughout this crate. We keep the
+// explicit nested style for readability rather than collapsing into let-chains.
+#![allow(clippy::collapsible_if)]
+
 pub mod config;
 pub mod convert;
 pub mod error;

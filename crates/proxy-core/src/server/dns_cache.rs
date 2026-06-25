@@ -178,7 +178,7 @@ async fn resolve_host(host: &str) -> Option<Vec<IpAddr>> {
         format!("{}:0", host)
     };
 
-    let result = match tokio::net::lookup_host(&addr_with_port).await {
+    match tokio::net::lookup_host(&addr_with_port).await {
         Ok(addrs) => {
             let ips: Vec<IpAddr> = addrs.map(|a| a.ip()).collect();
             if ips.is_empty() {
@@ -188,8 +188,7 @@ async fn resolve_host(host: &str) -> Option<Vec<IpAddr>> {
             }
         }
         Err(_) => None,
-    };
-    result
+    }
 }
 
 #[cfg(test)]

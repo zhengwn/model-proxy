@@ -1,3 +1,7 @@
+// Edition 2024 stabilized let-chains, so clippy's `collapsible_if` now flags
+// nested `if let ... { if ... }` blocks. Keep the explicit nested style.
+#![allow(clippy::collapsible_if)]
+
 // Tauri app setup and command registration
 //
 // ## Auto-start (Optional Feature)
