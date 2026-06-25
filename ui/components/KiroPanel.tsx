@@ -324,7 +324,7 @@ function CredentialManager() {
       {kiro.error && (
         <Alert
           type="error"
-          message={kiro.error}
+          title={kiro.error}
           closable
           onClose={() => kiro.setError(null)}
           style={{ marginBottom: 16 }}
@@ -520,7 +520,7 @@ function EndpointDashboard() {
       </div>
 
       {kiro.error && (
-        <Alert type="error" message={kiro.error} closable onClose={() => kiro.setError(null)} style={{ marginBottom: 16 }} />
+        <Alert type="error" title={kiro.error} closable onClose={() => kiro.setError(null)} style={{ marginBottom: 16 }} />
       )}
 
       <Row gutter={[16, 16]}>
@@ -621,7 +621,7 @@ function SettingsPanel() {
   return (
     <Space direction="vertical" style={{ width: "100%" }} size="middle">
       {kiro.error && (
-        <Alert type="error" message={kiro.error} closable onClose={() => kiro.setError(null)} />
+        <Alert type="error" title={kiro.error} closable onClose={() => kiro.setError(null)} />
       )}
 
       <Card title={t("kiro.thinkingMode")}>
@@ -806,7 +806,7 @@ function AuthFlows() {
     <Row gutter={[16, 16]}>
       {kiro.error && (
         <Col span={24}>
-          <Alert type="error" message={kiro.error} closable onClose={() => kiro.setError(null)} />
+          <Alert type="error" title={kiro.error} closable onClose={() => kiro.setError(null)} />
         </Col>
       )}
 

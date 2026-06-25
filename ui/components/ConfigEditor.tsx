@@ -80,7 +80,7 @@ export function ConfigEditor() {
 
       {isNew && (
         <Alert
-          message={t("config.firstUse")}
+          title={t("config.firstUse")}
           description={t("config.firstUseDesc")}
           type="info"
           showIcon

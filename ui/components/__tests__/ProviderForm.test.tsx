@@ -119,10 +119,10 @@ describe("ProviderForm", () => {
     await user.type(modelInput, "deepseek-chat");
 
     // Select format - open the dropdown using mouseDown on the format selector
-    // (skip the first select which is the template selector)
-    const selectInputs = document.querySelectorAll(
-      ".ant-select-selector"
-    );
+    // (skip the first select which is the template selector).
+    // antd 6 renamed the inner `.ant-select-selector` node, so target the
+    // `.ant-select` wrapper instead.
+    const selectInputs = document.querySelectorAll(".ant-select");
     const formatSelect = selectInputs[selectInputs.length - 1] as HTMLElement;
     await act(async () => {
       fireEvent.mouseDown(formatSelect);

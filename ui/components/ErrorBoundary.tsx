@@ -16,7 +16,7 @@ function ErrorFallback({ error, onReset }: { error: Error | null; onReset: () =>
   return (
     <div style={{ padding: 48 }}>
       <Alert
-        message={t("error.appError")}
+        title={t("error.appError")}
         description={
           <div>
             <p>{error?.message || t("error.unknown")}</p>

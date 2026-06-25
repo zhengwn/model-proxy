@@ -126,7 +126,7 @@ function StatusPanel() {
       {/* First-launch guide */}
       {isNew && (
         <Alert
-          message={t("status.firstUse")}
+          title={t("status.firstUse")}
           description={t("status.firstUseDesc")}
           type="info"
           showIcon
@@ -135,7 +135,7 @@ function StatusPanel() {
 
       {!hasProviders && !isNew && (
         <Alert
-          message={t("status.noProviders")}
+          title={t("status.noProviders")}
           description={t("status.noProvidersDesc")}
           type="warning"
           showIcon
@@ -185,7 +185,7 @@ function StatusPanel() {
               <Alert
                 type="success"
                 showIcon={false}
-                message={
+                title={
                   <Space direction="vertical" size={2}>
                     <Text>
                       {t("status.serviceRunningHint", { addr: "|||ADDR|||" }).split("|||ADDR|||")[0]}
@@ -264,7 +264,7 @@ function StatusPanel() {
 
       {status?.error_message && (
         <Alert
-          message={t("status.serviceError")}
+          title={t("status.serviceError")}
           description={status.error_message}
           type="error"
           showIcon

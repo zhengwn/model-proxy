@@ -166,7 +166,7 @@ export function ModelRoutesEditor() {
     return (
       <Card>
         <Alert
-          message={t("routes.loadFailed")}
+          title={t("routes.loadFailed")}
           description={error}
           type="error"
           showIcon
@@ -202,7 +202,7 @@ export function ModelRoutesEditor() {
           showIcon={false}
           className="modern-alert"
           style={{ marginBottom: 10 }}
-          message={
+          title={
             <div>
               <Paragraph style={{ margin: 0 }}>
                 <strong>{t("routes.explanation")}</strong>{t("routes.explanationDesc")}

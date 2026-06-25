@@ -84,7 +84,7 @@ export function ProviderManager() {
     return (
       <div>
         <Alert
-          message={t("provider.loadFailed")}
+          title={t("provider.loadFailed")}
           description={error}
           type="error"
           showIcon
@@ -118,7 +118,7 @@ export function ProviderManager() {
     >
       {error && (
         <Alert
-          message={error}
+          title={error}
           type="error"
           showIcon
           closable
@@ -127,7 +127,7 @@ export function ProviderManager() {
       )}
       {providers.length === 0 && !error ? (
         <Alert
-          message={t("provider.notConfigured")}
+          title={t("provider.notConfigured")}
           description={t("provider.notConfiguredDesc")}
           type="info"
           showIcon

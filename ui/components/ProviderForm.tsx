@@ -330,7 +330,7 @@ export function ProviderForm({
           type="info"
           showIcon={false}
           style={{ marginTop: -8 }}
-          message={
+          title={
             <Text type="secondary" style={{ fontSize: 12 }}>
               {t("providerForm.formatHint1")}
               <br />
@@ -489,7 +489,7 @@ export function ProviderForm({
                   type="info"
                   showIcon={false}
                   style={{ marginBottom: 16 }}
-                  message={
+                  title={
                     <Text type="secondary" style={{ fontSize: 12 }}>
                       {t("providerForm.advancedSettingsHint")}
                     </Text>
