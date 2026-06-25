@@ -66,8 +66,10 @@ body {
 
 .provider-item-active {
   position: relative;
-  margin: 4px 0;
-  padding-left: 16px !important;
+  /* Bleed into the card padding while keeping content aligned with the
+     other rows, so switching the active provider never shifts the text. */
+  margin-inline: -16px;
+  padding-inline: 16px;
   border-radius: 10px;
   border-block-end-color: transparent !important;
   background: linear-gradient(90deg, rgba(79, 70, 229, 0.13), rgba(79, 70, 229, 0.04) 70%);
@@ -76,11 +78,11 @@ body {
 .provider-item-active::before {
   content: "";
   position: absolute;
-  left: 0;
+  left: 4px;
   top: 8px;
   bottom: 8px;
   width: 4px;
-  border-radius: 0 4px 4px 0;
+  border-radius: 4px;
   background: #4f46e5;
 }
 
