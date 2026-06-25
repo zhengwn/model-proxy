@@ -350,8 +350,9 @@ pub struct KiroConfig {
 }
 
 impl ProviderConfig {
-    /// Creates a placeholder ProviderConfig used as serde default.
-    /// This is replaced during normalize() with the actual active provider.
+    /// Creates a placeholder ProviderConfig used as the serde default for the
+    /// legacy `Config.provider` field. When a config uses the new `[[providers]]`
+    /// format, this placeholder is simply left in place and ignored.
     pub fn placeholder() -> Self {
         Self {
             name: String::new(),
@@ -416,32 +417,22 @@ impl Config {
     /// Normalize the config: migrate legacy `[provider]` to `providers` vec if needed.
     ///
     /// Rules:
-    /// 1. If `providers` is non-empty, ignore the legacy `provider` field
-    /// 2. If `providers` is empty but the legacy `provider` field has data, migrate it
-    ///    to providers with name="default" and set active_provider="default"
-    /// 3. If both are empty, that's fine - validate() will catch it
+    /// 1. If `providers` is non-empty, the new format wins and the legacy
+    ///    `provider` field is ignored (the proxy reads providers via the
+    ///    registry, never `config.provider`).
+    /// 2. If `providers` is empty but the legacy `provider` field has data,
+    ///    migrate it to providers with name="default" and active_provider="default".
+    /// 3. If both are empty, that's fine - validate() will catch it.
     pub fn normalize(&mut self) {
-        if !self.providers.is_empty() {
-            // New format: providers vec is populated, use it.
-            // Set the legacy `provider` field to the active provider for backward compat
-            // with existing handler code (until task 2.3 migrates).
-            if let Ok(active) = self.active_provider_config() {
-                self.provider = active.clone();
-            } else if let Some(first) = self.providers.first() {
-                self.provider = first.clone();
+        // Migrate the legacy `provider` field into `providers` only when no
+        // new-format providers are present.
+        if self.providers.is_empty() && !self.provider.base_url.is_empty() {
+            let mut migrated = self.provider.clone();
+            if migrated.name.is_empty() {
+                migrated.name = "default".to_string();
             }
-        } else {
-            // Check if the legacy `provider` field has actual data (non-placeholder)
-            if !self.provider.base_url.is_empty() {
-                // Migrate legacy provider to providers vec
-                let mut migrated = self.provider.clone();
-                if migrated.name.is_empty() {
-                    migrated.name = "default".to_string();
-                }
-                self.providers = vec![migrated];
-                self.active_provider = Some("default".to_string());
-            }
-            // If both are empty, leave as-is; validate() will report NoProviders
+            self.providers = vec![migrated];
+            self.active_provider = Some("default".to_string());
         }
 
         // Migrate provider-level model_routes to global model_routes if global is empty
