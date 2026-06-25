@@ -64,6 +64,12 @@ body {
   transition: background 0.2s ease;
 }
 
+/* Uniform inner gutter on every provider row so the active block has
+   breathing room while all rows stay left-aligned with each other. */
+.provider-item {
+  padding-inline: 14px !important;
+}
+
 .provider-item-active {
   /* A rounded tinted block aligned to the content column: no protruding
      accent, no padding shift, so switching the active provider never moves
