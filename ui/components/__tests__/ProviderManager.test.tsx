@@ -134,12 +134,14 @@ describe("ProviderManager", () => {
     await user.click(deleteButtons[1]);
 
     await waitFor(() => {
-      expect(screen.getByText("Confirm Delete")).toBeInTheDocument();
+      // antd >=5.29 renders the Modal.confirm title in more than one node
+      // (visible + a11y), so assert on the unique content message instead.
+      expect(
+        screen.getByText('Delete Provider "anthropic"?')
+      ).toBeInTheDocument();
     });
 
-    expect(
-      screen.getByText('Delete Provider "anthropic"?')
-    ).toBeInTheDocument();
+    expect(screen.getAllByText("Confirm Delete").length).toBeGreaterThanOrEqual(1);
   });
 
   // Modal.warning does not render in jsdom test environment
