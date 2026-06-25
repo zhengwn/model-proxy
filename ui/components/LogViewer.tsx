@@ -14,7 +14,7 @@ import {
   Card,
   Drawer,
 } from "antd";
-import { DeleteOutlined, SearchOutlined, SettingOutlined } from "@ant-design/icons";
+import { DeleteOutlined, SearchOutlined, SettingOutlined, InboxOutlined } from "@ant-design/icons";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import type { LogEntry, LoggingConfig } from "../types";
@@ -103,8 +103,8 @@ function getColumns(t: (key: keyof Messages, params?: Record<string, string | nu
         if (requested && requested !== actual && actual) {
           return (
             <span>
-              <span style={{ opacity: 0.6 }}>{requested}</span>
-              <span style={{ margin: "0 4px" }}>→</span>
+              <span style={{ opacity: 0.55 }}>{requested}</span>
+              <span style={{ margin: "0 5px", color: "#6366f1", fontWeight: 600 }}>→</span>
               <span>{actual}</span>
             </span>
           );
@@ -370,7 +370,23 @@ function LogViewer() {
         pagination={false}
         tableLayout="fixed"
         scroll={{ x: 1524, y: 400 }}
-        locale={{ emptyText: t("log.noLogs") }}
+        locale={{
+          emptyText: (
+            <div
+              style={{
+                padding: "44px 0",
+                display: "flex",
+                flexDirection: "column",
+                alignItems: "center",
+                gap: 10,
+                color: "var(--ant-color-text-tertiary)",
+              }}
+            >
+              <InboxOutlined style={{ fontSize: 30, opacity: 0.45 }} />
+              <span style={{ fontSize: 13 }}>{t("log.noLogs")}</span>
+            </div>
+          ),
+        }}
       />
       </Card>
       <Drawer
