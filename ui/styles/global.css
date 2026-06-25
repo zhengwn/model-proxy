@@ -62,17 +62,30 @@ body {
 /* Active provider row highlight */
 .ant-list-item {
   transition: background 0.2s ease;
-  border-radius: 8px;
 }
 
 .provider-item-active {
-  background: linear-gradient(90deg, rgba(79, 70, 229, 0.07), rgba(79, 70, 229, 0) 55%);
-  box-shadow: inset 3px 0 0 #4f46e5;
+  position: relative;
+  background: linear-gradient(90deg, rgba(79, 70, 229, 0.06), rgba(79, 70, 229, 0) 50%);
+}
+
+.provider-item-active::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 10px;
+  bottom: 10px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: #4f46e5;
 }
 
 [data-theme="dark"] .provider-item-active {
-  background: linear-gradient(90deg, rgba(99, 102, 241, 0.12), rgba(99, 102, 241, 0) 55%);
-  box-shadow: inset 3px 0 0 #6366f1;
+  background: linear-gradient(90deg, rgba(99, 102, 241, 0.1), rgba(99, 102, 241, 0) 50%);
+}
+
+[data-theme="dark"] .provider-item-active::before {
+  background: #6366f1;
 }
 
 /* Metric cards on the overview page */
