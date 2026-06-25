@@ -1,0 +1,1192 @@
+//! Multi-account failover for Kiro API with circuit breaker pattern.
+//!
+//! Manages multiple Kiro credentials with automatic failover when an account
+//! encounters recoverable errors (403, 429, 402). Uses exponential backoff
+//! with probabilistic retry for broken accounts.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+use tracing::{info, warn};
+
+use super::auth::KiroAuthManager;
+use super::rate_limiter::{check_quota, QuotaManager};
+use crate::config::KiroConfig;
+
+mod circuit_breaker;
+mod error_class;
+mod load_balancing;
+
+use circuit_breaker::{AccountCircuitBreaker, CircuitState};
+pub use error_class::{classify_error, ErrorClass};
+pub use load_balancing::LoadBalancingMode;
+
+/// A managed Kiro account with auth manager and circuit breaker.
+struct ManagedAccount {
+    id: String,
+    auth: Arc<Mutex<KiroAuthManager>>,
+    circuit: AccountCircuitBreaker,
+    /// Optional per-account proxy URL (HTTP/SOCKS5)
+    proxy_url: Option<String>,
+    /// Priority (lower = higher priority)
+    priority: u32,
+    /// Whether this account is manually disabled
+    disabled: bool,
+    /// Number of currently inflight requests
+    inflight_count: u32,
+    /// Exponential moving average of response latency (ms)
+    latency_ema: f64,
+    /// Timestamp of last successful request
+    last_success_at: Option<Instant>,
+    /// Total recent requests for load balancing scoring
+    recent_requests: u64,
+}
+
+/// Snapshot of a single account's status for the Admin API.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AccountSnapshot {
+    pub id: String,
+    pub priority: u32,
+    pub disabled: bool,
+    pub failure_count: u32,
+    pub is_current: bool,
+    pub is_available: bool,
+    pub auth_method: String,
+    pub total_requests: u64,
+    pub successful_requests: u64,
+    pub failed_requests: u64,
+    pub proxy_url: Option<String>,
+    pub region: String,
+    pub health_score: u32,
+    pub quota_remaining: Option<f64>,
+    pub quota_limit: Option<f64>,
+    pub quota_exhausted: Option<bool>,
+}
+
+/// Persisted circuit breaker state for a single account.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedAccountState {
+    failures: u32,
+    health_score: u32,
+    disabled: bool,
+    total_requests: u64,
+    successful_requests: u64,
+    failed_requests: u64,
+}
+
+/// Top-level persisted state file structure.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PersistedAccountManagerState {
+    accounts: HashMap<String, PersistedAccountState>,
+}
+
+/// Multi-account manager with circuit breaker failover.
+pub struct AccountManager {
+    accounts: Vec<ManagedAccount>,
+    current_index: usize,
+    /// Probability of retrying a broken account (0.0 - 1.0)
+    probabilistic_retry_chance: f64,
+    /// Load balancing mode
+    load_balancing_mode: LoadBalancingMode,
+    /// Round-robin counter for balanced mode
+    round_robin_index: usize,
+    /// Quota cooldown manager for 429 rate-limited accounts
+    quota_manager: QuotaManager,
+    /// Health score decay per failure
+    health_score_decay: u32,
+    /// Health score recovery per success
+    health_score_recovery: u32,
+    /// Filesystem path for persisted account state
+    state_file_path: String,
+    /// Dirty flag — set when circuit breaker state changes
+    dirty: Arc<AtomicBool>,
+}
+
+impl AccountManager {
+    /// Create a new account manager from multiple Kiro configs.
+    pub fn new(configs: &[(String, KiroConfig)], client: reqwest::Client) -> Self {
+        Self::new_with_mode(configs, client, LoadBalancingMode::Priority)
+    }
+
+    /// Create with explicit load balancing mode.
+    pub fn new_with_mode(
+        configs: &[(String, KiroConfig)],
+        client: reqwest::Client,
+        mode: LoadBalancingMode,
+    ) -> Self {
+        let quota_cooldown_secs = configs.first()
+            .map(|(_, c)| c.quota_cooldown_secs.unwrap_or(300))
+            .unwrap_or(300);
+        let health_score_decay = configs.first()
+            .map(|(_, c)| c.health_score_decay.unwrap_or(20))
+            .unwrap_or(20);
+        let health_score_recovery = configs.first()
+            .map(|(_, c)| c.health_score_recovery.unwrap_or(10))
+            .unwrap_or(10);
+        let quota_check_enabled = configs.first()
+            .map(|(_, c)| c.enable_quota_check.unwrap_or(false))
+            .unwrap_or(false);
+        let quota_check_interval_secs = configs.first()
+            .map(|(_, c)| c.quota_check_interval_secs.unwrap_or(600))
+            .unwrap_or(600);
+
+        let mut accounts: Vec<ManagedAccount> = configs
+            .iter()
+            .map(|(id, config)| {
+                let auth = KiroAuthManager::new(config, client.clone());
+                ManagedAccount {
+                    id: id.clone(),
+                    auth: Arc::new(Mutex::new(auth)),
+                    circuit: AccountCircuitBreaker::new(),
+                    proxy_url: config.proxy_url.clone(),
+                    priority: 0,
+                    disabled: false,
+                    inflight_count: 0,
+                    latency_ema: 0.0,
+                    last_success_at: None,
+                    recent_requests: 0,
+                }
+            })
+            .collect();
+
+        // Sort by priority (lower = higher priority)
+        accounts.sort_by_key(|a| a.priority);
+
+        info!(
+            account_count = accounts.len(),
+            mode = mode.as_str(),
+            "初始化 Kiro 多账户管理器"
+        );
+
+        let state_file_path = {
+            let home = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_else(|_| ".".to_string());
+            format!("{}/.config/model-proxy/account-state.json", home)
+        };
+
+        let mut mgr = Self {
+            accounts,
+            current_index: 0,
+            probabilistic_retry_chance: 0.1,
+            load_balancing_mode: mode,
+            round_robin_index: 0,
+            quota_manager: QuotaManager::new(quota_cooldown_secs)
+                .with_quota_check(quota_check_enabled, quota_check_interval_secs),
+            health_score_decay,
+            health_score_recovery,
+            state_file_path,
+            dirty: Arc::new(AtomicBool::new(false)),
+        };
+        mgr.load_state();
+        mgr
+    }
+
+    /// Get the current preferred account's auth manager.
+    /// Returns (account_id, auth_arc).
+    pub fn current_account(&self) -> Option<(&str, &Arc<Mutex<KiroAuthManager>>)> {
+        self.accounts
+            .get(self.current_index)
+            .filter(|a| !a.disabled && a.circuit.is_available())
+            .map(|a| (a.id.as_str(), &a.auth))
+    }
+
+    /// Mark state as dirty (needs persistence).
+    fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Save account state to disk if dirty. Uses atomic tmp-file + rename.
+    pub fn save_state(&self) {
+        if !self.dirty.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let state = PersistedAccountManagerState {
+            accounts: self.accounts.iter().map(|a| {
+                (a.id.clone(), PersistedAccountState {
+                    failures: a.circuit.failures,
+                    health_score: a.circuit.health_score,
+                    disabled: a.disabled,
+                    total_requests: a.circuit.total_requests,
+                    successful_requests: a.circuit.successful_requests,
+                    failed_requests: a.circuit.failed_requests,
+                })
+            }).collect(),
+        };
+
+        match serde_json::to_string_pretty(&state) {
+            Ok(json) => {
+                let tmp_path = format!("{}.tmp", self.state_file_path);
+                // Ensure parent directory exists
+                if let Some(parent) = std::path::Path::new(&self.state_file_path).parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if std::fs::write(&tmp_path, &json).is_ok() {
+                    if std::fs::rename(&tmp_path, &self.state_file_path).is_ok() {
+                        self.dirty.store(false, Ordering::Relaxed);
+                        tracing::debug!("账户状态已持久化");
+                    } else {
+                        let _ = std::fs::remove_file(&tmp_path);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "序列化账户状态失败");
+            }
+        }
+    }
+
+    /// Load persisted account state from disk and apply to current accounts.
+    fn load_state(&mut self) {
+        let data = match std::fs::read_to_string(&self.state_file_path) {
+            Ok(d) => d,
+            Err(_) => return, // No persisted state yet
+        };
+        let persisted: PersistedAccountManagerState = match serde_json::from_str(&data) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "解析账户状态文件失败");
+                return;
+            }
+        };
+
+        for account in &mut self.accounts {
+            if let Some(saved) = persisted.accounts.get(&account.id) {
+                account.circuit.failures = saved.failures;
+                account.circuit.health_score = saved.health_score;
+                account.disabled = saved.disabled;
+                account.circuit.total_requests = saved.total_requests;
+                account.circuit.successful_requests = saved.successful_requests;
+                account.circuit.failed_requests = saved.failed_requests;
+                // If the account had failures before shutdown, set to HalfOpen
+                // so it gets a fair probe on next startup
+                if saved.failures > 0 {
+                    account.circuit.state = CircuitState::HalfOpen;
+                }
+                info!(
+                    account_id = account.id.as_str(),
+                    failures = saved.failures,
+                    health_score = saved.health_score,
+                    "从持久化文件恢复账户状态"
+                );
+            }
+        }
+    }
+
+    /// Start a background periodic save task.
+    /// Call this after wrapping the AccountManager in an Arc<Mutex<>>.
+    pub fn start_periodic_save(mgr: Arc<Mutex<Self>>) {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let guard = mgr.lock().await;
+                guard.save_state();
+            }
+        });
+    }
+
+    /// Get an available account, skipping excluded accounts.
+    /// Implements sticky behavior: prefers the current account.
+    /// Returns (account_index, account_id, auth_arc).
+    pub fn get_available_account(
+        &mut self,
+        exclude: &[String],
+    ) -> Option<(usize, &str, &Arc<Mutex<KiroAuthManager>>)> {
+        match self.load_balancing_mode {
+            LoadBalancingMode::Priority => self.get_available_priority(exclude),
+            LoadBalancingMode::Balanced => self.get_available_balanced(exclude),
+            LoadBalancingMode::Smart => self.get_available_smart(exclude),
+        }
+    }
+
+    fn get_available_priority(
+        &mut self,
+        exclude: &[String],
+    ) -> Option<(usize, &str, &Arc<Mutex<KiroAuthManager>>)> {
+        // Try current account first (sticky)
+        if self.current_index < self.accounts.len() {
+            let current = &self.accounts[self.current_index];
+            if !current.disabled && current.circuit.is_available()
+                && !self.quota_manager.is_in_cooldown(&current.id)
+                && !self.quota_manager.is_quota_exhausted(&current.id)
+                && !exclude.contains(&current.id)
+            {
+                return Some((self.current_index, current.id.as_str(), &current.auth));
+            }
+        }
+
+        // Find next available account index (sorted by priority)
+        let mut found_idx = None;
+        for (i, account) in self.accounts.iter().enumerate() {
+            if i == self.current_index {
+                continue;
+            }
+            if account.disabled || exclude.contains(&account.id)
+                || self.quota_manager.is_in_cooldown(&account.id)
+                || self.quota_manager.is_quota_exhausted(&account.id)
+            {
+                continue;
+            }
+
+            if account.circuit.is_available() {
+                found_idx = Some(i);
+                break;
+            }
+
+            // Probabilistic retry for broken accounts
+            if account.circuit.state == CircuitState::Broken
+                && self.should_probabilistic_retry(i) {
+                    found_idx = Some(i);
+                    break;
+                }
+        }
+
+        if let Some(idx) = found_idx {
+            self.current_index = idx;
+            let account = &self.accounts[idx];
+            Some((idx, account.id.as_str(), &account.auth))
+        } else {
+            None
+        }
+    }
+
+    fn get_available_balanced(
+        &mut self,
+        exclude: &[String],
+    ) -> Option<(usize, &str, &Arc<Mutex<KiroAuthManager>>)> {
+        let count = self.accounts.len();
+        let mut found_idx = None;
+        for _ in 0..count {
+            let idx = self.round_robin_index % count;
+            self.round_robin_index = (self.round_robin_index + 1) % count;
+            let account = &self.accounts[idx];
+            if account.disabled || exclude.contains(&account.id)
+                || self.quota_manager.is_in_cooldown(&account.id)
+                || self.quota_manager.is_quota_exhausted(&account.id)
+            {
+                continue;
+            }
+            if account.circuit.is_available() {
+                found_idx = Some(idx);
+                break;
+            }
+            // Probabilistic retry for broken accounts
+            if account.circuit.state == CircuitState::Broken
+                && self.should_probabilistic_retry(idx) {
+                    found_idx = Some(idx);
+                    break;
+                }
+        }
+
+        if let Some(idx) = found_idx {
+            self.current_index = idx;
+            let account = &self.accounts[idx];
+            Some((idx, account.id.as_str(), &account.auth))
+        } else {
+            None
+        }
+    }
+
+    /// Smart load balancing: composite scoring with jitter.
+    fn get_available_smart(
+        &mut self,
+        exclude: &[String],
+    ) -> Option<(usize, &str, &Arc<Mutex<KiroAuthManager>>)> {
+        // Collect available accounts with scores
+        let avg_recent = {
+            let total: u64 = self.accounts.iter().map(|a| a.recent_requests).sum();
+            let count = self.accounts.len().max(1) as f64;
+            total as f64 / count
+        };
+
+        let mut candidates: Vec<(usize, f64)> = Vec::new();
+        for (i, account) in self.accounts.iter().enumerate() {
+            if account.disabled || exclude.contains(&account.id)
+                || self.quota_manager.is_in_cooldown(&account.id)
+                || self.quota_manager.is_quota_exhausted(&account.id)
+            {
+                continue;
+            }
+            if !account.circuit.is_available() {
+                // Probabilistic retry for broken accounts
+                if account.circuit.state == CircuitState::Broken && self.should_probabilistic_retry(i) {
+                    let quota_ratio = self.quota_manager.get_quota_info(&account.id)
+                        .and_then(|q| if q.limit > 0.0 { Some(q.remaining / q.limit) } else { None });
+                    let score = Self::compute_account_score(account, avg_recent, quota_ratio);
+                    candidates.push((i, score));
+                }
+                continue;
+            }
+            let quota_ratio = self.quota_manager.get_quota_info(&account.id)
+                .and_then(|q| if q.limit > 0.0 { Some(q.remaining / q.limit) } else { None });
+            let score = Self::compute_account_score(account, avg_recent, quota_ratio);
+            candidates.push((i, score));
+        }
+
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // Sort by score descending (higher = better)
+        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let best_score = candidates[0].1;
+        let threshold = (best_score.abs() * 0.15).max(5.0);
+
+        // Select randomly from top candidates within threshold
+        let top_candidates: Vec<usize> = candidates
+            .iter()
+            .filter(|(_, score)| (best_score - score).abs() <= threshold)
+            .map(|(idx, _)| *idx)
+            .collect();
+
+        let selected_idx = if top_candidates.is_empty() {
+            candidates[0].0
+        } else {
+            let pick = rand_index(top_candidates.len());
+            top_candidates[pick]
+        };
+
+        self.current_index = selected_idx;
+        let account = &self.accounts[selected_idx];
+        Some((selected_idx, account.id.as_str(), &account.auth))
+    }
+
+    /// Compute composite score for smart load balancing. Higher = better.
+    fn compute_account_score(
+        account: &ManagedAccount,
+        avg_recent: f64,
+        quota_remaining_ratio: Option<f64>,
+    ) -> f64 {
+        let health = account.circuit.health_score as f64;
+        let inflight_penalty = -(account.inflight_count as f64 * 30.0);
+        let usage_balance = if avg_recent > 0.0 {
+            let ratio = account.recent_requests as f64 / avg_recent;
+            (-40.0f64).max(40.0 * (1.0 - ratio))
+        } else if account.recent_requests == 0 {
+            40.0
+        } else {
+            0.0
+        };
+        let zero_use_bonus = if account.recent_requests == 0 { 30.0 } else { 0.0 };
+        let idle_bonus = account
+            .last_success_at
+            .map(|t| {
+                let idle_secs = t.elapsed().as_secs_f64();
+                if idle_secs > 30.0 {
+                    (idle_secs / 60.0 * 5.0).min(20.0)
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or(0.0);
+        let latency_bonus = if account.latency_ema > 0.0 && account.latency_ema < 5000.0 {
+            10.0
+        } else {
+            0.0
+        };
+        let quota_bonus = quota_remaining_ratio
+            .map(|r| (r * 20.0).min(20.0))
+            .unwrap_or(0.0);
+
+        health + inflight_penalty + usage_balance + zero_use_bonus + idle_bonus + latency_bonus + quota_bonus
+    }
+
+    /// Increment inflight count for the current account.
+    pub fn increment_inflight(&mut self) {
+        if let Some(account) = self.accounts.get_mut(self.current_index) {
+            account.inflight_count += 1;
+            account.recent_requests += 1;
+        }
+    }
+
+    /// Decrement inflight count for the current account.
+    pub fn release_inflight(&mut self) {
+        if let Some(account) = self.accounts.get_mut(self.current_index) {
+            account.inflight_count = account.inflight_count.saturating_sub(1);
+        }
+    }
+
+    /// Record response latency with exponential moving average (alpha=0.3).
+    pub fn record_response_latency(&mut self, latency_ms: f64) {
+        if let Some(account) = self.accounts.get_mut(self.current_index) {
+            if account.latency_ema == 0.0 {
+                account.latency_ema = latency_ms;
+            } else {
+                account.latency_ema = account.latency_ema * 0.7 + latency_ms * 0.3;
+            }
+        }
+    }
+
+    /// Release inflight count and record response latency in one call.
+    pub fn release_inflight_with_latency(&mut self, latency_ms: f64) {
+        self.release_inflight();
+        self.record_response_latency(latency_ms);
+    }
+
+    /// Record a successful request (also updates last_success_at).
+    pub fn record_success(&mut self) {
+        let recovery = self.health_score_recovery;
+        if let Some(account) = self.accounts.get_mut(self.current_index) {
+            account.circuit.record_success(recovery);
+            account.last_success_at = Some(Instant::now());
+        }
+        self.mark_dirty();
+    }
+
+    /// Check if a broken account should be probabilistically retried.
+    fn should_probabilistic_retry(&self, idx: usize) -> bool {
+        let account = &self.accounts[idx];
+        let elapsed = account
+            .circuit
+            .last_failure
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+        let timeout = account.circuit.recovery_timeout().as_secs_f64();
+        let recovery_progress = elapsed / timeout;
+
+        if recovery_progress > 0.5 && rand_chance() < self.probabilistic_retry_chance {
+            info!(
+                account_id = account.id.as_str(),
+                recovery_progress,
+                "概率重试 broken 账户"
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Record a failed request for the current account.
+    pub fn record_failure(&mut self, error_class: ErrorClass) {
+        let decay = self.health_score_decay;
+        if let Some(account) = self.accounts.get_mut(self.current_index) {
+            let id = account.id.clone();
+            account.circuit.record_failure(error_class.clone(), decay);
+            warn!(
+                account_id = id.as_str(),
+                failures = account.circuit.failures,
+                backoff_secs = account.circuit.recovery_timeout().as_secs(),
+                error_class = ?error_class,
+                "账户 circuit breaker 触发"
+            );
+        }
+        self.mark_dirty();
+    }
+
+    /// Record success for a specific account by index (session-safe).
+    pub fn record_success_at(&mut self, idx: usize) {
+        let recovery = self.health_score_recovery;
+        if let Some(account) = self.accounts.get_mut(idx) {
+            account.circuit.record_success(recovery);
+            account.last_success_at = Some(Instant::now());
+            // Priority mode: sticky to the successful account
+            if self.load_balancing_mode == LoadBalancingMode::Priority {
+                self.current_index = idx;
+            }
+        }
+        self.mark_dirty();
+    }
+
+    /// Record failure for a specific account by index (session-safe).
+    pub fn record_failure_at(&mut self, idx: usize, error_class: ErrorClass) {
+        let decay = self.health_score_decay;
+        if let Some(account) = self.accounts.get_mut(idx) {
+            let id = account.id.clone();
+            account.circuit.record_failure(error_class.clone(), decay);
+            warn!(
+                account_id = id.as_str(),
+                failures = account.circuit.failures,
+                backoff_secs = account.circuit.recovery_timeout().as_secs(),
+                error_class = ?error_class,
+                "账户 circuit breaker 触发 (at)"
+            );
+        }
+        self.mark_dirty();
+    }
+
+    /// Increment inflight count for a specific account by index.
+    pub fn increment_inflight_at(&mut self, idx: usize) {
+        if let Some(account) = self.accounts.get_mut(idx) {
+            account.inflight_count += 1;
+            account.recent_requests += 1;
+        }
+    }
+
+    /// Decrement inflight count for a specific account by index.
+    pub fn release_inflight_at(&mut self, idx: usize) {
+        if let Some(account) = self.accounts.get_mut(idx) {
+            account.inflight_count = account.inflight_count.saturating_sub(1);
+        }
+    }
+
+    /// Release inflight and record latency for a specific account by index.
+    pub fn release_inflight_with_latency_at(&mut self, idx: usize, latency_ms: f64) {
+        self.release_inflight_at(idx);
+        if let Some(account) = self.accounts.get_mut(idx) {
+            if account.latency_ema == 0.0 {
+                account.latency_ema = latency_ms;
+            } else {
+                account.latency_ema = account.latency_ema * 0.7 + latency_ms * 0.3;
+            }
+        }
+    }
+
+    /// Self-healing: when ALL non-disabled accounts are unavailable,
+    /// halve error counts for accounts with recoverable errors,
+    /// clear cooldowns, and move them to HalfOpen state.
+    /// Returns true if any account was healed.
+    pub fn self_heal(&mut self) -> bool {
+        // Only trigger when all accounts are unavailable
+        let all_unavailable = self.accounts.iter().all(|a| {
+            a.disabled || !a.circuit.is_available()
+        });
+        if !all_unavailable {
+            return false;
+        }
+
+        let mut healed = false;
+        for account in &mut self.accounts {
+            if account.disabled {
+                continue;
+            }
+            // Only heal accounts with recoverable errors, not fatal/quota
+            if account.circuit.state != CircuitState::Broken {
+                continue;
+            }
+            match &account.circuit.last_error_class {
+                Some(ErrorClass::Recoverable) | None => {
+                    // Heal: halve error count, clear cooldown, move to HalfOpen
+                    let old_failures = account.circuit.failures;
+                    account.circuit.failures /= 2;
+                    if account.circuit.failures == 0 {
+                        account.circuit.state = CircuitState::Active;
+                    } else {
+                        account.circuit.state = CircuitState::HalfOpen;
+                    }
+                    account.circuit.last_failure = None;
+                    healed = true;
+                    info!(
+                        account_id = account.id.as_str(),
+                        old_failures,
+                        new_failures = account.circuit.failures,
+                        "自愈: 账户错误计数减半"
+                    );
+                }
+                Some(ErrorClass::Suspended) | Some(ErrorClass::Fatal) => {
+                    // Don't heal suspended or fatal errors
+                }
+            }
+        }
+        if healed {
+            self.mark_dirty();
+        }
+        healed
+    }
+
+    /// Check if we only have a single account (skip circuit breaker).
+    pub fn is_single_account(&self) -> bool {
+        self.accounts.iter().filter(|a| !a.disabled).count() <= 1
+    }
+
+    /// Get the proxy URL for the current account.
+    pub fn current_proxy_url(&self) -> Option<&str> {
+        self.accounts
+            .get(self.current_index)
+            .and_then(|a| a.proxy_url.as_deref())
+    }
+
+    /// Get the number of accounts.
+    pub fn account_count(&self) -> usize {
+        self.accounts.len()
+    }
+
+    // ---- Cooldown management ----
+
+    /// Get account ID by index.
+    pub fn account_id_at(&self, idx: usize) -> Option<String> {
+        self.accounts.get(idx).map(|a| a.id.clone())
+    }
+
+    /// Set cooldown for an account (e.g., after 429 rate limit).
+    pub fn set_cooldown_for_account(&mut self, account_id: &str) {
+        self.quota_manager.set_cooldown(account_id);
+        warn!(account_id, "账户进入配额冷却");
+    }
+
+    /// Clear cooldown for an account.
+    pub fn clear_cooldown_for_account(&mut self, account_id: &str) {
+        self.quota_manager.clear_cooldown(account_id);
+        info!(account_id, "账户配额冷却已清除");
+    }
+
+    /// Get account IDs currently in cooldown.
+    pub fn accounts_in_cooldown(&self) -> Vec<&str> {
+        self.quota_manager.accounts_in_cooldown()
+    }
+
+    // ---- Admin API CRUD methods ----
+
+    /// Get a snapshot of all accounts for the Admin API.
+    pub fn snapshot(&self) -> Vec<AccountSnapshot> {
+        self.accounts
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let quota_info = self.quota_manager.get_quota_info(&a.id);
+                AccountSnapshot {
+                    id: a.id.clone(),
+                    priority: a.priority,
+                    disabled: a.disabled,
+                    failure_count: a.circuit.failures,
+                    is_current: i == self.current_index,
+                    is_available: !a.disabled && a.circuit.is_available(),
+                    auth_method: "unknown".to_string(),
+                    total_requests: a.circuit.total_requests,
+                    successful_requests: a.circuit.successful_requests,
+                    failed_requests: a.circuit.failed_requests,
+                    proxy_url: a.proxy_url.clone(),
+                    region: String::new(),
+                    health_score: a.circuit.health_score,
+                    quota_remaining: quota_info.map(|q| q.remaining),
+                    quota_limit: quota_info.map(|q| q.limit),
+                    quota_exhausted: quota_info.map(|q| q.is_exhausted()),
+                }
+            })
+            .collect()
+    }
+
+    /// Add a new account. Returns the account ID.
+    pub fn add_account(
+        &mut self,
+        id: String,
+        config: &KiroConfig,
+        client: reqwest::Client,
+        priority: u32,
+    ) -> String {
+        let auth = KiroAuthManager::new(config, client);
+        let account_id = id.clone();
+        self.accounts.push(ManagedAccount {
+            id,
+            auth: Arc::new(Mutex::new(auth)),
+            circuit: AccountCircuitBreaker::new(),
+            proxy_url: config.proxy_url.clone(),
+            priority,
+            disabled: false,
+            inflight_count: 0,
+            latency_ema: 0.0,
+            last_success_at: None,
+            recent_requests: 0,
+        });
+        // Re-sort by priority
+        self.accounts.sort_by_key(|a| a.priority);
+        // Update current_index to track the same account
+        self.current_index = self
+            .accounts
+            .iter()
+            .position(|a| a.id == self.accounts.get(self.current_index).map(|a| a.id.as_str()).unwrap_or(""))
+            .unwrap_or(0);
+        info!(account_id = account_id.as_str(), priority, "添加 Kiro 账户");
+        account_id
+    }
+
+    /// Remove an account by ID. Returns true if found and removed.
+    pub fn remove_account(&mut self, id: &str) -> bool {
+        if let Some(pos) = self.accounts.iter().position(|a| a.id == id) {
+            self.accounts.remove(pos);
+            if self.current_index >= self.accounts.len() && !self.accounts.is_empty() {
+                self.current_index = self.accounts.len() - 1;
+            }
+            info!(account_id = id, "删除 Kiro 账户");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set disabled state for an account. Returns true if found.
+    pub fn set_disabled(&mut self, id: &str, disabled: bool) -> bool {
+        if let Some(account) = self.accounts.iter_mut().find(|a| a.id == id) {
+            account.disabled = disabled;
+            info!(account_id = id, disabled, "设置 Kiro 账户状态");
+            self.mark_dirty();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set priority for an account and re-sort. Returns true if found.
+    pub fn set_priority(&mut self, id: &str, priority: u32) -> bool {
+        if let Some(account) = self.accounts.iter_mut().find(|a| a.id == id) {
+            let old_priority = account.priority;
+            account.priority = priority;
+            // Re-sort by priority
+            let current_id = self
+                .accounts
+                .get(self.current_index)
+                .map(|a| a.id.clone());
+            self.accounts.sort_by_key(|a| a.priority);
+            // Restore current_index
+            if let Some(cid) = current_id {
+                self.current_index = self
+                    .accounts
+                    .iter()
+                    .position(|a| a.id == cid)
+                    .unwrap_or(0);
+            }
+            info!(
+                account_id = id,
+                old_priority, priority, "设置 Kiro 账户优先级"
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Reset failure count and re-enable an account. Returns true if found.
+    pub fn reset_failures(&mut self, id: &str) -> bool {
+        if let Some(account) = self.accounts.iter_mut().find(|a| a.id == id) {
+            account.circuit.failures = 0;
+            account.circuit.state = CircuitState::Active;
+            account.circuit.last_failure = None;
+            info!(account_id = id, "重置 Kiro 账户失败计数");
+            self.mark_dirty();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Force refresh token for a specific account. Returns Ok(token) or Err.
+    pub async fn force_refresh_account(&self, id: &str) -> Result<String, String> {
+        if let Some(account) = self.accounts.iter().find(|a| a.id == id) {
+            let mut auth = account.auth.lock().await;
+            auth.force_refresh()
+                .await
+                .map_err(|e| format!("Token refresh failed: {}", e))
+        } else {
+            Err(format!("Account '{}' not found", id))
+        }
+    }
+
+    /// Get the current load balancing mode.
+    pub fn load_balancing_mode(&self) -> &LoadBalancingMode {
+        &self.load_balancing_mode
+    }
+
+    /// Set the load balancing mode.
+    pub fn set_load_balancing_mode(&mut self, mode: LoadBalancingMode) {
+        self.load_balancing_mode = mode;
+    }
+
+    /// Get the auth manager Arc for a specific account by ID.
+    pub fn account_auth_at_id(&self, id: &str) -> Option<Arc<Mutex<KiroAuthManager>>> {
+        self.accounts
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| a.auth.clone())
+    }
+
+    /// Get the region for a specific account by ID.
+    pub fn account_region(&self, id: &str) -> Option<String> {
+        for a in &self.accounts {
+            if a.id == id {
+                let auth = a.auth.blocking_lock();
+                // Collect region into owned String before dropping guard
+                let region = auth.credentials_iter().map(|c| c.region.clone()).next();
+                return region;
+            }
+        }
+        None
+    }
+
+    /// Get a full JSON snapshot of a specific account including circuit breaker state.
+    pub fn account_full_snapshot(&self, id: &str) -> Option<serde_json::Value> {
+        for a in &self.accounts {
+            if a.id == id {
+                let cred_info = {
+                    let auth = a.auth.blocking_lock();
+                    let first = auth.credentials_iter().map(|c| {
+                        (format!("{:?}", c.auth_method), c.region.clone(), c.api_region.clone())
+                    }).next();
+                    match first {
+                        Some((am, reg, api)) => serde_json::json!({
+                            "auth_method": am,
+                            "region": reg,
+                            "api_region": api,
+                        }),
+                        None => serde_json::json!({}),
+                    }
+                };
+
+                return Some(serde_json::json!({
+                    "id": a.id,
+                    "priority": a.priority,
+                    "disabled": a.disabled,
+                    "proxy_url": a.proxy_url,
+                    "credentials": cred_info,
+                    "circuit": {
+                        "state": format!("{:?}", a.circuit.state),
+                        "failures": a.circuit.failures,
+                        "health_score": a.circuit.health_score,
+                        "total_requests": a.circuit.total_requests,
+                        "successful_requests": a.circuit.successful_requests,
+                        "failed_requests": a.circuit.failed_requests,
+                    },
+                    "inflight_count": a.inflight_count,
+                    "latency_ema": a.latency_ema,
+                    "last_success_at": a.last_success_at.map(|t| format!("{:?}", t)),
+                }));
+            }
+        }
+        None
+    }
+
+    /// Start a background task that periodically checks quota for all accounts.
+    /// Only runs if quota checking is enabled. Drops lock before network I/O.
+    pub fn start_periodic_quota_check(
+        mgr: Arc<Mutex<Self>>,
+        client: reqwest::Client,
+    ) {
+        tokio::spawn(async move {
+            loop {
+                let (interval, accounts_to_check) = {
+                    let guard = mgr.lock().await;
+                    if !guard.quota_manager.quota_check_enabled() {
+                        let interval = guard.quota_manager.check_interval();
+                        drop(guard);
+                        tokio::time::sleep(interval).await;
+                        continue;
+                    }
+                    let interval = guard.quota_manager.check_interval();
+                    let accounts: Vec<(String, String, String)> = guard
+                        .accounts
+                        .iter()
+                        .filter(|a| !a.disabled && guard.quota_manager.is_quota_stale(&a.id))
+                        .filter_map(|a| {
+                            let auth = a.auth.blocking_lock();
+                            let cred = auth.credentials_iter().find(|c| !c.disabled)?;
+                            let token = cred.access_token.clone()?;
+                            let region = if cred.api_region.is_empty() {
+                                cred.region.clone()
+                            } else {
+                                cred.api_region.clone()
+                            };
+                            Some((a.id.clone(), token, region))
+                        })
+                        .collect();
+                    (interval, accounts)
+                };
+
+                for (account_id, token, region) in accounts_to_check {
+                    if let Some(info) = check_quota(&client, &token, &region).await {
+                        let mut guard = mgr.lock().await;
+                        guard.quota_manager.set_quota_info(&account_id, info);
+                    }
+                }
+
+                tokio::time::sleep(interval).await;
+            }
+        });
+    }
+}
+
+/// Simple pseudo-random chance check (0.0 - 1.0).
+/// Uses current nanosecond timestamp for randomness.
+fn rand_chance() -> f64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    (nanos % 1000) as f64 / 1000.0
+}
+
+/// Simple pseudo-random index in range [0, n).
+fn rand_index(n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    (nanos as usize) % n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_error_codes() {
+        assert_eq!(classify_error(402, ""), ErrorClass::Recoverable);
+        assert_eq!(classify_error(403, ""), ErrorClass::Recoverable);
+        assert_eq!(classify_error(429, ""), ErrorClass::Recoverable);
+        assert_eq!(classify_error(400, "INVALID_MODEL_ID"), ErrorClass::Recoverable);
+        assert_eq!(classify_error(400, "CONTENT_LENGTH_EXCEEDS"), ErrorClass::Fatal);
+        assert_eq!(classify_error(400, "bad request"), ErrorClass::Fatal);
+        assert_eq!(classify_error(422, ""), ErrorClass::Fatal);
+        assert_eq!(classify_error(500, ""), ErrorClass::Fatal);
+        assert_eq!(classify_error(503, ""), ErrorClass::Fatal);
+    }
+
+    #[test]
+    fn circuit_breaker_exponential_backoff() {
+        let mut cb = AccountCircuitBreaker::new();
+        assert_eq!(cb.recovery_timeout(), Duration::from_secs(60));
+
+        cb.record_failure(ErrorClass::Recoverable, 20);
+        assert_eq!(cb.recovery_timeout(), Duration::from_secs(60));
+
+        cb.record_failure(ErrorClass::Recoverable, 20);
+        assert_eq!(cb.recovery_timeout(), Duration::from_secs(120));
+
+        cb.record_failure(ErrorClass::Recoverable, 20);
+        assert_eq!(cb.recovery_timeout(), Duration::from_secs(240));
+    }
+
+    #[test]
+    fn circuit_breaker_reset_on_success() {
+        let mut cb = AccountCircuitBreaker::new();
+        cb.record_failure(ErrorClass::Recoverable, 20);
+        cb.record_failure(ErrorClass::Recoverable, 20);
+        assert_eq!(cb.failures, 2);
+
+        cb.record_success(10);
+        assert_eq!(cb.failures, 0);
+        assert_eq!(cb.state, CircuitState::Active);
+    }
+
+    #[test]
+    fn error_class_recoverable_variants() {
+        assert_eq!(classify_error(402, "quota"), ErrorClass::Recoverable);
+        assert_eq!(classify_error(429, "rate limit"), ErrorClass::Recoverable);
+    }
+
+    #[test]
+    fn load_balancing_mode_from_str() {
+        assert_eq!(LoadBalancingMode::from_str("balanced"), LoadBalancingMode::Balanced);
+        assert_eq!(LoadBalancingMode::from_str("priority"), LoadBalancingMode::Priority);
+        assert_eq!(LoadBalancingMode::from_str("unknown"), LoadBalancingMode::Priority);
+    }
+
+    #[test]
+    fn load_balancing_mode_as_str() {
+        assert_eq!(LoadBalancingMode::Priority.as_str(), "priority");
+        assert_eq!(LoadBalancingMode::Balanced.as_str(), "balanced");
+    }
+
+    #[test]
+    fn self_heal_recovers_recoverable_errors() {
+        let configs = vec![
+            ("acc1".to_string(), make_test_config()),
+            ("acc2".to_string(), make_test_config()),
+        ];
+        let client = reqwest::Client::new();
+        let mut mgr = AccountManager::new(&configs, client);
+
+        // Break both accounts with recoverable errors
+        mgr.current_index = 0;
+        mgr.record_failure(ErrorClass::Recoverable);
+        mgr.record_failure(ErrorClass::Recoverable);
+        mgr.record_failure(ErrorClass::Recoverable);
+        mgr.current_index = 1;
+        mgr.record_failure(ErrorClass::Recoverable);
+        mgr.record_failure(ErrorClass::Recoverable);
+
+        // Both should be unavailable now
+        assert!(mgr.get_available_account(&[]).is_none());
+
+        // Self-heal should recover them
+        assert!(mgr.self_heal());
+
+        // After healing, accounts should be available (failures halved, moved to HalfOpen)
+        assert!(mgr.get_available_account(&[]).is_some());
+    }
+
+    #[test]
+    fn self_heal_ignores_fatal_errors() {
+        let configs = vec![
+            ("acc1".to_string(), make_test_config()),
+        ];
+        let client = reqwest::Client::new();
+        let mut mgr = AccountManager::new(&configs, client);
+
+        // Break account with fatal error
+        mgr.current_index = 0;
+        mgr.record_failure(ErrorClass::Fatal);
+
+        // Should be unavailable
+        assert!(mgr.get_available_account(&[]).is_none());
+
+        // Self-heal should NOT recover fatal errors
+        assert!(!mgr.self_heal());
+        assert!(mgr.get_available_account(&[]).is_none());
+    }
+
+    #[test]
+    fn smart_load_balancing_selects_account() {
+        let configs = vec![
+            ("acc1".to_string(), make_test_config()),
+            ("acc2".to_string(), make_test_config()),
+        ];
+        let client = reqwest::Client::new();
+        let mut mgr = AccountManager::new_with_mode(
+            &configs,
+            client,
+            LoadBalancingMode::Smart,
+        );
+
+        // Both accounts are fresh - smart mode should select one
+        let result = mgr.get_available_account(&[]);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn smart_mode_from_str() {
+        assert_eq!(LoadBalancingMode::from_str("smart"), LoadBalancingMode::Smart);
+        assert_eq!(LoadBalancingMode::Smart.as_str(), "smart");
+    }
+
+    fn make_test_config() -> KiroConfig {
+        KiroConfig {
+            auth_method: "social".to_string(),
+            refresh_token: Some("test".to_string()),
+            client_id: None,
+            client_secret: None,
+            profile_arn: None,
+            region: "us-east-1".to_string(),
+            api_region: None,
+            model_aliases: None,
+            hidden_models: None,
+            kiro_version: None,
+            proxy_url: None,
+            thinking_mode: None,
+            web_search_enabled: None,
+            accounts: None,
+            load_balancing_mode: None,
+            agentic_prompt_injection: None,
+            filter_env_noise: None,
+            filter_strip_boundaries: None,
+            first_token_timeout: None,
+            streaming_read_timeout: None,
+            first_token_max_retries: None,
+            quota_cooldown_secs: None,
+            health_score_decay: None,
+            health_score_recovery: None,
+            preferred_endpoint: None,
+            endpoint_fallback: None,
+            debug_save_requests: None,
+            smart_summary_enabled: None,
+            enable_quota_check: None,
+            quota_check_interval_secs: None,
+        }
+    }
+}
