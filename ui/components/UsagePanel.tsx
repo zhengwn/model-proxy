@@ -240,8 +240,12 @@ export function UsagePanel() {
     MIN_CELL,
     Math.min(MAX_CELL, Math.floor((baseW - (WEEKS - 1) * GAP) / WEEKS))
   );
-  const colStride = cellSize + GAP;
-  const gridWidth = WEEKS * colStride - GAP;
+  // Spread the floor() remainder into the column gaps so the grid fills the full
+  // width exactly (no sliver on the right). Falls back to GAP when content would
+  // overflow a narrow container.
+  const colGap = Math.max(GAP, (baseW - WEEKS * cellSize) / (WEEKS - 1));
+  const colStride = cellSize + colGap;
+  const gridWidth = WEEKS * cellSize + (WEEKS - 1) * colGap;
 
   const statItems = [
     { label: t("usage.totalCalls"), value: formatTokens(stats.total, locale), color: STAT_COLORS[0] },
@@ -339,7 +343,7 @@ export function UsagePanel() {
                 </div>
                 {/* Grid — keyed by mode so cells replay the pop-in wave on switch */}
                 <div style={{ display: "flex" }}>
-                  <div key={mode} style={{ display: "flex", gap: GAP }}>
+                  <div key={mode} style={{ display: "flex", gap: colGap }}>
                     {columns.map((week, ci) => (
                       <div key={ci} style={{ display: "flex", flexDirection: "column", gap: GAP }}>
                         {week.map((cell) =>
