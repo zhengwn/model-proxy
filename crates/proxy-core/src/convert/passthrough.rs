@@ -78,6 +78,7 @@ pub(crate) async fn handle_stream_passthrough(
                                 Some(upstream_headers_ms as u64),
                                 Some("stream ended: client disconnected".to_string()),
                                 None,
+                                None,
                             );
                         }
                         return;
@@ -102,6 +103,7 @@ pub(crate) async fn handle_stream_passthrough(
                             Some(upstream_headers_ms as u64),
                             Some("stream ended: upstream error".to_string()),
                             None,
+                            None,
                         );
                     }
                     return;
@@ -120,7 +122,7 @@ pub(crate) async fn handle_stream_passthrough(
             "流式透传响应结束"
         );
         if let Some(log_ctx) = &log_ctx {
-            log_ctx.emit(200, Some(upstream_headers_ms as u64), None, None);
+            log_ctx.emit(200, Some(upstream_headers_ms as u64), None, None, None);
         }
     });
 

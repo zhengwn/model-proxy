@@ -539,12 +539,25 @@ export function ProviderForm({
       />
 
       <Form.Item>
-        <Space>
-          <Button type="primary" htmlType="submit">
-            {mode === "add" ? t("common.add") : t("common.save")}
-          </Button>
-          <TestConnectionButton form={form} />
-          <Button onClick={onCancel}>{t("common.cancel")}</Button>
+        <Space direction="vertical" style={{ width: "100%" }}>
+          <Space>
+            <Button type="primary" htmlType="submit">
+              {mode === "add" ? t("common.add") : t("common.save")}
+            </Button>
+            <TestConnectionButton form={form} />
+            <Button onClick={onCancel}>{t("common.cancel")}</Button>
+          </Space>
+          {isKiro && (
+            <Alert
+              type="info"
+              showIcon
+              title={
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  {t("providerForm.kiroTestHint")}
+                </Text>
+              }
+            />
+          )}
         </Space>
       </Form.Item>
     </Form>

@@ -423,7 +423,13 @@ pub(crate) async fn handle_stream_openai_output(
                     "Anthropic→OpenAI 流式响应结束"
                 );
                 if let Some(ref log_ctx) = log_ctx {
-                    log_ctx.emit(status, Some(upstream_headers_ms as u64), error_message, None);
+                    log_ctx.emit(
+                        status,
+                        Some(upstream_headers_ms as u64),
+                        error_message,
+                        None,
+                        Some(state.input_tokens + state.completion_tokens),
+                    );
                 }
             }};
         }

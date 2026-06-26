@@ -73,6 +73,7 @@ pub fn run() {
             commands::start_service,
             commands::stop_service,
             commands::get_service_status,
+            commands::get_daily_usage,
             commands::switch_provider,
             commands::get_providers,
             commands::add_provider,

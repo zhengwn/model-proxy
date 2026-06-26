@@ -59,7 +59,7 @@ mod log_tests {
             raw_request_body: "{}".to_string(),
         };
 
-        ctx.emit(200, Some(30), None, None);
+        ctx.emit(200, Some(30), None, None, Some(123));
         let entry = receiver.try_recv().unwrap();
 
         assert!(entry.duration_ms >= 120);

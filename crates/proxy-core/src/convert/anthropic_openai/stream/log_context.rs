@@ -27,6 +27,7 @@ impl StreamLogContext {
         ttft_ms: Option<u64>,
         error_message: Option<String>,
         response_body: Option<&str>,
+        token_count: Option<u64>,
     ) {
         if !self.collector.should_log(status) {
             return;
@@ -64,7 +65,7 @@ impl StreamLogContext {
                 None
             },
             is_stream: true,
-            token_count: None,
+            token_count,
         };
         self.collector.emit(entry);
     }

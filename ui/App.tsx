@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { ConfigProvider, Layout, Menu, Badge, Spin, theme, Dropdown, Button } from "antd";
+import { useRef, useState } from "react";
+import { ConfigProvider, Layout, Menu, Badge, Spin, theme, Dropdown, Button, Modal } from "antd";
 import type { MenuProps } from "antd";
 import {
   DashboardOutlined,
@@ -11,12 +11,14 @@ import {
   SunOutlined,
   MoonOutlined,
   DesktopOutlined,
+  BarChartOutlined,
 } from "@ant-design/icons";
 import StatusPanel from "./components/StatusPanel";
 import { ProviderManager } from "./components/ProviderManager";
 import { ModelRoutesEditor } from "./components/ModelRoutesEditor";
 import LogViewer from "./components/LogViewer";
 import KiroPanel from "./components/KiroPanel";
+import UsagePanel from "./components/UsagePanel";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { useServiceStatus } from "./hooks/useServiceStatus";
 import { useProviders } from "./hooks/useProviders";
@@ -37,24 +39,57 @@ interface AppLayoutProps {
 function AppLayout({ themeMode, resolved, onThemeChange }: AppLayoutProps) {
   const { token } = theme.useToken();
   const [activePage, setActivePage] = useState("status");
+  const [providerAutoAdd, setProviderAutoAdd] = useState(false);
+  const routesDirtyRef = useRef(false);
   const { status } = useServiceStatus();
   const { activeProvider } = useProviders();
   const isRunning = status?.running ?? false;
   const { t, setLocale } = useLocale();
+
+  // Navigate between pages, guarding unsaved route edits before leaving the routes page.
+  const navigate = (key: string) => {
+    if (activePage === "routes" && key !== "routes" && routesDirtyRef.current) {
+      Modal.confirm({
+        title: t("routes.unsavedConfirmTitle"),
+        content: t("routes.unsavedConfirmMsg"),
+        okText: t("common.leave"),
+        okType: "danger",
+        cancelText: t("common.stay"),
+        onOk: () => {
+          routesDirtyRef.current = false;
+          setActivePage(key);
+        },
+      });
+      return;
+    }
+    setActivePage(key);
+  };
+
+  const goAddProvider = () => {
+    setProviderAutoAdd(true);
+    navigate("providers");
+  };
 
   const menuItems: MenuProps["items"] = [
     { key: "status", icon: <DashboardOutlined />, label: t("nav.overview") },
     { key: "providers", icon: <CloudServerOutlined />, label: t("nav.providers") },
     { key: "kiro", icon: <ApiOutlined />, label: t("nav.kiro") },
     { key: "routes", icon: <NodeIndexOutlined />, label: t("nav.modelRoutes") },
+    { key: "usage", icon: <BarChartOutlined />, label: t("nav.usage") },
     { key: "logs", icon: <FileTextOutlined />, label: t("nav.requestLogs") },
   ];
 
   const PAGE_MAP: Record<string, React.ReactNode> = {
-    status: <StatusPanel />,
-    providers: <ProviderManager />,
+    status: <StatusPanel onGoAddProvider={goAddProvider} />,
+    providers: (
+      <ProviderManager
+        autoOpenAdd={providerAutoAdd}
+        onAutoOpenConsumed={() => setProviderAutoAdd(false)}
+      />
+    ),
     kiro: <KiroPanel />,
-    routes: <ModelRoutesEditor />,
+    routes: <ModelRoutesEditor onDirtyChange={(dirty) => (routesDirtyRef.current = dirty)} />,
+    usage: <UsagePanel />,
     logs: <LogViewer />,
   };
 
@@ -124,7 +159,7 @@ function AppLayout({ themeMode, resolved, onThemeChange }: AppLayoutProps) {
           mode="inline"
           theme={resolved === "dark" ? "dark" : "light"}
           selectedKeys={[activePage]}
-          onClick={(e) => setActivePage(e.key)}
+          onClick={(e) => navigate(e.key)}
           items={menuItems}
           style={{ background: "transparent", borderRight: "none" }}
         />
@@ -186,7 +221,7 @@ function AppLayout({ themeMode, resolved, onThemeChange }: AppLayoutProps) {
         </Header>
         <Content
           style={{
-            padding: 20,
+            padding: "16px 20px",
             overflow: "auto",
             height: "calc(100vh - 48px)",
             background: token.colorBgLayout,
@@ -207,6 +242,7 @@ function App() {
     <ErrorBoundary>
       <ConfigProvider
         locale={antdLocale}
+        button={{ autoInsertSpace: false }}
         theme={{
           algorithm: resolved === "dark" ? theme.darkAlgorithm : theme.defaultAlgorithm,
           token: {

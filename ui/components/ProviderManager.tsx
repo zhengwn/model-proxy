@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Spin, Alert, Button, Modal, Drawer, message, Card } from "antd";
 import { PlusOutlined } from "@ant-design/icons";
 import { useProviders } from "../hooks/useProviders";
@@ -7,7 +7,14 @@ import { ProviderForm } from "./ProviderForm";
 import type { ProviderConfig } from "../types";
 import { useLocale } from "../i18n";
 
-export function ProviderManager() {
+interface ProviderManagerProps {
+  /** When true, opens the Add Provider drawer automatically (e.g. from first-launch guide). */
+  autoOpenAdd?: boolean;
+  /** Called once the auto-open intent has been consumed. */
+  onAutoOpenConsumed?: () => void;
+}
+
+export function ProviderManager({ autoOpenAdd, onAutoOpenConsumed }: ProviderManagerProps = {}) {
   const { t } = useLocale();
   const {
     providers,
@@ -24,6 +31,15 @@ export function ProviderManager() {
 
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [editingProvider, setEditingProvider] = useState<ProviderConfig | undefined>();
+
+  // Honor an external request to open the Add Provider drawer (first-launch guide).
+  useEffect(() => {
+    if (autoOpenAdd) {
+      setEditingProvider(undefined);
+      setDrawerOpen(true);
+      onAutoOpenConsumed?.();
+    }
+  }, [autoOpenAdd, onAutoOpenConsumed]);
 
   const handleEdit = (provider: ProviderConfig) => {
     setEditingProvider(provider);

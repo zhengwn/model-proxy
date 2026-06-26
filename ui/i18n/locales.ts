@@ -34,6 +34,8 @@ const zhMessages = {
   "common.ok": "知道了",
   "common.loading": "加载中...",
   "common.saveFailed": "保存失败: {error}",
+  "common.leave": "离开",
+  "common.stay": "留下",
 
   // ---- theme ----
   "theme.dark": "暗色",
@@ -46,6 +48,26 @@ const zhMessages = {
   "nav.kiro": "Kiro",
   "nav.modelRoutes": "模型路由",
   "nav.requestLogs": "请求日志",
+  "nav.usage": "用量",
+
+  // ---- usage ----
+  "usage.heatmapTitle": "Token 用量热力图",
+  "usage.totalCalls": "Token 总量",
+  "usage.peakDay": "单日峰值",
+  "usage.activeDays": "活跃天数",
+  "usage.activeDaysUnit": "天",
+  "usage.less": "少",
+  "usage.more": "多",
+  "usage.weekShort": "一,二,三,四,五,六,日",
+  "usage.monthFmt": "{m}月",
+  "usage.empty": "暂无 Token 用量数据。代理服务启动并产生请求后，这里会逐日累计。",
+  "usage.loadFailed": "加载用量数据失败",
+  "usage.daily": "每日",
+  "usage.weekly": "每周",
+  "usage.cumulative": "累计",
+  "usage.tipDaily": "{date} 使用了 {tokens} 个 Token",
+  "usage.tipWeekly": "{date} 当周使用了 {tokens} 个 Token",
+  "usage.tipCumulative": "截至 {date} 当周累计使用 {tokens} 个 Token",
 
   // ---- status ----
   "status.serviceStatus": "服务状态",
@@ -79,6 +101,11 @@ const zhMessages = {
   "status.apiKeyHint": "API Key 设置为你上方配置的值",
   "status.requestStats": "请求统计 (总数 / 失败)",
   "status.stoppedHint": "代理服务未启动。请在下方配置服务器参数后，点击右上角启动服务。",
+  "status.goAddProvider": "前往添加 Provider",
+  "status.startDisabledTip": "请先添加至少一个 Provider 才能启动服务",
+  "status.serverLockedHint": "服务运行中，参数已锁定。如需修改请先停止服务。",
+  "status.restartTag": "重启生效",
+  "status.restartTagTip": "这些参数在服务运行时无法修改，停止服务后编辑并重新启动方可生效。",
 
   // ---- provider ----
   "provider.cannotDelete": "无法删除",
@@ -167,6 +194,8 @@ const zhMessages = {
   "providerForm.connectSuccess": "连接成功 ({latency}ms){model}",
   "providerForm.connectFailed": "连接失败: {error}",
   "providerForm.testFailed": "测试失败: {error}",
+  "providerForm.kiroTestHint":
+    "Kiro 凭据需在「Kiro」页面添加并测试连接，此处的“测试连接”不适用于 Kiro。",
 
   // ---- kiro ----
   "kiro.ssoLogin": "SSO 登录",
@@ -284,6 +313,11 @@ const zhMessages = {
   "routes.addRule": "添加规则",
   "routes.quickAdd": "快速添加",
   "routes.saveRoutes": "保存路由",
+  "routes.unsaved": "未保存",
+  "routes.exampleHint":
+    "以下为示例规则，尚未保存生效。按需修改后点击「保存路由」才会应用。",
+  "routes.unsavedConfirmTitle": "有未保存的更改",
+  "routes.unsavedConfirmMsg": "离开此页面将丢失未保存的路由更改，确定要离开吗？",
 
   // ---- log ----
   "log.time": "时间",
@@ -354,6 +388,8 @@ const enMessages: Messages = {
   "common.ok": "OK",
   "common.loading": "Loading...",
   "common.saveFailed": "Save failed: {error}",
+  "common.leave": "Leave",
+  "common.stay": "Stay",
 
   // ---- theme ----
   "theme.dark": "Dark",
@@ -366,6 +402,26 @@ const enMessages: Messages = {
   "nav.kiro": "Kiro",
   "nav.modelRoutes": "Model Routes",
   "nav.requestLogs": "Request Logs",
+  "nav.usage": "Usage",
+
+  // ---- usage ----
+  "usage.heatmapTitle": "Token Usage Heatmap",
+  "usage.totalCalls": "Total Tokens",
+  "usage.peakDay": "Peak Day",
+  "usage.activeDays": "Active Days",
+  "usage.activeDaysUnit": "days",
+  "usage.less": "Less",
+  "usage.more": "More",
+  "usage.weekShort": "Mon,Tue,Wed,Thu,Fri,Sat,Sun",
+  "usage.monthFmt": "{m}",
+  "usage.empty": "No token usage yet. Once the proxy starts handling requests, daily usage will accumulate here.",
+  "usage.loadFailed": "Failed to load usage data",
+  "usage.daily": "Daily",
+  "usage.weekly": "Weekly",
+  "usage.cumulative": "Cumulative",
+  "usage.tipDaily": "{date}: {tokens} tokens used",
+  "usage.tipWeekly": "{date} that week: {tokens} tokens used",
+  "usage.tipCumulative": "Through {date}: {tokens} tokens total",
 
   // ---- status ----
   "status.serviceStatus": "Service Status",
@@ -399,6 +455,11 @@ const enMessages: Messages = {
   "status.apiKeyHint": "Set API Key to the value configured above",
   "status.requestStats": "Request Stats (Total / Failed)",
   "status.stoppedHint": "Proxy service is not running. Configure parameters below and click Start.",
+  "status.goAddProvider": "Add a Provider",
+  "status.startDisabledTip": "Add at least one Provider before starting the service",
+  "status.serverLockedHint": "Service is running; settings are locked. Stop the service to edit them.",
+  "status.restartTag": "Restart required",
+  "status.restartTagTip": "These settings can't be changed while the service is running. Stop the service, edit, then restart to apply.",
 
   // ---- provider ----
   "provider.cannotDelete": "Cannot Delete",
@@ -487,6 +548,8 @@ const enMessages: Messages = {
   "providerForm.connectSuccess": "Connected ({latency}ms){model}",
   "providerForm.connectFailed": "Connection failed: {error}",
   "providerForm.testFailed": "Test failed: {error}",
+  "providerForm.kiroTestHint":
+    "Kiro credentials are added and tested on the \"Kiro\" page. The \"Test Connection\" button here does not apply to Kiro.",
 
   // ---- kiro ----
   "kiro.ssoLogin": "SSO Login",
@@ -604,6 +667,11 @@ const enMessages: Messages = {
   "routes.addRule": "Add Rule",
   "routes.quickAdd": "Quick Add",
   "routes.saveRoutes": "Save Routes",
+  "routes.unsaved": "Unsaved",
+  "routes.exampleHint":
+    "These are example rules and are not active yet. Adjust as needed, then click \"Save Routes\" to apply.",
+  "routes.unsavedConfirmTitle": "Unsaved changes",
+  "routes.unsavedConfirmMsg": "Leaving this page will discard unsaved route changes. Leave anyway?",
 
   // ---- log ----
   "log.time": "Time",

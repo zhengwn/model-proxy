@@ -10,6 +10,7 @@ import {
   message,
   Typography,
   Tooltip,
+  Tag,
 } from "antd";
 import {
   MinusCircleOutlined,
@@ -64,7 +65,18 @@ const ROUTE_TEMPLATES: RouteTemplate[] = [
 
 const REASONING_VALUES = ["", "low", "medium", "high", "max"];
 
-export function ModelRoutesEditor() {
+interface ModelRoutesEditorProps {
+  /** Reports whether there are unsaved edits, so the parent can guard navigation. */
+  onDirtyChange?: (dirty: boolean) => void;
+}
+
+const DEFAULT_EXAMPLE_ROUTES: ModelRoute[] = [
+  { match: "opus", target: "deepseek-v4-pro", reasoning_effort: "max" },
+  { match: "sonnet", target: "deepseek-v4-pro", reasoning_effort: "max" },
+  { match: "haiku", target: "deepseek-v4-flash", reasoning_effort: "high" },
+];
+
+export function ModelRoutesEditor({ onDirtyChange }: ModelRoutesEditorProps = {}) {
   const { t } = useLocale();
   const REASONING_OPTIONS = [
     { value: "", label: t("routes.notSet") },
@@ -73,6 +85,18 @@ export function ModelRoutesEditor() {
   const [routes, setRoutes] = useState<ModelRoute[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Snapshot of the last persisted routes — used to detect unsaved edits.
+  const [savedSnapshot, setSavedSnapshot] = useState<string>("[]");
+  // True when the shown rules are auto-filled examples that haven't been saved yet.
+  const [isExample, setIsExample] = useState(false);
+
+  const dirty = !isExample && JSON.stringify(routes) !== savedSnapshot;
+
+  // Report dirty state to the parent (for the leave-page guard); clear it on unmount.
+  useEffect(() => {
+    onDirtyChange?.(dirty);
+    return () => onDirtyChange?.(false);
+  }, [dirty, onDirtyChange]);
 
   const loadRoutes = async () => {
     setLoading(true);
@@ -80,24 +104,22 @@ export function ModelRoutesEditor() {
     try {
       const data = await invoke<ModelRoute[]>("get_model_routes");
       if (data.length === 0) {
-        // Pre-populate with default routes on first use
-        setRoutes([
-          { match: "opus", target: "deepseek-v4-pro", reasoning_effort: "max" },
-          { match: "sonnet", target: "deepseek-v4-pro", reasoning_effort: "max" },
-          { match: "haiku", target: "deepseek-v4-flash", reasoning_effort: "high" },
-        ]);
+        // Pre-populate with example routes on first use (not yet saved)
+        setRoutes(DEFAULT_EXAMPLE_ROUTES);
+        setSavedSnapshot(JSON.stringify(DEFAULT_EXAMPLE_ROUTES));
+        setIsExample(true);
       } else {
         setRoutes(data);
+        setSavedSnapshot(JSON.stringify(data));
+        setIsExample(false);
       }
     } catch (e) {
       const errMsg = typeof e === "string" ? e : String(e);
       if (errMsg.includes("不存在")) {
-        // Config doesn't exist yet, show defaults
-        setRoutes([
-          { match: "opus", target: "deepseek-v4-pro", reasoning_effort: "max" },
-          { match: "sonnet", target: "deepseek-v4-pro", reasoning_effort: "max" },
-          { match: "haiku", target: "deepseek-v4-flash", reasoning_effort: "high" },
-        ]);
+        // Config doesn't exist yet, show examples
+        setRoutes(DEFAULT_EXAMPLE_ROUTES);
+        setSavedSnapshot(JSON.stringify(DEFAULT_EXAMPLE_ROUTES));
+        setIsExample(true);
       } else {
         setError(errMsg);
       }
@@ -121,6 +143,8 @@ export function ModelRoutesEditor() {
         })),
       });
       setRoutes(validRoutes);
+      setSavedSnapshot(JSON.stringify(validRoutes));
+      setIsExample(false);
       message.success(t("routes.saved"));
     } catch (e) {
       message.error(t("common.saveFailed", { error: typeof e === "string" ? e : String(e) }));
@@ -128,10 +152,12 @@ export function ModelRoutesEditor() {
   };
 
   const handleAdd = () => {
+    setIsExample(false);
     setRoutes([...routes, { match: "", target: "", reasoning_effort: "" }]);
   };
 
   const handleAddTemplate = (template: RouteTemplate) => {
+    setIsExample(false);
     setRoutes([
       ...routes,
       {
@@ -143,6 +169,7 @@ export function ModelRoutesEditor() {
   };
 
   const handleRemove = (index: number) => {
+    setIsExample(false);
     setRoutes(routes.filter((_, i) => i !== index));
   };
 
@@ -151,6 +178,7 @@ export function ModelRoutesEditor() {
     field: keyof ModelRoute,
     value: string
   ) => {
+    setIsExample(false);
     const updated = [...routes];
     updated[index] = { ...updated[index], [field]: value };
     setRoutes(updated);
@@ -183,7 +211,12 @@ export function ModelRoutesEditor() {
   return (
     <div style={{ maxWidth: 780 }}>
       <Card
-        title={t("routes.routeRules")}
+        title={
+          <Space>
+            <span>{t("routes.routeRules")}</span>
+            {dirty && <Tag color="warning">{t("routes.unsaved")}</Tag>}
+          </Space>
+        }
         style={{ marginBottom: 8 }}
         extra={
           <Space>
@@ -213,6 +246,14 @@ export function ModelRoutesEditor() {
             </div>
           }
         />
+        {isExample && routes.length > 0 && (
+          <Alert
+            type="warning"
+            showIcon
+            title={t("routes.exampleHint")}
+            style={{ marginBottom: 10 }}
+          />
+        )}
         {routes.length === 0 && (
           <Text type="secondary" style={{ display: "block", marginBottom: 12 }}>
             {t("routes.noRules")}

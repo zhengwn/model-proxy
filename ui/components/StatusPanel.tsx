@@ -12,6 +12,8 @@ import {
   InputNumber,
   Typography,
   Progress,
+  Tooltip,
+  Tag,
 } from "antd";
 import {
   PlayCircleOutlined,
@@ -20,6 +22,8 @@ import {
   CloudServerOutlined,
   GlobalOutlined,
   ThunderboltOutlined,
+  PlusOutlined,
+  LockOutlined,
 } from "@ant-design/icons";
 import { useState, useEffect } from "react";
 import { useServiceStatus } from "../hooks/useServiceStatus";
@@ -37,7 +41,11 @@ function formatTimestamp(iso: string): string {
   }
 }
 
-function StatusPanel() {
+interface StatusPanelProps {
+  onGoAddProvider?: () => void;
+}
+
+function StatusPanel({ onGoAddProvider }: StatusPanelProps = {}) {
   const { t } = useLocale();
   const { status, loading, startService, stopService } = useServiceStatus();
   const { providers, activeProvider, loadProviders } = useProviders();
@@ -126,7 +134,7 @@ function StatusPanel() {
   const canStart = hasProviders && !isRunning;
 
   return (
-    <Space direction="vertical" size={12} style={{ width: "100%" }}>
+    <Space direction="vertical" size={10} style={{ width: "100%" }}>
       {/* First-launch guide */}
       {isNew && (
         <Alert
@@ -134,6 +142,14 @@ function StatusPanel() {
           description={t("status.firstUseDesc")}
           type="info"
           showIcon
+          action={
+            !hasProviders &&
+            onGoAddProvider && (
+              <Button type="primary" size="small" icon={<PlusOutlined />} onClick={onGoAddProvider}>
+                {t("status.goAddProvider")}
+              </Button>
+            )
+          }
         />
       )}
 
@@ -143,11 +159,19 @@ function StatusPanel() {
           description={t("status.noProvidersDesc")}
           type="warning"
           showIcon
+          action={
+            onGoAddProvider && (
+              <Button type="primary" size="small" icon={<PlusOutlined />} onClick={onGoAddProvider}>
+                {t("status.goAddProvider")}
+              </Button>
+            )
+          }
         />
       )}
 
       {/* Main status card */}
       <Card
+        styles={{ body: { padding: "18px 24px" } }}
         title={
           <Space>
             <span>{t("status.serviceStatus")}</span>
@@ -159,15 +183,17 @@ function StatusPanel() {
         }
         extra={
           <Space>
-            <Button
-              type="primary"
-              icon={<PlayCircleOutlined />}
-              onClick={handleStart}
-              disabled={!canStart}
-              loading={actionLoading && !isRunning}
-            >
-              {t("status.start")}
-            </Button>
+            <Tooltip title={!hasProviders && !isRunning ? t("status.startDisabledTip") : ""}>
+              <Button
+                type="primary"
+                icon={<PlayCircleOutlined />}
+                onClick={handleStart}
+                disabled={!canStart}
+                loading={actionLoading && !isRunning}
+              >
+                {t("status.start")}
+              </Button>
+            </Tooltip>
             <Button
               danger
               icon={<StopOutlined />}
@@ -180,7 +206,7 @@ function StatusPanel() {
           </Space>
         }
       >
-        <div style={{ minHeight: 116, display: "flex", flexDirection: "column", justifyContent: "center" }}>
+        <div style={{ minHeight: 108, display: "flex", flexDirection: "column", justifyContent: "center" }}>
           {isRunning && status?.started_at ? (
             <Space direction="vertical" style={{ width: "100%" }}>
               <Text type="secondary">
@@ -220,7 +246,7 @@ function StatusPanel() {
 
       {/* Grid of Metric Cards */}
       <Row gutter={[12, 12]} align="stretch">
-        <Col span={8}>
+        <Col xs={24} sm={8}>
           <Card className="metric-card" style={{ height: "100%" }} bodyStyle={{ padding: 16 }}>
             <div className="metric-head">
               <span className="metric-icon" style={{ background: "rgba(79,70,229,0.12)", color: "#4f46e5" }}>
@@ -236,7 +262,7 @@ function StatusPanel() {
           </Card>
         </Col>
 
-        <Col span={8}>
+        <Col xs={24} sm={8}>
           <Card className="metric-card" style={{ height: "100%" }} bodyStyle={{ padding: 16 }}>
             <div className="metric-head">
               <span className="metric-icon" style={{ background: "rgba(8,145,178,0.12)", color: "#0891b2" }}>
@@ -252,7 +278,7 @@ function StatusPanel() {
           </Card>
         </Col>
 
-        <Col span={8}>
+        <Col xs={24} sm={8}>
           <Card className="metric-card" style={{ height: "100%" }} bodyStyle={{ padding: 16 }}>
             <div className="metric-head">
               <span className="metric-icon" style={{ background: "rgba(217,119,6,0.12)", color: "#d97706" }}>
@@ -300,8 +326,29 @@ function StatusPanel() {
       )}
 
       {/* Server settings card */}
-      <Card title={t("status.serverSettings")}>
-        <Row gutter={[12, 12]} align="middle" wrap={false}>
+      <Card
+        styles={{ body: { padding: "18px 24px" } }}
+        title={
+          <Space>
+            <span>{t("status.serverSettings")}</span>
+            <Tooltip title={t("status.restartTagTip")}>
+              <Tag icon={<LockOutlined />} color="default" style={{ cursor: "help" }}>
+                {t("status.restartTag")}
+              </Tag>
+            </Tooltip>
+          </Space>
+        }
+      >
+        {isRunning && (
+          <Alert
+            type="info"
+            showIcon
+            icon={<LockOutlined />}
+            title={t("status.serverLockedHint")}
+            style={{ marginBottom: 8 }}
+          />
+        )}
+        <Row gutter={[12, 12]} align="middle" wrap>
                   <Col>
                     <Space>
                       <Text>Host:</Text>

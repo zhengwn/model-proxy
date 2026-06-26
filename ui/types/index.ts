@@ -21,6 +21,12 @@ export interface ModelRoute {
 
 export type ProviderFormat = "openai" | "anthropic" | "kiro";
 
+/** One calendar day's request count, from the `get_daily_usage` command. */
+export interface DailyUsage {
+  date: string; // YYYY-MM-DD
+  count: number;
+}
+
 export interface KiroAccountEntry {
   auth_method?: string;
   refresh_token?: string;

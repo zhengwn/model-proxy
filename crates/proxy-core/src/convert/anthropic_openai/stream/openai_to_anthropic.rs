@@ -377,6 +377,10 @@ pub(crate) async fn handle_stream(
                     Some(upstream_headers_ms as u64),
                     error_message,
                     None,
+                    Some(
+                        actual_usage.input_tokens.unwrap_or(0)
+                            + actual_usage.output_tokens.unwrap_or(0),
+                    ),
                 );
             }
         };

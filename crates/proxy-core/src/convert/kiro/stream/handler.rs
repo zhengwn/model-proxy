@@ -124,7 +124,13 @@ pub(crate) async fn handle_stream_anthropic_output(
                 "Kiro→Anthropic 流式响应结束"
             );
             if let Some(log_ctx) = &log_ctx {
-                log_ctx.emit(status, Some(upstream_headers_ms as u64), error_message, None);
+                log_ctx.emit(
+                    status,
+                    Some(upstream_headers_ms as u64),
+                    error_message,
+                    None,
+                    Some(state.input_tokens + state.completion_tokens),
+                );
             }
         };
 
@@ -510,7 +516,13 @@ pub(crate) async fn handle_stream_anthropic_output_buffered(
                 "Kiro→Anthropic 缓冲流式响应结束"
             );
             if let Some(log_ctx) = &log_ctx {
-                log_ctx.emit(status, Some(upstream_headers_ms as u64), error_message, None);
+                log_ctx.emit(
+                    status,
+                    Some(upstream_headers_ms as u64),
+                    error_message,
+                    None,
+                    Some(state.input_tokens + state.completion_tokens),
+                );
             }
         };
 

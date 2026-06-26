@@ -202,15 +202,18 @@ pub async fn start_service(
     // Create LogCollector with the shared log_config
     let log_collector = Arc::new(LogCollector::new(app_state.log_config.clone(), 256));
 
-    // Subscribe two receivers from the broadcast channel
+    // Subscribe receivers from the broadcast channel (file logger, event emitter,
+    // usage tracker).
     let receiver1 = log_collector.sender.subscribe();
     let receiver2 = log_collector.sender.subscribe();
+    let receiver3 = log_collector.sender.subscribe();
 
     // Determine app_data_dir for FileLogger
     let app_data_dir = app_handle
         .path()
         .app_data_dir()
         .map_err(|e| format!("获取 app_data_dir 失败: {}", e))?;
+    let usage_app_data_dir = app_data_dir.clone();
 
     // Create a shared cancellation token for graceful shutdown
     let cancel_token = tokio_util::sync::CancellationToken::new();
@@ -232,6 +235,19 @@ pub async fn start_service(
     let event_emitter_cancel = cancel_token.clone();
     tokio::spawn(async move {
         event_emitter_task(receiver2, app_handle, event_emitter_cancel).await;
+    });
+
+    // Spawn UsageTracker background task (persistent per-day request counter)
+    let usage_config = app_state.log_config.clone();
+    let usage_cancel = cancel_token.clone();
+    tokio::spawn(async move {
+        proxy_core::usage::UsageTracker::run(
+            receiver3,
+            usage_config,
+            usage_app_data_dir,
+            usage_cancel,
+        )
+        .await;
     });
 
     // Start the service with shared ArcSwap instances
@@ -262,6 +278,25 @@ pub async fn get_service_status(
     service: State<'_, ServiceManager>,
 ) -> Result<ServiceStatus, String> {
     Ok(service.get_status().await)
+}
+
+/// Return the persisted per-day request counts for the call heatmap.
+///
+/// Reads `usage_daily.json` from the log directory; safe to call whether or not
+/// the proxy service is running. Returns an empty list when no usage exists yet.
+#[tauri::command]
+pub async fn get_daily_usage(
+    app_handle: AppHandle,
+    app_state: State<'_, TauriState>,
+) -> Result<Vec<proxy_core::usage::DailyUsage>, String> {
+    let app_data_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("获取 app_data_dir 失败: {}", e))?;
+    Ok(proxy_core::usage::load_daily_usage(
+        &app_state.log_config,
+        &app_data_dir,
+    ))
 }
 
 /// Switch the active provider at runtime.

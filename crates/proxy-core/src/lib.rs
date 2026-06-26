@@ -9,6 +9,7 @@ pub mod error;
 pub mod logging;
 pub mod provider_registry;
 pub mod server;
+pub mod usage;
 
 pub use provider_registry::ProviderRegistry;
 pub use server::AppState;
