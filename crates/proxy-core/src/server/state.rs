@@ -135,6 +135,41 @@ pub struct AppState {
     pub metrics: Option<Arc<crate::server::metrics::Metrics>>,
 }
 
+/// Parts of `AppState` whose construction is identical regardless of
+/// whether the state is built standalone (CLI) or shared (Tauri).
+/// Factored out so `AppState::new` and `AppState::new_shared` don't
+/// duplicate this logic.
+struct CommonStateParts {
+    concurrency_semaphore: Option<Arc<Semaphore>>,
+    kiro: Option<KiroState>,
+    ip_filter: IpFilter,
+    site_guard: SiteGuardConfig,
+    metrics: Option<Arc<super::metrics::Metrics>>,
+}
+
+impl CommonStateParts {
+    fn build(config: &Config, client: &Client) -> Self {
+        let concurrency_semaphore = if config.server.max_concurrent_requests > 0 {
+            Some(Arc::new(Semaphore::new(
+                config.server.max_concurrent_requests,
+            )))
+        } else {
+            None
+        };
+
+        // Initialize Kiro state (returns None if no Kiro provider configured)
+        let kiro = KiroState::from_config(config, client);
+
+        Self {
+            concurrency_semaphore,
+            kiro,
+            ip_filter: IpFilter::new(),
+            site_guard: SiteGuardConfig::default(),
+            metrics: Some(Arc::new(crate::server::metrics::Metrics::new())),
+        }
+    }
+}
+
 impl AppState {
     /// Create a new AppState from a Config (standalone mode, e.g. CLI).
     pub fn new(config: Config) -> Self {
@@ -157,16 +192,7 @@ impl AppState {
         let log_config = Arc::new(ArcSwap::from_pointee(config.logging.clone()));
         let log_collector = Arc::new(LogCollector::new(log_config, 256));
 
-        let concurrency_semaphore = if config.server.max_concurrent_requests > 0 {
-            Some(Arc::new(Semaphore::new(
-                config.server.max_concurrent_requests,
-            )))
-        } else {
-            None
-        };
-
-        // Initialize Kiro state (returns None if no Kiro provider configured)
-        let kiro = KiroState::from_config(&config, &client);
+        let common = CommonStateParts::build(&config, &client);
 
         Self {
             config: Arc::new(config),
@@ -177,11 +203,11 @@ impl AppState {
             client,
             log_collector,
             counters: None,
-            concurrency_semaphore,
-            kiro,
-            ip_filter: IpFilter::new(),
-            site_guard: SiteGuardConfig::default(),
-            metrics: Some(Arc::new(crate::server::metrics::Metrics::new())),
+            concurrency_semaphore: common.concurrency_semaphore,
+            kiro: common.kiro,
+            ip_filter: common.ip_filter,
+            site_guard: common.site_guard,
+            metrics: common.metrics,
         }
     }
 
@@ -197,16 +223,7 @@ impl AppState {
     ) -> Self {
         let client = build_upstream_client();
 
-        let concurrency_semaphore = if config.server.max_concurrent_requests > 0 {
-            Some(Arc::new(Semaphore::new(
-                config.server.max_concurrent_requests,
-            )))
-        } else {
-            None
-        };
-
-        // Initialize Kiro state
-        let kiro = KiroState::from_config(&config, &client);
+        let common = CommonStateParts::build(&config, &client);
 
         Self {
             config: Arc::new(config),
@@ -217,11 +234,11 @@ impl AppState {
             client,
             log_collector,
             counters: None,
-            concurrency_semaphore,
-            kiro,
-            ip_filter: IpFilter::new(),
-            site_guard: SiteGuardConfig::default(),
-            metrics: Some(Arc::new(crate::server::metrics::Metrics::new())),
+            concurrency_semaphore: common.concurrency_semaphore,
+            kiro: common.kiro,
+            ip_filter: common.ip_filter,
+            site_guard: common.site_guard,
+            metrics: common.metrics,
         }
     }
 
